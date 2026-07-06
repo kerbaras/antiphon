@@ -64,6 +64,9 @@ export class TakePlayer {
   private masterScratch: Float32Array<ArrayBuffer> | null = null;
   private tracks = new Map<string, Track>();
   private sources: AudioBufferSourceNode[] = [];
+  /** Per-clip timeline delay (seconds ≥ 0 relative to the take's base):
+   * the arrangement position of each clip, set by timeline edits. */
+  private clipDelays = new Map<string, number>();
   private loadedTakeId: string | null = null;
   private loading = false;
   private aligning = false;
@@ -256,10 +259,30 @@ export class TakePlayer {
     return this.alignDeltas().get(track.streamId) ?? 0;
   }
 
+  /** Update arrangement positions (from timeline clip drags). Re-schedules
+   * live so the change is audible immediately. */
+  setClipDelays(delays: Record<string, number>): void {
+    this.clipDelays = new Map(Object.entries(delays).map(([id, d]) => [id, Math.max(0, d)]));
+    if (this.playing) {
+      const pos = this.position();
+      this.stopSources();
+      this.schedule(pos);
+    } else {
+      this.notify();
+    }
+  }
+
+  private clipDelay(streamId: string): number {
+    return this.clipDelays.get(streamId) ?? 0;
+  }
+
   duration(): number {
     let max = 0;
     for (const t of this.tracks.values()) {
-      max = Math.max(max, t.buffer.duration - this.alignDelta(t) / t.buffer.sampleRate);
+      max = Math.max(
+        max,
+        this.clipDelay(t.streamId) + t.buffer.duration - this.alignDelta(t) / t.buffer.sampleRate,
+      );
     }
     return max;
   }
@@ -282,13 +305,20 @@ export class TakePlayer {
     const ctx = this.ensureGraph();
     const when = ctx.currentTime + 0.06;
     for (const track of this.tracks.values()) {
-      const delta = this.alignDelta(track) / track.buffer.sampleRate;
-      const offset = fromSec + delta;
-      if (offset >= track.buffer.duration) continue;
+      const alignSec = this.alignDelta(track) / track.buffer.sampleRate;
+      // Timeline time t maps to buffer time (t - clipDelay + alignSec).
+      const rel = fromSec - this.clipDelay(track.streamId);
       const source = ctx.createBufferSource();
       source.buffer = track.buffer;
       source.connect(track.gain);
-      source.start(when, offset);
+      if (rel >= 0) {
+        const offset = rel + alignSec;
+        if (offset >= track.buffer.duration) continue;
+        source.start(when, offset);
+      } else {
+        // Clip begins later on the timeline: schedule its future start.
+        source.start(when - rel, alignSec);
+      }
       this.sources.push(source);
     }
     this.startCtxTime = when;

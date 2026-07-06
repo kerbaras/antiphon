@@ -10,6 +10,20 @@ let latest: DeskSessionState | null = null;
 let player: TakePlayer | null = null;
 let playerSnap: PlayerSnapshot | null = null;
 
+export interface DeskUiMirror {
+  selection: string[];
+  clipStarts: Record<string, number>;
+  playheadSec: number | null;
+  selectedTakeId: string | null;
+}
+
+let uiMirror: DeskUiMirror | null = null;
+
+/** Test/diagnostics hook: the desk component mirrors its editing state. */
+export function publishUiMirror(mirror: DeskUiMirror): void {
+  uiMirror = mirror;
+}
+
 export function getDeskSession(sessionId: string): DeskSession {
   if (!session || session.sessionId !== sessionId) {
     session?.close();
@@ -23,6 +37,7 @@ export function getDeskSession(sessionId: string): DeskSession {
       snapshot: () => latest,
       player: getPlayer(),
       playerSnapshot: () => playerSnap,
+      ui: () => uiMirror,
     };
   }
   return session;

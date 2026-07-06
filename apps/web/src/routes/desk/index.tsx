@@ -45,6 +45,7 @@ import {
   getDeskSession,
   getPlayer,
   loadTakeIntoPlayer,
+  publishUiMirror,
   type ServerStreamStatus,
   useDeskState,
   usePlayer,
@@ -241,7 +242,6 @@ function Desk({ sessionId }: { sessionId: string }) {
     });
   }, [sessionId, selectedTakeId, selectedStreamIds, recording, chirped]);
 
-  const selectedSlot = selectedTakeId ? (takes.get(selectedTakeId) ?? null) : null;
   const playerLoaded = playerSnap.loadedTakeId === selectedTakeId && playerSnap.tracks.length > 0;
   const alignmentByStream = useMemo(() => {
     const map = new Map<string, boolean>();
@@ -249,9 +249,198 @@ function Desk({ sessionId }: { sessionId: string }) {
     return map;
   }, [playerSnap.tracks]);
 
+  // ---- timeline editing: selection, marquee, clip drag ---------------------
+  const [selection, setSelection] = useState<string[]>([]);
+  const [clipStartOverrides, setClipStartOverrides] = useState<Record<string, number>>({});
+  const [marquee, setMarquee] = useState<{
+    x0: number;
+    y0: number;
+    x1: number;
+    y1: number;
+  } | null>(null);
+  const timelineRef = useRef<HTMLDivElement | null>(null);
+
+  /** Arrangement position of a clip: user override, else its take slot. */
+  const clipStartSec = (streamId: string, takeId: string): number =>
+    clipStartOverrides[streamId] ?? takes.get(takeId)?.offsetSec ?? 0;
+
+  /** Per-row clip models with geometry + interaction handlers. */
+  const rowClips: ClipModel[][] = rows.map((row) =>
+    row.streams.flatMap((stream) => {
+      const slot = takes.get(stream.takeId);
+      if (!slot) return [];
+      const server = serverStatus.get(stream.streamId);
+      const converged =
+        stream.complete && (server?.complete ?? false) && stream.digest === server?.digest;
+      const aligned = alignmentByStream.get(stream.streamId) ?? false;
+      const durationSec = Math.max(
+        stream.totalSamples / SAMPLE_RATE,
+        slot.live ? slot.durationSec : 1,
+      );
+      const takeNumber = [...takes.keys()].indexOf(stream.takeId) + 1;
+      const startSec = clipStartSec(stream.streamId, stream.takeId);
+      return [
+        {
+          id: stream.streamId,
+          takeId: stream.takeId,
+          name: slot.live ? "Incoming take" : `Take ${takeNumber}`,
+          color: row.color,
+          x: startSec * pxPerSec,
+          width: durationSec * pxPerSec - 3,
+          durationSec,
+          live: slot.live,
+          badge: slot.live
+            ? ("rec" as const)
+            : aligned
+              ? ("aligned" as const)
+              : converged
+                ? ("converged" as const)
+                : ("syncing" as const),
+          energy: stream.energy,
+          selected: selection.includes(stream.streamId) && !slot.live,
+          ...(slot.live
+            ? {}
+            : {
+                onPointerDown: (e: React.PointerEvent) =>
+                  onClipPointerDown(e, stream.streamId, stream.takeId),
+              }),
+        },
+      ];
+    }),
+  );
+
+  /** The selected take's timeline base: leftmost of its clips. */
+  const selectedBaseSec = useMemo(() => {
+    if (!selectedTakeId) return 0;
+    const starts = state.deskStatus
+      .filter((s) => s.takeId === selectedTakeId)
+      .map((s) => clipStartOverrides[s.streamId] ?? takes.get(selectedTakeId)?.offsetSec ?? 0);
+    return starts.length > 0 ? Math.min(...starts) : 0;
+    // eslint-style deps handled below in the delays effect
+  }, [selectedTakeId, state.deskStatus, clipStartOverrides, takes]);
+
+  // Feed arrangement offsets into the playback engine.
+  useEffect(() => {
+    if (!selectedTakeId || !playerLoaded) return;
+    const delays: Record<string, number> = {};
+    for (const s of state.deskStatus) {
+      if (s.takeId !== selectedTakeId) continue;
+      delays[s.streamId] =
+        (clipStartOverrides[s.streamId] ?? takes.get(selectedTakeId)?.offsetSec ?? 0) -
+        selectedBaseSec;
+    }
+    getPlayer().setClipDelays(delays);
+  }, [selectedTakeId, playerLoaded, clipStartOverrides, state.deskStatus, takes, selectedBaseSec]);
+
+  /** Clip drag: pressing an unselected clip selects it; dragging moves every
+   * selected clip together. A press without movement is just selection. */
+  function onClipPointerDown(e: React.PointerEvent, streamId: string, takeId: string) {
+    if (e.button !== 0) return;
+    e.stopPropagation();
+    const dragIds = selection.includes(streamId) ? selection : [streamId];
+    if (!selection.includes(streamId)) setSelection([streamId]);
+    setPickedTakeId(takeId);
+    const originX = e.clientX;
+    const startPositions = new Map(
+      dragIds.map((id) => {
+        const stream = state.deskStatus.find((s) => s.streamId === id);
+        return [id, stream ? clipStartSec(id, stream.takeId) : 0];
+      }),
+    );
+    const move = (ev: PointerEvent) => {
+      const dxSec = (ev.clientX - originX) / pxPerSec;
+      if (Math.abs(ev.clientX - originX) < 4) return;
+      setClipStartOverrides((prev) => {
+        const next = { ...prev };
+        for (const [id, start] of startPositions) {
+          next[id] = Math.max(0, start + dxSec);
+        }
+        return next;
+      });
+    };
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  }
+
+  /** Empty-lane press: click seeks the playhead, click-and-hold drags a
+   * marquee that selects every clip it touches. */
+  function onLanePointerDown(e: React.PointerEvent) {
+    if (e.button !== 0 || recording) return;
+    const target = e.target as HTMLElement;
+    if (target.closest("button")) return; // clips and controls handle themselves
+    const container = timelineRef.current;
+    if (!container) return;
+    const rect = container.getBoundingClientRect();
+    const x0 = e.clientX - rect.left;
+    const y0 = e.clientY - rect.top;
+    if (x0 < TRACK_HEADER_W || y0 < RULER_H) return; // headers/ruler
+    let moved = false;
+    const move = (ev: PointerEvent) => {
+      const x1 = ev.clientX - rect.left;
+      const y1 = ev.clientY - rect.top;
+      if (Math.abs(x1 - x0) + Math.abs(y1 - y0) > 5) moved = true;
+      if (moved) setMarquee({ x0, y0, x1, y1 });
+    };
+    const up = (ev: PointerEvent) => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+      if (!moved) {
+        setSelection([]);
+        seekTimeline((x0 - TRACK_HEADER_W) / pxPerSec);
+        setMarquee(null);
+        return;
+      }
+      // Marquee select: every non-live clip whose rect intersects.
+      const x1 = ev.clientX - rect.left;
+      const y1 = ev.clientY - rect.top;
+      const [left, right] = [Math.min(x0, x1), Math.max(x0, x1)];
+      const [top, bottom] = [Math.min(y0, y1), Math.max(y0, y1)];
+      const hit: string[] = [];
+      let hitTake: string | null = null;
+      rowClips.forEach((clips, rowIndex) => {
+        const rowTop = RULER_H + rowIndex * TRACK_ROW_H + 4;
+        const rowBottom = RULER_H + (rowIndex + 1) * TRACK_ROW_H - 4;
+        for (const clip of clips) {
+          if (clip.live) continue;
+          const clipLeft = TRACK_HEADER_W + clip.x;
+          const clipRight = clipLeft + Math.max(clip.width, 26);
+          if (clipLeft < right && clipRight > left && rowTop < bottom && rowBottom > top) {
+            hit.push(clip.id);
+            hitTake ??= clip.takeId;
+          }
+        }
+      });
+      setSelection(hit);
+      if (hitTake) setPickedTakeId(hitTake);
+      setMarquee(null);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  }
+
+  // Space bar: stop the ongoing recording, otherwise toggle playback.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.code !== "Space") return;
+      const target = e.target as HTMLElement;
+      if (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable) {
+        return;
+      }
+      e.preventDefault();
+      if (recording) getDeskSession(sessionId).stopTake();
+      else if (playerLoaded) getPlayer().toggle();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [recording, playerLoaded, sessionId]);
+
   function seekTimeline(sec: number) {
-    if (!selectedSlot || !playerLoaded) return;
-    getPlayer().seek(Math.max(0, sec - selectedSlot.offsetSec));
+    if (!playerLoaded) return;
+    getPlayer().seek(Math.max(0, sec - selectedBaseSec));
   }
 
   // Playhead position on the shared timeline.
@@ -259,9 +448,19 @@ function Desk({ sessionId }: { sessionId: string }) {
     ? state.activeTakeId && takes.has(state.activeTakeId)
       ? (takes.get(state.activeTakeId) as TakeSlot).offsetSec + elapsed
       : null
-    : selectedSlot && playerLoaded
-      ? selectedSlot.offsetSec + playerSnap.positionSec
+    : playerLoaded && selectedTakeId
+      ? selectedBaseSec + playerSnap.positionSec
       : null;
+
+  // Mirror editing state for tests/diagnostics.
+  useEffect(() => {
+    publishUiMirror({
+      selection,
+      clipStarts: clipStartOverrides,
+      playheadSec,
+      selectedTakeId,
+    });
+  });
 
   const joinUrl = `${location.origin}/join/${sessionId}`;
 
@@ -450,7 +649,15 @@ function Desk({ sessionId }: { sessionId: string }) {
       <div className="flex min-h-0">
         {/* -------- arrange timeline -------- */}
         <section className="relative min-w-0 flex-1 overflow-auto bg-bg">
-          <div className="relative min-w-full" style={{ width: laneWidth + TRACK_HEADER_W }}>
+          {/* Pointer editing surface (seek/marquee/drag); the transport
+              buttons + space bar are the keyboard path. */}
+          <div
+            ref={timelineRef}
+            className="relative min-w-full"
+            style={{ width: laneWidth + TRACK_HEADER_W }}
+            onPointerDown={onLanePointerDown}
+            role="presentation"
+          >
             {/* ruler row */}
             <div className="sticky top-0 z-[6] flex">
               <div
@@ -485,20 +692,29 @@ function Desk({ sessionId }: { sessionId: string }) {
                 </div>
               </div>
             )}
-            {rows.map((row) => (
+            {rows.map((row, rowIndex) => (
               <TimelineRow
                 key={row.key}
                 row={row}
-                takes={takes}
+                clips={rowClips[rowIndex] ?? []}
                 pxPerSec={pxPerSec}
                 laneWidth={laneWidth}
-                serverStatus={serverStatus}
-                selectedTakeId={selectedTakeId}
-                alignmentByStream={alignmentByStream}
-                onSelectTake={setPickedTakeId}
                 level={levelFor(row)}
               />
             ))}
+
+            {/* Marquee selection rectangle */}
+            {marquee && (
+              <div
+                className="pointer-events-none absolute z-[5] border border-accent bg-accent/10"
+                style={{
+                  left: Math.min(marquee.x0, marquee.x1),
+                  top: Math.min(marquee.y0, marquee.y1),
+                  width: Math.abs(marquee.x1 - marquee.x0),
+                  height: Math.abs(marquee.y1 - marquee.y0),
+                }}
+              />
+            )}
 
             {/* Playhead: rides the live take's write head while recording,
                 the player position during playback. */}
@@ -646,52 +862,17 @@ function formatDbfs(peak: number): string {
 
 function TimelineRow({
   row,
-  takes,
+  clips,
   pxPerSec,
   laneWidth,
-  serverStatus,
-  selectedTakeId,
-  alignmentByStream,
-  onSelectTake,
   level,
 }: {
   row: TrackRow;
-  takes: Map<string, TakeSlot>;
+  clips: ClipModel[];
   pxPerSec: number;
   laneWidth: number;
-  serverStatus: Map<string, ServerStreamStatus>;
-  selectedTakeId: string | null;
-  alignmentByStream: Map<string, boolean>;
-  onSelectTake: (takeId: string) => void;
   level: number;
 }) {
-  const clips: ClipModel[] = [];
-  for (const stream of row.streams) {
-    const slot = takes.get(stream.takeId);
-    if (!slot) continue;
-    const server = serverStatus.get(stream.streamId);
-    const converged =
-      stream.complete && (server?.complete ?? false) && stream.digest === server?.digest;
-    const aligned = alignmentByStream.get(stream.streamId) ?? false;
-    const durationSec = Math.max(
-      stream.totalSamples / SAMPLE_RATE,
-      slot.live ? slot.durationSec : 1,
-    );
-    const takeNumber = [...takes.keys()].indexOf(stream.takeId) + 1;
-    clips.push({
-      id: stream.streamId,
-      name: slot.live ? "Incoming take" : `Take ${takeNumber}`,
-      color: row.color,
-      x: slot.offsetSec * pxPerSec,
-      width: durationSec * pxPerSec - 3,
-      live: slot.live,
-      badge: slot.live ? "rec" : aligned ? "aligned" : converged ? "converged" : "syncing",
-      energy: stream.energy,
-      selected: stream.takeId === selectedTakeId && !slot.live,
-      ...(slot.live ? {} : { onSelect: () => onSelectTake(stream.takeId) }),
-    });
-  }
-
   return (
     <div className="flex border-b border-[#0e0f10]" style={{ height: TRACK_ROW_H }}>
       {/* header (232px, sticky) */}

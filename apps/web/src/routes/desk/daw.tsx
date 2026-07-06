@@ -254,15 +254,18 @@ export function VUVertical({
 
 export interface ClipModel {
   id: string;
+  takeId: string;
   name: string;
   color: string;
   x: number;
   width: number;
+  durationSec: number;
   live: boolean;
   badge: "rec" | "converged" | "syncing" | "aligned" | null;
   energy: number[];
   selected?: boolean;
-  onSelect?: () => void;
+  /** Press = select; press-and-drag = move every selected clip. */
+  onPointerDown?: (e: React.PointerEvent) => void;
 }
 
 export function ClipCard({ clip }: { clip: ClipModel }) {
@@ -276,10 +279,11 @@ export function ClipCard({ clip }: { clip: ClipModel }) {
     <button
       type="button"
       aria-label={`Select ${clip.name}`}
-      onClick={clip.onSelect}
+      data-clip={clip.id}
+      onPointerDown={clip.onPointerDown}
       className={cx(
         "absolute inset-y-1 overflow-hidden rounded-[5px] border p-0 text-left",
-        clip.onSelect ? "cursor-pointer" : "cursor-default",
+        clip.onPointerDown ? "cursor-grab active:cursor-grabbing" : "cursor-default",
         clip.selected && "shadow-[0_0_0_1px_var(--color-accent)]",
       )}
       style={{

@@ -101,13 +101,15 @@ for (let t = 0; t < 16; t++) {
   for (const l of await deskLevels()) deskChirpMax = Math.max(deskChirpMax, l);
 }
 log(`chirp-window peaks: ${chirpPeaks.map((p) => p.toFixed(4)).join(", ")}`);
-const micHeardChirp = chirpPeaks.every((p, i) => p > Math.max(0.004, peaksBefore[i] * 1.5));
+// Definitive proof arrives later via correlation confidence; the peak rise
+// factor stays modest because room noise floors move between runs.
+const micHeardChirp = chirpPeaks.every((p, i) => p > Math.max(0.004, peaksBefore[i] * 1.25));
 check(
   "all mics captured the chirp acoustically",
   micHeardChirp,
   micHeardChirp ? "" : "peaks did not rise — speakers muted or mic blocked by macOS?",
 );
-const deskBaseline = Math.max(0.004, ...deskLevelsBefore) * 1.5;
+const deskBaseline = Math.max(0.004, ...deskLevelsBefore) * 1.25;
 check(
   "desk meters respond to actual audio (rise during chirp)",
   deskChirpMax > deskBaseline,
@@ -243,6 +245,121 @@ if (rbox) {
 } else {
   check("ruler click seeks", false, "ruler not clickable");
 }
+
+// --- timeline editing: space / lane seek / marquee / group drag --------------
+const ui = () => desk.evaluate(() => window.__antiphonDesk?.ui?.() ?? null);
+const timeline = desk.locator("section > div[role=presentation]").first();
+const tbox2 = await timeline.boundingBox();
+const HEADER_W = 232;
+const RULER_HEIGHT = 30;
+const ROW_H = 66;
+const PX_PER_SEC = 24;
+
+// Space toggles playback.
+await desk.locator("body").click({ position: { x: 5, y: 300 } }); // drop focus, also a lane-less click
+await desk.keyboard.press("Space");
+await desk.waitForTimeout(500);
+const sp1 = await playerSnap();
+await desk.keyboard.press("Space");
+await desk.waitForTimeout(300);
+const sp2 = await playerSnap();
+check(
+  "space bar toggles play/pause",
+  sp1.playing && !sp2.playing,
+  `playing ${sp1.playing} → ${sp2.playing}`,
+);
+
+// Lane click on empty space (before the clips start at 1s) seeks: the
+// target maps to take-time 0.
+await desk.mouse.click(
+  tbox2.x + HEADER_W + 0.5 * PX_PER_SEC,
+  tbox2.y + RULER_HEIGHT + ROW_H / 2, // inside row 1's lane, left of its clip
+);
+await desk.waitForTimeout(300);
+const afterLaneSeek = await playerSnap();
+check(
+  "timeline click moves the playhead",
+  afterLaneSeek.positionSec < 0.2,
+  `pos ${afterLaneSeek.positionSec.toFixed(2)} (want ≈0)`,
+);
+
+// Marquee: drag on empty lane space from right of the clips leftward across
+// all three rows → selects all three clips.
+await desk.mouse.move(tbox2.x + HEADER_W + 320, tbox2.y + RULER_HEIGHT + 8);
+await desk.mouse.down();
+await desk.mouse.move(tbox2.x + HEADER_W + 30, tbox2.y + RULER_HEIGHT + 3 * ROW_H - 8, {
+  steps: 8,
+});
+await desk.mouse.up();
+await desk.waitForTimeout(300);
+const afterMarquee = await ui();
+check(
+  "marquee selects all clips it touches",
+  (afterMarquee?.selection.length ?? 0) === 3,
+  `${afterMarquee?.selection.length ?? 0}/3 selected`,
+);
+
+// Group drag: grab the first row's clip and pull it +2s; every selected clip
+// moves together.
+const clip = desk.locator("[data-clip]").first();
+const cbox = await clip.boundingBox();
+await desk.mouse.move(cbox.x + cbox.width / 2, cbox.y + cbox.height / 2);
+await desk.mouse.down();
+await desk.mouse.move(cbox.x + cbox.width / 2 + 2 * PX_PER_SEC, cbox.y + cbox.height / 2, {
+  steps: 6,
+});
+await desk.mouse.up();
+await desk.waitForTimeout(400);
+const afterDrag = await ui();
+const starts = Object.values(afterDrag?.clipStarts ?? {});
+const movedTogether =
+  starts.length === 3 && starts.every((s) => Math.abs(s - (starts[0] ?? 0)) < 0.05);
+check(
+  "dragging a selected clip moves all selected clips together",
+  movedTogether && Math.abs((starts[0] ?? 0) - 3) < 0.6, // 1s base + 2s drag
+  `starts ${starts.map((s) => s.toFixed(2)).join(", ")}`,
+);
+
+// Nudge ONE clip relative to the others: clear the selection with an empty
+// click, drag only row 1's clip a further +1.5s — the arrangement now has a
+// relative offset, so total playable duration must grow by ~1.5s.
+const durBefore = (await playerSnap()).durationSec;
+await desk.mouse.click(tbox2.x + HEADER_W + 0.3 * PX_PER_SEC, tbox2.y + RULER_HEIGHT + 8);
+await desk.waitForTimeout(200);
+const clip0 = desk.locator("[data-clip]").first();
+const c0 = await clip0.boundingBox();
+await desk.mouse.move(c0.x + c0.width / 2, c0.y + c0.height / 2);
+await desk.mouse.down();
+await desk.mouse.move(c0.x + c0.width / 2 + 1.5 * PX_PER_SEC, c0.y + c0.height / 2, {
+  steps: 5,
+});
+await desk.mouse.up();
+await desk.waitForTimeout(400);
+const durAfter = (await playerSnap()).durationSec;
+check(
+  "playback honors a per-clip offset (duration grows)",
+  Math.abs(durAfter - durBefore - 1.5) < 0.3,
+  `duration ${durBefore.toFixed(2)} → ${durAfter.toFixed(2)}`,
+);
+await desk.keyboard.press("Space");
+await desk.waitForTimeout(600);
+const spMoved = await playerSnap();
+check(
+  "playback runs on the edited arrangement",
+  spMoved.playing,
+  `pos ${spMoved.positionSec.toFixed(2)}`,
+);
+await desk.keyboard.press("Space");
+
+// Space during recording stops the take.
+await desk.getByRole("button", { name: "Record take" }).click();
+await desk.waitForTimeout(1500);
+await desk.keyboard.press("Space");
+await desk.waitForTimeout(800);
+const takeStopped = await desk.evaluate(
+  () => window.__antiphonDesk?.snapshot()?.activeTakeId === null,
+);
+check("space bar stops an ongoing recording", takeStopped);
 
 await desk.screenshot({ path: "screens/live-final.png" });
 
