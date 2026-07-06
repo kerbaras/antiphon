@@ -3,7 +3,7 @@
 // channel to the server (HAVE-diff replication, §6.8), persists every chunk
 // to OPFS via the sink worker, and drives take lifecycle + calibration.
 
-import { generate_chirp, init as initWasm } from "@antiphon/core-wasm";
+import { decode_meter_frame, generate_chirp, init as initWasm } from "@antiphon/core-wasm";
 import {
   DEFAULT_CHIRP_SPEC,
   SERVER_PEER_ID,
@@ -39,6 +39,8 @@ export interface DeskSessionState {
   rebuiltChunks: number;
   lastChirpAt: number | null;
   errors: string[];
+  /** Live capture peaks per stream (METER telemetry): value + received-at. */
+  liveLevels: Record<string, { peak: number; at: number }>;
 }
 
 type Listener = (state: DeskSessionState) => void;
@@ -69,7 +71,9 @@ export class DeskSession {
     rebuiltChunks: 0,
     lastChirpAt: null,
     errors: [],
+    liveLevels: {},
   };
+  private wasmReady = false;
   private timers: number[] = [];
   private waiters: {
     acks: Array<(f: ArrayBuffer[]) => void>;
@@ -92,6 +96,9 @@ export class DeskSession {
   }
 
   start(): void {
+    void initWasm().then(() => {
+      this.wasmReady = true;
+    });
     this.post({ type: "configure", sessionId: this.sessionId });
     this.signaling.onMessage((msg) => this.onSignal(msg));
     this.signaling.onState(() => {
@@ -263,6 +270,7 @@ export class DeskSession {
       this.conns.set(connId, conn);
       channel.addEventListener("message", (mev) => {
         if (mev.data instanceof ArrayBuffer) {
+          if (this.interceptMeter(mev.data)) return;
           this.post({ type: "frame", connId, bytes: mev.data }, [mev.data]);
         }
       });
@@ -331,6 +339,9 @@ export class DeskSession {
   }
 
   private onServerSyncFrame(bytes: ArrayBuffer, connId: number): void {
+    // Meter telemetry (teed by the server for recorders without a P2P leg)
+    // never reaches the protocol worker.
+    if (this.interceptMeter(bytes)) return;
     // Frame type dispatch happens in the worker for chunks/gaps; HAVEs from
     // the server additionally trigger a push plan from OUR store.
     const view = new Uint8Array(bytes);
@@ -340,6 +351,25 @@ export class DeskSession {
       this.requestPushPlan(copy);
     }
     this.post({ type: "frame", connId, bytes }, [bytes]);
+  }
+
+  /** METER frames (experimental 0x80) are UI telemetry, handled here. */
+  private interceptMeter(bytes: ArrayBuffer): boolean {
+    if (bytes.byteLength !== 40) return false;
+    const head = new Uint8Array(bytes, 0, 4);
+    if (head[3] !== 0x80) return false;
+    if (!this.wasmReady) return true; // it IS a meter frame; just not ready
+    const json = decode_meter_frame(new Uint8Array(bytes));
+    if (json) {
+      const { streamId, peak } = JSON.parse(json) as { streamId: string; peak: number };
+      this.patch({
+        liveLevels: {
+          ...this.state.liveLevels,
+          [streamId]: { peak, at: Date.now() },
+        },
+      });
+    }
+    return true;
   }
 
   private requestPushPlan(haveBytes: ArrayBuffer): void {

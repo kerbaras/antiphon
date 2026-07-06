@@ -5,6 +5,7 @@
 
 import {
   chunk_meta_json,
+  encode_meter_frame,
   extract_chunk_payload,
   extract_codec_header,
   init,
@@ -33,6 +34,8 @@ let localSink: SinkEngine | null = null;
 const localPayloads = new Map<number, Uint8Array>();
 let localCodecHeader: Uint8Array | null = null;
 let peak = 0;
+/** Take/stream identity retained for METER telemetry frames. */
+let meterIds: { takeId: Uint8Array; streamId: Uint8Array } | null = null;
 /** Sinks registered before the engine exists (arm applies them). */
 const preArmSinks = new Map<number, boolean>();
 
@@ -122,6 +125,12 @@ function sendStats() {
     peak,
     localChunks: localPayloads.size,
   });
+  // Live level telemetry toward the desk's meters, only while capturing.
+  if (stats?.state === "streaming" && meterIds) {
+    const frame = encode_meter_frame(meterIds.takeId, meterIds.streamId, peak);
+    const buf = frame.buffer as ArrayBuffer;
+    post({ type: "meter", frame: buf }, [buf]);
+  }
 }
 
 async function handle(msg: ToEncoderWorker) {
@@ -150,6 +159,7 @@ async function handle(msg: ToEncoderWorker) {
       const epochUs = nowUs();
       retainLocal = msg.retainLocal;
       localSink = retainLocal ? new SinkEngine() : null;
+      meterIds = { takeId: msg.takeId.slice(), streamId: msg.streamId.slice() };
       localPayloads.clear();
       localCodecHeader = null;
       engine = new RecorderEngine(

@@ -265,6 +265,21 @@ function Desk({ sessionId }: { sessionId: string }) {
 
   const joinUrl = `${location.origin}/join/${sessionId}`;
 
+  /** Real level for a row's meters: live METER telemetry while recording,
+   * the player's analyser during playback, silence otherwise. */
+  function levelFor(row: TrackRow): number {
+    if (recording) {
+      const activeStream = row.streams.find((s) => s.takeId === state.activeTakeId);
+      const live = activeStream ? state.liveLevels[activeStream.streamId] : undefined;
+      return live && Date.now() - live.at < 1_200 ? live.peak : 0;
+    }
+    if (playerLoaded && playerSnap.playing) {
+      const streamId = row.streams.find((s) => s.takeId === selectedTakeId)?.streamId;
+      return playerSnap.tracks.find((t) => t.streamId === streamId)?.level ?? 0;
+    }
+    return 0;
+  }
+
   function share() {
     void navigator.clipboard.writeText(joinUrl).then(() => {
       setShared(true);
@@ -481,6 +496,7 @@ function Desk({ sessionId }: { sessionId: string }) {
                 selectedTakeId={selectedTakeId}
                 alignmentByStream={alignmentByStream}
                 onSelectTake={setPickedTakeId}
+                level={levelFor(row)}
               />
             ))}
 
@@ -532,6 +548,7 @@ function Desk({ sessionId }: { sessionId: string }) {
               joinUrl={joinUrl}
               activeTakeId={state.activeTakeId}
               streams={state.streams}
+              levelForRow={levelFor}
             />
           ) : (
             <SinksPanel deskStatus={state.deskStatus} serverStatus={serverStatus} />
@@ -549,6 +566,8 @@ function Desk({ sessionId }: { sessionId: string }) {
               selectedTakeId={selectedTakeId}
               playerSnap={playerSnap}
               playerLoaded={playerLoaded}
+              recording={recording}
+              liveLevel={levelFor(row)}
             />
           ))}
         </div>
@@ -571,27 +590,33 @@ function Desk({ sessionId }: { sessionId: string }) {
 }
 
 /** Mixer strip bound to a track row: controls the selected take's stream
- * for that performer; falls back to activity display while recording. */
+ * for that performer; while recording it meters the LIVE capture level
+ * reported by the phone (METER telemetry). */
 function RowMixerStrip({
   row,
   selectedTakeId,
   playerSnap,
   playerLoaded,
+  recording,
+  liveLevel,
 }: {
   row: TrackRow;
   selectedTakeId: string | null;
   playerSnap: PlayerSnapshot;
   playerLoaded: boolean;
+  recording: boolean;
+  liveLevel: number;
 }) {
   const streamId = row.streams.find((s) => s.takeId === selectedTakeId)?.streamId;
   const track = playerLoaded ? playerSnap.tracks.find((t) => t.streamId === streamId) : undefined;
-  if (!track) {
+  if (recording || !track) {
     return (
       <MixerStrip
         name={row.name}
         color={row.color}
         active={row.receiving}
-        dbText={row.receiving ? "rx" : "—"}
+        level={liveLevel}
+        dbText={recording ? formatDbfs(liveLevel) : "—"}
       />
     );
   }
@@ -611,6 +636,12 @@ function RowMixerStrip({
   );
 }
 
+/** Instantaneous dBFS readout for a 0..1 peak. */
+function formatDbfs(peak: number): string {
+  if (peak <= 0.001) return "−∞ dB";
+  return `${(20 * Math.log10(peak)).toFixed(1)} dB`;
+}
+
 // ---- timeline row -----------------------------------------------------------
 
 function TimelineRow({
@@ -622,6 +653,7 @@ function TimelineRow({
   selectedTakeId,
   alignmentByStream,
   onSelectTake,
+  level,
 }: {
   row: TrackRow;
   takes: Map<string, TakeSlot>;
@@ -631,6 +663,7 @@ function TimelineRow({
   selectedTakeId: string | null;
   alignmentByStream: Map<string, boolean>;
   onSelectTake: (takeId: string) => void;
+  level: number;
 }) {
   const clips: ClipModel[] = [];
   for (const stream of row.streams) {
@@ -698,7 +731,7 @@ function TimelineRow({
           </div>
         </div>
         <div className="flex w-[14px] flex-none items-end bg-[#191a1b] px-1 py-1.5">
-          <VUVertical active={row.receiving} className="h-[52px]" />
+          <VUVertical active={row.receiving} level={level} className="h-[52px]" />
         </div>
       </div>
 
@@ -721,6 +754,7 @@ function PerformersPanel({
   joinUrl,
   activeTakeId,
   streams,
+  levelForRow,
 }: {
   sessionId: string;
   recorders: Array<{ peerId: string; deviceInfo: { userAgent: string } }>;
@@ -728,6 +762,7 @@ function PerformersPanel({
   joinUrl: string;
   activeTakeId: string | null;
   streams: Array<{ streamId: string; takeId: string; peerId: string | null }>;
+  levelForRow: (row: TrackRow) => number;
 }) {
   const [showQr, setShowQr] = useState<boolean | null>(null);
   const [qr, setQr] = useState<string | null>(null);
@@ -781,7 +816,7 @@ function PerformersPanel({
               <span className="w-14 flex-none truncate text-[9px] text-text-faint">
                 → {row?.name ?? "unassigned"}
               </span>
-              <VUMeter level={row?.receiving ? 0.72 : 0.03} className="flex-1" />
+              <VUMeter level={row ? levelForRow(row) : 0} className="flex-1" />
             </div>
           </div>
         );

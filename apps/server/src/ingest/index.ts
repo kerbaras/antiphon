@@ -358,9 +358,15 @@ export class SessionIngest {
           );
           break;
         }
+        case "ignored": {
+          // Experimental frames (0x80–0xFF, e.g. live METER telemetry) are
+          // not protocol state, but the desk wants them even when its P2P
+          // leg to the recorder failed: tee recorder→sync, fire-and-forget.
+          if (link.dataChannel === dc) this.teeRawToSyncPeers(peerId, bytes);
+          break;
+        }
         case "corrupt":
         case "ack":
-        case "ignored":
         case "discard":
           break;
         default:
@@ -427,6 +433,15 @@ export class SessionIngest {
     if (!this.engine) return;
     for (const have of this.engine.have_frames()) {
       safeSend(dc, have as Uint8Array);
+    }
+  }
+
+  /** Best-effort raw tee (telemetry): dropped without retry under pressure. */
+  private teeRawToSyncPeers(sourcePeerId: string, bytes: Uint8Array): void {
+    for (const [peerId, link] of this.peers) {
+      if (peerId === sourcePeerId) continue;
+      const dc = link.syncChannel;
+      if (dc?.isOpen() && dc.bufferedAmount() < LOW_WATERMARK) safeSend(dc, bytes);
     }
   }
 

@@ -55,6 +55,8 @@ export type FromEncoderWorker =
   | { type: "frames"; sinkId: number; frames: ArrayBuffer[] }
   | { type: "reply"; sinkId: number; bytes: ArrayBuffer }
   | { type: "pending"; sinkIds: number[] }
+  /** Live peak telemetry (experimental METER frame) for every sink. */
+  | { type: "meter"; frame: ArrayBuffer }
   | {
       type: "stats";
       stats: RecorderStats | null;

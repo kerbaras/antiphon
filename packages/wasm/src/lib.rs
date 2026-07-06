@@ -101,3 +101,56 @@ fn parse_id(bytes: &[u8], what: &str) -> Result<[u8; 16], JsError> {
         .try_into()
         .map_err(|_| JsError::new(&format!("{what} must be exactly 16 bytes")))
 }
+
+/// Experimental METER frame type — from the private/experimental range the
+/// RFC reserves (§6.1, 0x80–0xFF). Carries a recorder's instantaneous peak
+/// level for live desk metering. Fire-and-forget UI telemetry: never
+/// persisted, never acked, and any conformant receiver that doesn't know it
+/// MUST ignore it. Not part of the normative protocol.
+pub const FT_METER_EXPERIMENTAL: u8 = 0x80;
+const METER_FRAME_LEN: usize = 4 + 16 + 16 + 4;
+
+/// Build a METER frame: header ++ take_id ++ stream_id ++ peak (f32 LE).
+#[wasm_bindgen]
+pub fn encode_meter_frame(take_id: &[u8], stream_id: &[u8], peak: f32) -> Result<Vec<u8>, JsError> {
+    let take = parse_id(take_id, "take_id")?;
+    let stream = parse_id(stream_id, "stream_id")?;
+    let mut out = Vec::with_capacity(METER_FRAME_LEN);
+    out.extend_from_slice(&antiphon_core::constants::MAGIC);
+    out.push(antiphon_core::constants::PROTOCOL_VERSION);
+    out.push(FT_METER_EXPERIMENTAL);
+    out.extend_from_slice(&take);
+    out.extend_from_slice(&stream);
+    out.extend_from_slice(&peak.clamp(0.0, 1.0).to_le_bytes());
+    Ok(out)
+}
+
+/// Parse a METER frame → JSON `{takeId, streamId, peak}`, or null for
+/// anything that isn't one.
+#[wasm_bindgen]
+pub fn decode_meter_frame(bytes: &[u8]) -> Option<String> {
+    if bytes.len() != METER_FRAME_LEN
+        || bytes[0..2] != antiphon_core::constants::MAGIC
+        || bytes[2] != antiphon_core::constants::PROTOCOL_VERSION
+        || bytes[3] != FT_METER_EXPERIMENTAL
+    {
+        return None;
+    }
+    let take_id: [u8; 16] = bytes[4..20].try_into().ok()?;
+    let stream_id: [u8; 16] = bytes[20..36].try_into().ok()?;
+    let peak = f32::from_le_bytes(bytes[36..40].try_into().ok()?);
+    Some(
+        crate::json::Obj::new()
+            .str("takeId", crate::json::uuid_string(&take_id))
+            .str("streamId", crate::json::uuid_string(&stream_id))
+            .num(
+                "peak",
+                if peak.is_finite() {
+                    peak.clamp(0.0, 1.0)
+                } else {
+                    0.0
+                },
+            )
+            .build(),
+    )
+}

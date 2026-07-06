@@ -8,7 +8,9 @@ import wasmInit, { initSync } from "../pkg/antiphon.js";
 export {
   chunk_meta_json,
   constants_json,
+  decode_meter_frame,
   encode_have_summary,
+  encode_meter_frame,
   extract_chunk_payload,
   extract_codec_header,
   find_chirp_offset,

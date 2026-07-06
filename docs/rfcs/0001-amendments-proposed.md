@@ -73,7 +73,19 @@ intact DTLS; indicates a sender bug) is discarded WITHOUT storing: the seq
 stays a hole and retransmission re-requests it. Storing known-corrupt bytes
 under an immutable chunk key would poison the idempotency law.
 
-## A8. Editorial
+## A8. Informative: METER telemetry frame (experimental 0x80)
+
+The reference implementation uses frame type `0x80` (from the §6.1
+private/experimental range, exactly as intended) for live capture-level
+telemetry: header ++ `take_id` ++ `stream_id` ++ `peak` (f32 LE, 0..1),
+sent ~4×/s recorder→sinks, teed server→desk over `antiphon-sync/1`.
+Fire-and-forget UI data: never persisted, never acknowledged, never
+retransmitted; conformant receivers that don't know it ignore it (verified
+— the server's SinkEngine treats it as UnknownType). Documented here so
+other implementations don't collide on 0x80 casually; not proposed for the
+normative protocol.
+
+## A9. Editorial
 
 - §15 says the property suite lives in `rust/core`; the crate lives at
   `packages/core` (Cargo workspace member `antiphon-core`).

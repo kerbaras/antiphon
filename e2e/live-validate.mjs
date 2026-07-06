@@ -71,17 +71,34 @@ for (const [i, page] of phones.entries()) {
   check(`phone ${i + 1} streaming`, s.state === "streaming", s.state);
 }
 
+// Desk-side live meters (METER telemetry): fresh levels for every stream.
+const deskLevels = () =>
+  desk.evaluate(() => {
+    const levels = window.__antiphonDesk?.snapshot()?.liveLevels ?? {};
+    const now = Date.now();
+    return Object.values(levels)
+      .filter((l) => now - l.at < 1500)
+      .map((l) => l.peak);
+  });
+await desk.waitForTimeout(1200);
+const meterCount = (await deskLevels()).length;
+check("desk receives live meter telemetry for all 3 streams", meterCount === 3, `${meterCount}/3`);
+
 // Sample ambient peak before the chirp, then chirp and watch the mic hear it.
 const peaksBefore = await Promise.all(phones.map((p) => phoneState(p).then((s) => s.peak)));
+const deskLevelsBefore = await deskLevels();
 log(`ambient peaks: ${peaksBefore.map((p) => p.toFixed(4)).join(", ")}`);
+log(`desk meter levels: ${deskLevelsBefore.map((p) => p.toFixed(4)).join(", ")}`);
 
 await desk.getByRole("button", { name: "Chirp" }).click();
 log("chirp playing through speakers…");
 let chirpPeaks = [0, 0, 0];
+let deskChirpMax = 0;
 for (let t = 0; t < 16; t++) {
   await desk.waitForTimeout(250);
   const now = await Promise.all(phones.map((p) => phoneState(p).then((s) => s.peak)));
   chirpPeaks = chirpPeaks.map((v, i) => Math.max(v, now[i]));
+  for (const l of await deskLevels()) deskChirpMax = Math.max(deskChirpMax, l);
 }
 log(`chirp-window peaks: ${chirpPeaks.map((p) => p.toFixed(4)).join(", ")}`);
 const micHeardChirp = chirpPeaks.every((p, i) => p > Math.max(0.004, peaksBefore[i] * 1.5));
@@ -89,6 +106,12 @@ check(
   "all mics captured the chirp acoustically",
   micHeardChirp,
   micHeardChirp ? "" : "peaks did not rise — speakers muted or mic blocked by macOS?",
+);
+const deskBaseline = Math.max(0.004, ...deskLevelsBefore) * 1.5;
+check(
+  "desk meters respond to actual audio (rise during chirp)",
+  deskChirpMax > deskBaseline,
+  `max ${deskChirpMax.toFixed(4)} vs baseline ${deskBaseline.toFixed(4)}`,
 );
 
 // Keep recording a few more seconds of room, then stop.

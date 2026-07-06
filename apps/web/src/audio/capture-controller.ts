@@ -252,6 +252,14 @@ export class CaptureController {
         port?.send([msg.bytes]);
         break;
       }
+      case "meter": {
+        // Fire-and-forget telemetry to every sink with headroom; meters are
+        // worthless stale, so never queue behind audio.
+        for (const port of this.sinks.values()) {
+          if (port.budget() > msg.frame.byteLength) port.send([msg.frame]);
+        }
+        break;
+      }
       case "stopped":
         this.publish({ finalSeq: msg.finalSeq });
         break;
