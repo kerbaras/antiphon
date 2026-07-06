@@ -24,9 +24,24 @@ export default defineConfig({
     // Mobile Safari is the hostile baseline for the phone recorder.
     { name: "mobile-safari", use: { ...devices["iPhone 15"] } },
   ],
-  webServer: {
-    command: "pnpm --filter @antiphon/web preview",
-    url: "http://localhost:4173",
-    reuseExistingServer: !process.env.CI,
-  },
+  webServer: [
+    {
+      command: "pnpm --filter @antiphon/web preview",
+      url: "http://localhost:4173",
+      reuseExistingServer: !process.env.CI,
+    },
+    {
+      // The real thing: Hono + node-datachannel + Postgres + blobs.
+      command: "pnpm --filter @antiphon/server start",
+      url: "http://localhost:8787/health",
+      reuseExistingServer: !process.env.CI,
+      env: {
+        DATABASE_URL:
+          process.env.DATABASE_URL ?? "postgres://antiphon:antiphon@localhost:5433/antiphon",
+        PORT: "8787",
+        BLOB_DRIVER: "fs",
+        BLOB_FS_ROOT: "./data/e2e-blobs",
+      },
+    },
+  ],
 });

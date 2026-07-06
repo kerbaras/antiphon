@@ -43,3 +43,11 @@ pnpm check          # all of the above
 ```
 
 Real-iPhone testing needs HTTPS: `cloudflared tunnel --url http://localhost:5173`.
+
+## Key documents
+
+- [docs/rfcs/0001-protocol.md](docs/rfcs/0001-protocol.md) — the wire format (normative)
+- [docs/rfcs/0001-amendments-proposed.md](docs/rfcs/0001-amendments-proposed.md) — implementation-driven amendments
+- [docs/demo-m1.md](docs/demo-m1.md) — the Milestone 1 demo (automated + two-iPhone runbook)
+- [docs/ios-capture-runbook.md](docs/ios-capture-runbook.md) — real-device capture verification
+- [docs/design-system.md](docs/design-system.md) — UI tokens, kit, and binding references

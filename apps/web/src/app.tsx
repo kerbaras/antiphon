@@ -9,6 +9,8 @@ export function App() {
       <Routes>
         <Route path="/session/:uuid" element={<DeskRoute />} />
         <Route path="/join/:uuid" element={<JoinRoute />} />
+        {/* Capture verification without a session (M0 / iOS runbook). */}
+        <Route path="/rehearse" element={<JoinRoute />} />
         <Route path="*" element={<Home />} />
       </Routes>
     </BrowserRouter>

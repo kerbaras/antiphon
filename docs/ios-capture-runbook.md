@@ -13,7 +13,8 @@ cloudflared tunnel --url http://localhost:5173   # terminal 2
 
 `cloudflared` prints an `https://<random>.trycloudflare.com` URL — HTTPS is
 mandatory for `getUserMedia`, and LAN IPs can't get certificates on iOS.
-Open `https://<tunnel>/join/test` on the iPhone in Safari.
+Open `https://<tunnel>/rehearse` on the iPhone in Safari (the session-less
+capture-verification page).
 
 ## Checks (in order)
 

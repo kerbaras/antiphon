@@ -11,6 +11,7 @@ export {
   encode_have_summary,
   extract_chunk_payload,
   extract_codec_header,
+  generate_chirp,
   IngestResult,
   RecorderEngine,
   SinkEngine,

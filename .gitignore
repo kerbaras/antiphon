@@ -19,6 +19,9 @@ coverage/
 proptest-regressions/
 screens/
 
+# local blob storage (fs driver)
+data/
+
 # editor / os
 .DS_Store
 *.log

@@ -10,6 +10,17 @@ const crossOriginIsolation = {
   "Cross-Origin-Embedder-Policy": "require-corp",
 };
 
+// Control plane + archive REST live on the app server; one origin for the
+// browser (and for a single cloudflared tunnel) via proxy in dev/preview.
+const serverProxy = {
+  "/api": { target: "http://localhost:8787", changeOrigin: true },
+  "^/(session|join)/[^/]+/ws$": {
+    target: "http://localhost:8787",
+    ws: true,
+    changeOrigin: true,
+  },
+};
+
 export default defineConfig({
   plugins: [
     react({
@@ -19,7 +30,7 @@ export default defineConfig({
     }),
     tailwindcss(),
   ],
-  server: { headers: crossOriginIsolation },
-  preview: { headers: crossOriginIsolation },
+  server: { headers: crossOriginIsolation, proxy: serverProxy },
+  preview: { headers: crossOriginIsolation, proxy: serverProxy },
   worker: { format: "es" },
 });

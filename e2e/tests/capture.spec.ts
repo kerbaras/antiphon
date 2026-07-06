@@ -39,7 +39,7 @@ test.describe("capture path", () => {
   test.skip(({ browserName }) => browserName !== "chromium", "fake mic is Chromium-only");
 
   test("records a local take: chunks, no gaps, no drops, playable flac", async ({ page }) => {
-    await page.goto(`/join/${crypto.randomUUID()}`);
+    await page.goto("/rehearse");
     await page.getByRole("button", { name: /enable microphone/i }).click();
 
     // Pipeline up: capture flags honored (fake device applies constraints).
@@ -93,7 +93,7 @@ test.describe("capture path", () => {
   });
 
   test("take state machine survives a second take on the same page", async ({ page }) => {
-    await page.goto(`/join/${crypto.randomUUID()}`);
+    await page.goto("/rehearse");
     await page.getByRole("button", { name: /enable microphone/i }).click();
     await page.getByRole("button", { name: /record/i }).click();
     await page.waitForTimeout(800);

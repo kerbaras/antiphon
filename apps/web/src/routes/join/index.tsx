@@ -18,16 +18,23 @@ import {
   VUMeter,
   Wordmark,
 } from "../../ui/kit";
-import { getCaptureController, useCaptureSnapshot } from "./use-capture";
+import {
+  getCaptureController,
+  joinSession,
+  useCaptureSnapshot,
+  useRecorderSessionState,
+} from "./use-capture";
 
 export function JoinRoute() {
   const { uuid } = useParams();
   const snap = useCaptureSnapshot();
+  const sessionState = useRecorderSessionState();
   const [busy, setBusy] = useState(false);
 
   const state = snap.stats?.state ?? "idle";
   const capturing = snap.contextSampleRate !== null;
   const recording = state === "streaming";
+  const inSession = sessionState !== null;
 
   const seconds =
     snap.stats && snap.stats.sampleRate > 0 ? snap.stats.samplesIn / snap.stats.sampleRate : 0;
@@ -36,6 +43,7 @@ export function JoinRoute() {
     setBusy(true);
     try {
       await getCaptureController().start();
+      if (uuid) joinSession(uuid);
     } finally {
       setBusy(false);
     }
@@ -69,9 +77,9 @@ export function JoinRoute() {
       <header className="flex items-center justify-between border-b border-divider pb-3">
         <Wordmark />
         <div className="flex flex-col items-end leading-tight">
-          <span className="text-[10px] text-text-dim">session</span>
+          <span className="text-[10px] text-text-dim">{uuid ? "session" : "rehearsal"}</span>
           <span className="font-mono text-[10px] text-text-mute">
-            {uuid ? `${uuid.slice(0, 8)}…` : "—"}
+            {uuid ? `${uuid.slice(0, 8)}…` : "no session"}
           </span>
         </div>
       </header>
@@ -154,8 +162,51 @@ export function JoinRoute() {
         )}
       </Panel>
 
-      {/* Local rehearsal take (server transport arrives with the session) */}
-      {capturing && (
+      {/* Session transport: the desk drives takes; links carry the chunks */}
+      {capturing && inSession && sessionState && (
+        <Panel className="p-4">
+          <div className="flex items-center justify-between">
+            <SectionLabel>Session links</SectionLabel>
+            <StatusPill tone={sessionState.signalingConnected ? "ok" : "warn"}>
+              {sessionState.signalingConnected ? "joined" : "rejoining"}
+            </StatusPill>
+          </div>
+          <div className="mt-3 flex flex-col gap-1.5">
+            <LinkReadout label="server sink" state={sessionState.serverLink} />
+            <LinkReadout label="desk sink" state={sessionState.deskLink} />
+            {sessionState.activeTakeId && (
+              <MonoReadout label="take" value={`${sessionState.activeTakeId.slice(0, 8)}…`} />
+            )}
+            {snap.stats?.sinks.map((s) => (
+              <MonoReadout
+                key={s.id}
+                label={`sink ${s.id === 0 ? "server" : "desk"} settled`}
+                value={
+                  <span className={s.settled ? "text-ok" : undefined}>
+                    {s.settled ? "yes" : "no"}
+                  </span>
+                }
+              />
+            ))}
+          </div>
+          {sessionState.outageUntil && (
+            <p className="mt-2 font-mono text-[10px] text-rec">
+              network outage simulated — capture continues
+            </p>
+          )}
+          <Button
+            variant="outline"
+            className="mt-3 w-full"
+            onClick={() => joinSession(uuid as string).simulateOutage(5_000)}
+            disabled={sessionState.outageUntil !== null}
+          >
+            ⚡ Simulate 5s dropout
+          </Button>
+        </Panel>
+      )}
+
+      {/* Local rehearsal take (no session joined) */}
+      {capturing && !inSession && (
         <Panel className="p-4">
           <div className="flex items-center justify-between">
             <SectionLabel>Local take</SectionLabel>
@@ -229,6 +280,24 @@ export function JoinRoute() {
       </p>
     </main>
   );
+}
+
+function LinkReadout({
+  label,
+  state,
+}: {
+  label: string;
+  state: "connected" | "connecting" | "down" | "absent";
+}) {
+  const color =
+    state === "connected"
+      ? "text-ok"
+      : state === "connecting"
+        ? "text-warn"
+        : state === "absent"
+          ? "text-text-faint"
+          : "text-rec";
+  return <MonoReadout label={label} value={<span className={color}>{state}</span>} />;
 }
 
 function FlagBadge({ label, value }: { label: string; value: boolean | string | undefined }) {

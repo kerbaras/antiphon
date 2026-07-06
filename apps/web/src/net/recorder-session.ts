@@ -1,0 +1,295 @@
+// Recorder-side session orchestration: signaling + a DataChannel to every
+// reachable sink (server always, desk when ICE allows) + the capture
+// pipeline. Transport state NEVER gates capture (§7.1): take-start arms the
+// worker immediately; channels catch up whenever they can.
+
+import { SERVER_PEER_ID, type SignalingMessage } from "@antiphon/protocol";
+import type { CaptureController, SinkPort } from "../audio/capture-controller";
+import { uuidToBytes } from "../audio/capture-controller";
+import { offerChannel } from "./rtc";
+import { SignalingClient } from "./signaling-client";
+
+export const SINK_SERVER = 0;
+export const SINK_DESK = 1;
+
+const HIGH_WATERMARK = 1 << 20;
+const LOW_WATERMARK = 256 * 1024;
+const TIME_SYNC_INTERVAL_MS = 5_000;
+const RECONNECT_DELAY_MS = 2_000;
+
+interface SinkLink {
+  sinkId: number;
+  targetPeerId: string;
+  label: string;
+  dispose: (() => void) | null;
+  channel: RTCDataChannel | null;
+  connecting: boolean;
+  wanted: boolean;
+}
+
+export interface RecorderSessionState {
+  signalingConnected: boolean;
+  peerId: string | null;
+  serverLink: "connected" | "connecting" | "down";
+  deskLink: "connected" | "connecting" | "down" | "absent";
+  activeTakeId: string | null;
+  streamId: string | null;
+  outageUntil: number | null;
+}
+
+type Listener = (state: RecorderSessionState) => void;
+
+export class RecorderSession {
+  private readonly signaling: SignalingClient;
+  private readonly controller: CaptureController;
+  private readonly links = new Map<number, SinkLink>();
+  private readonly listeners = new Set<Listener>();
+  private timeSyncTimer: number | null = null;
+  private outageUntil: number | null = null;
+  private activeTakeId: string | null = null;
+  private streamId: string | null = null;
+  private stoppedForFinal: { takeId: string; streamId: string } | null = null;
+
+  constructor(sessionId: string, controller: CaptureController) {
+    this.controller = controller;
+    this.signaling = new SignalingClient("recorder", sessionId);
+  }
+
+  start(): void {
+    this.signaling.onMessage((msg) => this.onSignal(msg));
+    this.signaling.onState(() => {
+      if (this.signaling.state.connected) this.ensureLinks();
+      this.publish();
+    });
+    this.signaling.connect();
+    this.timeSyncTimer = window.setInterval(() => {
+      for (const link of this.links.values()) {
+        if (link.channel?.readyState === "open") {
+          this.controller.sendTimePing(link.sinkId);
+        }
+      }
+    }, TIME_SYNC_INTERVAL_MS);
+  }
+
+  subscribe(listener: Listener): () => void {
+    this.listeners.add(listener);
+    listener(this.snapshot());
+    return () => this.listeners.delete(listener);
+  }
+
+  snapshot(): RecorderSessionState {
+    const linkState = (sinkId: number): "connected" | "connecting" | "down" => {
+      const link = this.links.get(sinkId);
+      if (link?.channel?.readyState === "open") return "connected";
+      if (link?.connecting) return "connecting";
+      return "down";
+    };
+    return {
+      signalingConnected: this.signaling.state.connected,
+      peerId: this.signaling.state.peerId,
+      serverLink: linkState(SINK_SERVER),
+      deskLink: this.deskPeerId() ? linkState(SINK_DESK) : "absent",
+      activeTakeId: this.activeTakeId,
+      streamId: this.streamId,
+      outageUntil: this.outageUntil,
+    };
+  }
+
+  /** Demo/testing hook: kill every transport for `ms`. Capture continues;
+   * reconnect + backfill happen automatically afterwards (the M1 story). */
+  simulateOutage(ms: number): void {
+    this.outageUntil = Date.now() + ms;
+    for (const link of this.links.values()) this.teardownLink(link);
+    this.publish();
+    window.setTimeout(() => {
+      this.outageUntil = null;
+      this.ensureLinks();
+      this.publish();
+    }, ms);
+  }
+
+  private deskPeerId(): string | null {
+    const peers = this.signaling.state.session?.peers ?? [];
+    return peers.find((p) => p.role === "desk")?.peerId ?? null;
+  }
+
+  private onSignal(msg: SignalingMessage): void {
+    switch (msg.type) {
+      case "welcome": {
+        this.ensureLinks();
+        const active = msg.session.activeTake;
+        if (active && this.activeTakeId !== active.takeId) {
+          this.armForTake(active.takeId);
+        }
+        break;
+      }
+      case "peer-status":
+        this.ensureLinks();
+        break;
+      case "take-start":
+        if (this.activeTakeId !== msg.takeId) this.armForTake(msg.takeId);
+        break;
+      case "take-stop":
+        if (this.activeTakeId === msg.takeId) this.stopTake();
+        break;
+      default:
+        break;
+    }
+    this.publish();
+  }
+
+  private armForTake(takeId: string): void {
+    const streamId = crypto.randomUUID();
+    this.activeTakeId = takeId;
+    this.streamId = streamId;
+    // The worker replays registered sinks + connectivity into each fresh
+    // per-take engine, so links registered before arm are already wired.
+    this.controller.arm({
+      takeId: uuidToBytes(takeId),
+      streamId: uuidToBytes(streamId),
+      retainLocal: false,
+    });
+    this.signaling.send({ v: 1, type: "stream-announce", takeId, streamId });
+    this.publish();
+  }
+
+  private stopTake(): void {
+    if (!this.activeTakeId || !this.streamId) return;
+    this.stoppedForFinal = { takeId: this.activeTakeId, streamId: this.streamId };
+    this.controller.stopTake();
+    this.activeTakeId = null;
+    this.publish();
+  }
+
+  /** Called by the page when the worker reports the final seq. */
+  notifyFinal(finalSeq: number): void {
+    if (!this.stoppedForFinal) return;
+    this.signaling.send({
+      v: 1,
+      type: "stream-final",
+      takeId: this.stoppedForFinal.takeId,
+      streamId: this.stoppedForFinal.streamId,
+      finalSeq,
+    });
+    this.stoppedForFinal = null;
+  }
+
+  private ensureLinks(): void {
+    if (this.outageUntil && Date.now() < this.outageUntil) return;
+    if (!this.signaling.state.connected) return;
+    this.ensureLink(SINK_SERVER, SERVER_PEER_ID, "antiphon/1");
+    const deskId = this.deskPeerId();
+    if (deskId) {
+      const existing = this.links.get(SINK_DESK);
+      if (existing && existing.targetPeerId !== deskId) {
+        // Desk reconnected under a new peer id.
+        this.teardownLink(existing);
+        this.links.delete(SINK_DESK);
+      }
+      this.ensureLink(SINK_DESK, deskId, "antiphon/1");
+    }
+  }
+
+  private ensureLink(sinkId: number, targetPeerId: string, label: string): void {
+    let link = this.links.get(sinkId);
+    if (!link) {
+      link = {
+        sinkId,
+        targetPeerId,
+        label,
+        dispose: null,
+        channel: null,
+        connecting: false,
+        wanted: true,
+      };
+      this.links.set(sinkId, link);
+      this.controller.attachSink(sinkId, this.portFor(link));
+    }
+    if (link.connecting || link.channel?.readyState === "open") return;
+    link.connecting = true;
+    this.publish();
+    void offerChannel(this.signaling, targetPeerId, label)
+      .then(({ pc, channel, dispose }) => {
+        link.dispose = dispose;
+        link.channel = channel;
+        link.connecting = false;
+        channel.bufferedAmountLowThreshold = LOW_WATERMARK;
+        channel.addEventListener("bufferedamountlow", () => {
+          this.controller.requestDrain(sinkId);
+        });
+        channel.addEventListener("message", (ev) => {
+          if (ev.data instanceof ArrayBuffer) {
+            this.controller.deliverFrame(sinkId, ev.data);
+          }
+        });
+        const onDown = () => {
+          if (link.channel === channel) this.linkDown(link);
+        };
+        channel.addEventListener("close", onDown);
+        pc.addEventListener("connectionstatechange", () => {
+          if (pc.connectionState === "failed" || pc.connectionState === "disconnected") {
+            onDown();
+          }
+        });
+        this.controller.setSinkConnected(sinkId, true);
+        this.controller.requestDrain(sinkId);
+        this.publish();
+      })
+      .catch(() => {
+        link.connecting = false;
+        this.controller.setSinkConnected(sinkId, false);
+        this.publish();
+        window.setTimeout(() => this.ensureLinks(), RECONNECT_DELAY_MS);
+      });
+  }
+
+  private linkDown(link: SinkLink): void {
+    this.teardownLink(link);
+    this.publish();
+    window.setTimeout(() => this.ensureLinks(), RECONNECT_DELAY_MS);
+  }
+
+  private teardownLink(link: SinkLink): void {
+    this.controller.setSinkConnected(link.sinkId, false);
+    link.dispose?.();
+    link.dispose = null;
+    link.channel = null;
+    link.connecting = false;
+  }
+
+  private portFor(link: SinkLink): SinkPort {
+    return {
+      send: (frames) => {
+        const channel = link.channel;
+        if (channel?.readyState !== "open") return;
+        for (const frame of frames) {
+          try {
+            channel.send(frame);
+          } catch {
+            return; // channel died mid-batch; reconnect path handles it
+          }
+        }
+        // More might be waiting if the budget was the limiter.
+        if (channel.bufferedAmount < LOW_WATERMARK) {
+          this.controller.requestDrain(link.sinkId);
+        }
+      },
+      budget: () => {
+        const channel = link.channel;
+        if (channel?.readyState !== "open") return 0;
+        return Math.max(0, HIGH_WATERMARK - channel.bufferedAmount);
+      },
+    };
+  }
+
+  private publish(): void {
+    const snap = this.snapshot();
+    for (const l of this.listeners) l(snap);
+  }
+
+  close(): void {
+    if (this.timeSyncTimer !== null) window.clearInterval(this.timeSyncTimer);
+    for (const link of this.links.values()) this.teardownLink(link);
+    this.signaling.close();
+  }
+}

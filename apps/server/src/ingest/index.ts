@@ -28,6 +28,13 @@ const { PeerConnection } = nodeDataChannel;
 type DataChannel = nodeDataChannel.DataChannel;
 type NdcPeerConnection = nodeDataChannel.PeerConnection;
 
+if (process.env.ANTIPHON_RTC_LOG) {
+  nodeDataChannel.initLogger(
+    (process.env.ANTIPHON_RTC_LOG as nodeDataChannel.LogLevel) ?? "Info",
+    (level, message) => console.error(`[rtc:${level}] ${message}`),
+  );
+}
+
 const ACK_INTERVAL_MS = 2_000;
 const TIME_SYNC_INTERVAL_MS = 5_000;
 /** Stop pushing into a channel above this buffered amount (bytes). */
