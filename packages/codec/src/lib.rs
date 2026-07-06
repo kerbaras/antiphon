@@ -4,3 +4,5 @@
 //! Encodes raw PCM frames from the capture ring into chunk payloads.
 
 pub mod encoder;
+
+pub use encoder::{BLOCK_SIZE, CodecError, EncodedChunk, EncoderConfig, StreamEncoder};

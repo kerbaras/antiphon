@@ -10,3 +10,7 @@ repository.workspace = true
 antiphon-core = { workspace = true }
 flacenc = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+claxon = { workspace = true }
+proptest = { workspace = true }

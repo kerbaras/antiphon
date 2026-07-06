@@ -18,6 +18,8 @@ flacenc = { version = "0.5", default-features = false }
 realfft = "3.5"
 rubato = "3.0"
 proptest = "1.11"
+# dev-only: pure-Rust FLAC decoder to verify encodes are lossless
+claxon = "0.4"
 wasm-bindgen = "0.2"
 js-sys = "0.3"
 
