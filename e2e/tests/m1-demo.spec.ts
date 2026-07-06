@@ -99,18 +99,18 @@ test.describe("Milestone 1", () => {
     await joinAsRecorder(phoneB, sessionId);
     await expect(desk.getByText("2 phones connected")).toBeVisible({ timeout: 15_000 });
 
-    // --- chirp calibration ----------------------------------------------
-    await desk.getByRole("button", { name: /chirp/i }).click();
-    await expect(desk.getByText(/chirp emitted/i)).toBeVisible();
-
     // --- take starts; both phones arm and stream -------------------------
-    await desk.getByRole("button", { name: /record take/i }).click();
+    await desk.getByRole("button", { name: "Record take" }).click();
     await expect(phoneA.getByText("recording", { exact: true })).toBeVisible({
       timeout: 15_000,
     });
     await expect(phoneB.getByText("recording", { exact: true })).toBeVisible({
       timeout: 15_000,
     });
+
+    // --- chirp calibration (§10: only while streams are armed) -----------
+    await desk.getByRole("button", { name: "Chirp" }).click();
+    await expect(desk.getByText(/chirp emitted/i)).toBeVisible();
     await desk.waitForTimeout(3_000);
 
     // --- kill phone B's network mid-take ---------------------------------
@@ -128,7 +128,7 @@ test.describe("Milestone 1", () => {
     await desk.waitForTimeout(4_000);
 
     // --- stop the take -----------------------------------------------------
-    await desk.getByRole("button", { name: /stop take/i }).click();
+    await desk.getByRole("button", { name: "Stop take" }).click();
 
     // --- convergence: every sink, identical, complete ---------------------
     await expect
@@ -183,8 +183,12 @@ test.describe("Milestone 1", () => {
       expect(bytes.length).toBeGreaterThan(10_000);
     }
 
-    // The desk UI reports convergence to the operator.
-    await expect(desk.getByText("⇥ converged").first()).toBeVisible({ timeout: 15_000 });
+    // The desk UI reports convergence to the operator (clips upgrade to
+    // "⇥ aligned" when chirp correlation succeeds — fake mics won't have
+    // heard the speaker chirp, real rooms will).
+    await expect(desk.getByText(/⇥ (converged|aligned)/).first()).toBeVisible({
+      timeout: 15_000,
+    });
 
     await phoneA.close();
     await phoneB.close();

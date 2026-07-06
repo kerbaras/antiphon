@@ -3,7 +3,13 @@
 // (RFC §8). Persist-before-ack: all work serializes on a chain and ACK
 // generation joins it, so an ACK can never claim an unpersisted chunk.
 
-import { chunk_meta_json, init, SinkEngine } from "@antiphon/core-wasm";
+import {
+  chunk_meta_json,
+  extract_chunk_payload,
+  extract_codec_header,
+  init,
+  SinkEngine,
+} from "@antiphon/core-wasm";
 import type { DeskStreamStatus, FromSinkWorker, ToSinkWorker } from "./sink-worker-protocol";
 
 let engine: SinkEngine | null = null;
@@ -302,6 +308,59 @@ async function handle(msg: ToSinkWorker): Promise<void> {
         // stream dir missing entirely
       }
       post({ type: "frames-result", frames }, frames);
+      break;
+    }
+    case "assemble-flac": {
+      // codec bootstrap (seq 0) ++ payloads 1..=max held, refusing holes —
+      // a playable file must never silently skip audio.
+      if (!root) {
+        post({ type: "flac-result", requestId: msg.requestId, flac: null, reason: "no store" });
+        return;
+      }
+      try {
+        const dir = await root.getDirectoryHandle(streamDirName(msg.takeId, msg.streamId));
+        const streamMetas = metas.get(streamDirName(msg.takeId, msg.streamId));
+        const seqs = [...(streamMetas?.keys() ?? [])].sort((a, b) => a - b);
+        if (seqs.length === 0 || seqs[0] !== 0) {
+          post({
+            type: "flac-result",
+            requestId: msg.requestId,
+            flac: null,
+            reason: "stream header not held",
+          });
+          return;
+        }
+        for (let i = 1; i < seqs.length; i++) {
+          if ((seqs[i] as number) !== (seqs[i - 1] as number) + 1) {
+            post({
+              type: "flac-result",
+              requestId: msg.requestId,
+              flac: null,
+              reason: `hole at seq ${(seqs[i - 1] as number) + 1}`,
+            });
+            return;
+          }
+        }
+        const parts: Uint8Array[] = [];
+        for (const seq of seqs) {
+          const fh = await dir.getFileHandle(String(seq));
+          const frame = new Uint8Array(await (await fh.getFile()).arrayBuffer());
+          const payload = extract_chunk_payload(frame);
+          parts.push(seq === 0 ? extract_codec_header(payload) : payload);
+        }
+        const total = parts.reduce((n, p) => n + p.byteLength, 0);
+        const out = new Uint8Array(total);
+        let off = 0;
+        for (const p of parts) {
+          out.set(p, off);
+          off += p.byteLength;
+        }
+        post({ type: "flac-result", requestId: msg.requestId, flac: out.buffer as ArrayBuffer }, [
+          out.buffer as ArrayBuffer,
+        ]);
+      } catch (e) {
+        post({ type: "flac-result", requestId: msg.requestId, flac: null, reason: String(e) });
+      }
       break;
     }
     case "status": {

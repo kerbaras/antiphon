@@ -30,7 +30,8 @@ export type ToSinkWorker =
   | { type: "haves" }
   | { type: "plan-push"; haveBytes: ArrayBuffer }
   | { type: "get-frames"; takeId: string; streamId: string; ranges: Array<[number, number]> }
-  | { type: "status" };
+  | { type: "status" }
+  | { type: "assemble-flac"; requestId: number; takeId: string; streamId: string };
 
 export type FromSinkWorker =
   | { type: "ready"; rebuiltChunks: number }
@@ -45,4 +46,5 @@ export type FromSinkWorker =
     }
   | { type: "frames-result"; frames: ArrayBuffer[] }
   | { type: "status-result"; streams: DeskStreamStatus[] }
+  | { type: "flac-result"; requestId: number; flac: ArrayBuffer | null; reason?: string }
   | { type: "error"; message: string };

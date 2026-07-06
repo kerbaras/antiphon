@@ -34,6 +34,48 @@ pub fn generate_chirp(
     antiphon_dsp::chirp::generate_ess(sample_rate, start_hz, end_hz, duration_ms, gain_dbfs)
 }
 
+/// Locate the calibration chirp in captured PCM. Returns JSON
+/// `{"lagSamples":n,"peak":x,"confidence":y}` or `null` when nothing
+/// resembling the sweep is present. `repeats`/`gap_ms` describe the §10
+/// emission schedule so the sibling sweep isn't scored as a sidelobe. The
+/// chirp position per stream maps every sample domain onto the shared room
+/// clock (RFC §10).
+#[wasm_bindgen]
+#[allow(clippy::too_many_arguments)]
+pub fn find_chirp_offset(
+    signal: &[f32],
+    sample_rate: u32,
+    start_hz: f32,
+    end_hz: f32,
+    duration_ms: f32,
+    gain_dbfs: f32,
+    repeats: u32,
+    gap_ms: f32,
+) -> Option<String> {
+    antiphon_dsp::correlate::find_chirp(
+        signal,
+        sample_rate,
+        start_hz,
+        end_hz,
+        duration_ms,
+        gain_dbfs,
+        repeats,
+        gap_ms,
+    )
+    .map(|m| {
+        format!(
+            "{{\"lagSamples\":{},\"peak\":{},\"confidence\":{}}}",
+            m.lag_samples,
+            if m.peak.is_finite() { m.peak } else { 0.0 },
+            if m.confidence.is_finite() {
+                m.confidence
+            } else {
+                1.0e9
+            },
+        )
+    })
+}
+
 /// Protocol constants exposed for TS consumers (§13).
 #[wasm_bindgen]
 pub fn constants_json() -> String {

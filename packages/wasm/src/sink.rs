@@ -419,8 +419,11 @@ pub fn stream_header_json(seq0_payload: &[u8]) -> Result<String, JsError> {
     let h = antiphon_core::chunk::StreamHeaderV1::decode(seq0_payload)
         .map_err(|e| JsError::new(&e.to_string()))?;
     // device_desc is free text: strip characters that would need escaping.
-    let safe_desc: String =
-        h.device_desc.chars().filter(|c| !matches!(c, '"' | '\\' | '\u{0}'..='\u{1f}')).collect();
+    let safe_desc: String = h
+        .device_desc
+        .chars()
+        .filter(|c| !matches!(c, '"' | '\\' | '\u{0}'..='\u{1f}'))
+        .collect();
     Ok(Obj::new()
         .num("codec", h.codec)
         .num("channels", h.channels)

@@ -76,6 +76,11 @@ export class DeskSession {
     haves: Array<(f: ArrayBuffer[]) => void>;
     frames: Array<(f: ArrayBuffer[]) => void>;
   } = { acks: [], haves: [], frames: [] };
+  private flacWaiters = new Map<
+    number,
+    (result: { flac: ArrayBuffer | null; reason?: string }) => void
+  >();
+  private nextRequestId = 1;
   private audioContext: AudioContext | null = null;
 
   constructor(readonly sessionId: string) {
@@ -164,6 +169,15 @@ export class DeskSession {
       spec,
     });
     this.patch({ lastChirpAt: Date.now() });
+  }
+
+  /** Reassemble a stream's playable FLAC from the desk's own OPFS store. */
+  assembleFlac(takeId: string, streamId: string): Promise<ArrayBuffer | null> {
+    const requestId = this.nextRequestId++;
+    return new Promise((resolve) => {
+      this.flacWaiters.set(requestId, ({ flac }) => resolve(flac));
+      this.post({ type: "assemble-flac", requestId, takeId, streamId });
+    });
   }
 
   // ---- signaling ------------------------------------------------------------
@@ -407,6 +421,12 @@ export class DeskSession {
       case "frames-result":
         this.waiters.frames.shift()?.(msg.frames);
         break;
+      case "flac-result": {
+        const waiter = this.flacWaiters.get(msg.requestId);
+        this.flacWaiters.delete(msg.requestId);
+        waiter?.({ flac: msg.flac, ...(msg.reason !== undefined ? { reason: msg.reason } : {}) });
+        break;
+      }
       case "status-result":
         this.patch({ deskStatus: msg.streams });
         break;

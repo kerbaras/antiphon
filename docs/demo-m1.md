@@ -39,19 +39,22 @@ then asserts:
 3. Scan the QR with both iPhones (Safari). Tap **Enable microphone** on
    each; watch them appear in the desk's Performers rail, and confirm the
    capture-flag badges read OFF (see `docs/ios-capture-runbook.md`).
-4. Desk: **♫ Chirp** — everyone stays quiet for the two sweeps (this is
-   the alignment ground truth landing inside every stream).
-5. Desk: **● Record take**. Sing/clap around the room. The stream rows show
-   per-sink CHWM/held climbing, status RECONCILING.
+4. Desk: **● Record take**. All phones flip to RECORDING.
+5. Desk: **♫ Chirp** (enabled only while a take is armed — RFC §10) —
+   everyone stays quiet for the two sweeps; the alignment ground truth
+   lands inside every stream. Then sing/clap around the room. Track rows
+   show live clips growing; the Sinks tab shows CHWM/held climbing.
 6. **The moment**: put phone B in airplane mode (or walk it off WiFi) for
    ~10 seconds. Its screen shows the outage; its seq counter KEEPS
    CLIMBING — capture never gates on the network. Re-enable the network and
    watch the desk row's server/desk held counts sprint to catch up
    (live-first, backfill behind).
-7. Desk: **■ Stop take**. Rows flip to **⇥ CONVERGED** (digest-equal at
-   both sinks) with FINAL badges and a `.flac` download per stream.
-8. Play the downloads. That dropout is inaudible, because it never touched
-   the audio — only the transport.
+7. Desk: **■ Stop take**. Clips flip to **⇥ CONVERGED** (digest-equal at
+   both sinks), then to **⇥ ALIGNED** once chirp correlation locks; the
+   Sinks tab has a `.flac` download per stream.
+8. Desk: **▶ Play** — the aligned take plays through the mixer (faders,
+   mute/solo, live meters). The dropout is inaudible, because it never
+   touched the audio — only the transport.
 
 Anything that doesn't match this script is a bug in the heartbeat: file it
 before building anything else.

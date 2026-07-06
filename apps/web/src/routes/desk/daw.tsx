@@ -216,16 +216,20 @@ export function ZoomControl({ zoom, onZoom }: { zoom: number; onZoom: (z: number
 
 // ---- meters ----------------------------------------------------------------
 
-/** Vertical VU strip; animates only while `active` (real data flowing). */
+/** Vertical VU strip. With a numeric `level` (0..1) it meters that level;
+ * otherwise it shows the data-flow activity animation while `active`. */
 export function VUVertical({
   active,
+  level,
   className,
   width = 6,
 }: {
   active: boolean;
+  level?: number | null;
   className?: string;
   width?: number;
 }) {
+  const metered = typeof level === "number";
   return (
     <div
       className={cx("relative overflow-hidden rounded-[2px] bg-well", className)}
@@ -233,10 +237,14 @@ export function VUVertical({
     >
       <div
         className={cx(
-          "vu-gradient-v absolute inset-x-0 bottom-0 origin-bottom transition-transform",
-          active ? "animate-vu" : "scale-y-0",
+          "vu-gradient-v absolute inset-x-0 bottom-0 origin-bottom",
+          !metered && (active ? "animate-vu" : "scale-y-0"),
         )}
-        style={{ height: "88%" }}
+        style={
+          metered
+            ? { height: "100%", transform: `scaleY(${Math.min(1, level as number)})` }
+            : { height: "88%" }
+        }
       />
     </div>
   );
@@ -251,16 +259,29 @@ export interface ClipModel {
   x: number;
   width: number;
   live: boolean;
-  badge: "rec" | "converged" | "syncing" | null;
+  badge: "rec" | "converged" | "syncing" | "aligned" | null;
   energy: number[];
+  selected?: boolean;
+  onSelect?: () => void;
 }
 
 export function ClipCard({ clip }: { clip: ClipModel }) {
-  const edge = clip.live ? "var(--color-rec)" : hexA(clip.color, 0.55);
+  const edge = clip.live
+    ? "var(--color-rec)"
+    : clip.selected
+      ? "var(--color-accent)"
+      : hexA(clip.color, 0.55);
   const head = clip.live ? "var(--color-rec)" : clip.color;
   return (
-    <div
-      className="absolute inset-y-1 overflow-hidden rounded-[5px] border"
+    <button
+      type="button"
+      aria-label={`Select ${clip.name}`}
+      onClick={clip.onSelect}
+      className={cx(
+        "absolute inset-y-1 overflow-hidden rounded-[5px] border p-0 text-left",
+        clip.onSelect ? "cursor-pointer" : "cursor-default",
+        clip.selected && "shadow-[0_0_0_1px_var(--color-accent)]",
+      )}
       style={{
         left: clip.x,
         width: Math.max(clip.width, 26),
@@ -273,6 +294,11 @@ export function ClipCard({ clip }: { clip: ClipModel }) {
         {clip.badge === "rec" && (
           <span className="ml-auto flex flex-none items-center gap-[3px] rounded-[3px] bg-rec px-[5px] font-mono text-[7px] font-bold text-white uppercase animate-recpulse">
             ● rec
+          </span>
+        )}
+        {clip.badge === "aligned" && (
+          <span className="ml-auto flex-none rounded-[3px] bg-white/40 px-1 font-mono text-[7px] font-bold text-void uppercase">
+            ⇥ aligned
           </span>
         )}
         {clip.badge === "converged" && (
@@ -296,25 +322,40 @@ export function ClipCard({ clip }: { clip: ClipModel }) {
           />
         ))}
       </div>
-    </div>
+    </button>
   );
 }
 
 /** Time ruler with second labels — the prototype's bar ruler, in seconds
- * (Antiphon has no tempo; the session clock is the grid). */
-export function LaneRuler({ pxPerSec, widthPx }: { pxPerSec: number; widthPx: number }) {
+ * (Antiphon has no tempo; the session clock is the grid). Click to seek. */
+export function LaneRuler({
+  pxPerSec,
+  widthPx,
+  onSeek,
+}: {
+  pxPerSec: number;
+  widthPx: number;
+  onSeek?: (sec: number) => void;
+}) {
   const step = pxPerSec >= 36 ? 2 : pxPerSec >= 18 ? 5 : 10;
   const marks: number[] = [];
   for (let s = 0; s * pxPerSec < widthPx; s += step) marks.push(s);
   return (
+    // biome-ignore lint/a11y/noStaticElementInteractions: seek surface; transport buttons are the keyboard path
+    // biome-ignore lint/a11y/useKeyWithClickEvents: same
     <div
-      className="relative border-b border-divider bg-raised"
+      className={cx("relative border-b border-divider bg-raised", onSeek && "cursor-pointer")}
       style={{
         height: RULER_H,
         width: widthPx,
         backgroundImage: `repeating-linear-gradient(90deg, var(--color-edge-inset) 0 1px, transparent 1px ${
           step * pxPerSec
         }px)`,
+      }}
+      onClick={(e) => {
+        if (!onSeek) return;
+        const rect = e.currentTarget.getBoundingClientRect();
+        onSeek((e.clientX - rect.left) / pxPerSec);
       }}
     >
       {marks.map((s) => (
@@ -367,7 +408,7 @@ export function PanKnob() {
   return (
     <div
       aria-disabled="true"
-      title="Pan arrives with the DAW milestone"
+      title="Pan arrives with stereo render (v1 streams are mono)"
       className="relative size-6 cursor-not-allowed rounded-full border border-edge-strong bg-edge"
     >
       <div className="absolute top-[2px] left-1/2 h-[9px] w-[2px] rounded-[1px] bg-[#c8c9cb]" />
@@ -375,15 +416,76 @@ export function PanKnob() {
   );
 }
 
-export function Fader({ position = 0.3 }: { position?: number }) {
+const FADER_MAX_DB = 6;
+const FADER_MIN_DB = -60;
+
+export function dbToFaderPos(db: number): number {
+  return (FADER_MAX_DB - db) / (FADER_MAX_DB - FADER_MIN_DB);
+}
+
+function faderPosToDb(pos: number): number {
+  return FADER_MAX_DB - pos * (FADER_MAX_DB - FADER_MIN_DB);
+}
+
+/** Draggable gain fader. Without `onChange` it renders inert. */
+export function Fader({
+  db = 0,
+  onChange,
+  label,
+}: {
+  db?: number;
+  onChange?: (db: number) => void;
+  label?: string;
+}) {
+  const position = Math.max(0, Math.min(1, dbToFaderPos(db)));
+  function startDrag(downEvent: React.PointerEvent<HTMLDivElement>) {
+    if (!onChange) return;
+    const track = downEvent.currentTarget;
+    const rect = track.getBoundingClientRect();
+    const usable = rect.height - 11;
+    const apply = (clientY: number) => {
+      const p = Math.max(0, Math.min(1, (clientY - rect.top - 5) / usable));
+      onChange(Math.round(faderPosToDb(p) * 2) / 2);
+    };
+    apply(downEvent.clientY);
+    const move = (e: PointerEvent) => apply(e.clientY);
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  }
+  if (!onChange) {
+    return (
+      <div className="relative w-[5px] cursor-not-allowed rounded-[3px] bg-well opacity-70">
+        <div
+          className="pointer-events-none absolute -left-2 h-[11px] w-[21px] rounded-[3px] border border-divider shadow-[0_1px_3px_rgba(0,0,0,.6)]"
+          style={{
+            top: `calc(${position * 100}% - ${position * 11}px)`,
+            background: "linear-gradient(180deg,#5a5c5e,#38393b)",
+          }}
+        >
+          <div className="mt-[5px] h-px bg-accent" />
+        </div>
+      </div>
+    );
+  }
   return (
-    <div className="relative w-[5px] rounded-[3px] bg-well">
+    <div
+      className="relative w-[5px] cursor-ns-resize rounded-[3px] bg-well"
+      onPointerDown={startDrag}
+      role="slider"
+      aria-label={label}
+      aria-valuenow={Math.round(db)}
+      aria-valuemin={FADER_MIN_DB}
+      aria-valuemax={FADER_MAX_DB}
+      tabIndex={0}
+    >
       <div
-        aria-disabled="true"
-        title="Gain arrives with the DAW milestone"
-        className="absolute -left-2 h-[11px] w-[21px] cursor-not-allowed rounded-[3px] border border-divider shadow-[0_1px_3px_rgba(0,0,0,.6)]"
+        className="pointer-events-none absolute -left-2 h-[11px] w-[21px] rounded-[3px] border border-divider shadow-[0_1px_3px_rgba(0,0,0,.6)]"
         style={{
-          top: `${position * 100}%`,
+          top: `calc(${position * 100}% - ${position * 11}px)`,
           background: "linear-gradient(180deg,#5a5c5e,#38393b)",
         }}
       >
@@ -393,19 +495,38 @@ export function Fader({ position = 0.3 }: { position?: number }) {
   );
 }
 
+export interface MixerStripProps {
+  name: string;
+  color: string;
+  active: boolean;
+  master?: boolean;
+  /** Real playback level 0..1; null/undefined → activity animation. */
+  level?: number | null;
+  gainDb?: number;
+  onGainDb?: (db: number) => void;
+  muted?: boolean;
+  onMute?: () => void;
+  soloed?: boolean;
+  onSolo?: () => void;
+  dbText?: string;
+}
+
 export function MixerStrip({
   name,
   color,
   active,
   master,
-  db = "0.0 dB",
-}: {
-  name: string;
-  color: string;
-  active: boolean;
-  master?: boolean;
-  db?: string;
-}) {
+  level,
+  gainDb = 0,
+  onGainDb,
+  muted,
+  onMute,
+  soloed,
+  onSolo,
+  dbText,
+}: MixerStripProps) {
+  const db =
+    dbText ?? (onGainDb ? (gainDb <= FADER_MIN_DB ? "−∞ dB" : `${gainDb.toFixed(1)} dB`) : "—");
   return (
     <div
       className={cx(
@@ -426,21 +547,43 @@ export function MixerStrip({
         <PanKnob />
       </div>
       <div className="flex min-h-0 flex-1 justify-center gap-[9px] py-1">
-        <Fader position={master ? 0.22 : 0.3} />
+        <Fader db={gainDb} {...(onGainDb ? { onChange: onGainDb } : {})} label={`${name} gain`} />
         <div className="flex items-end gap-[2px]">
-          <VUVertical active={active} width={4} className="h-full" />
-          <VUVertical active={active} width={4} className="h-full" />
+          <VUVertical active={active} level={level ?? null} width={4} className="h-full" />
+          <VUVertical active={active} level={level ?? null} width={4} className="h-full" />
         </div>
       </div>
       <div className="flex justify-center gap-1 py-[3px]">
         {!master && (
           <>
-            <span className="grid h-4 w-5 cursor-not-allowed place-items-center rounded-[3px] border border-edge-btn bg-[#232425] text-[8.5px] font-bold text-text-dim">
+            <button
+              type="button"
+              aria-label={`Mute ${name}`}
+              aria-pressed={muted}
+              disabled={!onMute}
+              onClick={onMute}
+              className={cx(
+                "grid h-4 w-5 place-items-center rounded-[3px] border border-edge-btn text-[8.5px] font-bold",
+                muted ? "bg-track-gold text-void" : "bg-[#232425] text-text-dim",
+                onMute ? "hover:brightness-125" : "cursor-not-allowed",
+              )}
+            >
               M
-            </span>
-            <span className="grid h-4 w-5 cursor-not-allowed place-items-center rounded-[3px] border border-edge-btn bg-[#232425] text-[8.5px] font-bold text-text-dim">
+            </button>
+            <button
+              type="button"
+              aria-label={`Solo ${name}`}
+              aria-pressed={soloed}
+              disabled={!onSolo}
+              onClick={onSolo}
+              className={cx(
+                "grid h-4 w-5 place-items-center rounded-[3px] border border-edge-btn text-[8.5px] font-bold",
+                soloed ? "bg-track-teal text-void" : "bg-[#232425] text-text-dim",
+                onSolo ? "hover:brightness-125" : "cursor-not-allowed",
+              )}
+            >
               S
-            </span>
+            </button>
           </>
         )}
       </div>

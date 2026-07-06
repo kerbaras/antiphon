@@ -1,11 +1,14 @@
-// One DeskSession per page, bridged into React, plus server-side archive
-// polling for the sink-convergence table.
+// One DeskSession + one TakePlayer per page, bridged into React, plus
+// server-side archive polling for the sink-convergence table.
 
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { DeskSession, type DeskSessionState } from "../../net/desk-session";
+import { type PlayerSnapshot, TakePlayer } from "./player";
 
 let session: DeskSession | null = null;
 let latest: DeskSessionState | null = null;
+let player: TakePlayer | null = null;
+let playerSnap: PlayerSnapshot | null = null;
 
 export function getDeskSession(sessionId: string): DeskSession {
   if (!session || session.sessionId !== sessionId) {
@@ -18,9 +21,38 @@ export function getDeskSession(sessionId: string): DeskSession {
     (globalThis as Record<string, unknown>).__antiphonDesk = {
       session,
       snapshot: () => latest,
+      player: getPlayer(),
+      playerSnapshot: () => playerSnap,
     };
   }
   return session;
+}
+
+export function getPlayer(): TakePlayer {
+  if (!player) {
+    player = new TakePlayer();
+    player.subscribe((s) => {
+      playerSnap = s;
+    });
+  }
+  return player;
+}
+
+export function usePlayer(): PlayerSnapshot {
+  const subscribe = useCallback((onChange: () => void) => {
+    return getPlayer().subscribe(() => onChange());
+  }, []);
+  return useSyncExternalStore(subscribe, () => playerSnap ?? getPlayer().snapshot());
+}
+
+/** Load a take into the player from the desk's OPFS store (idempotent). */
+export async function loadTakeIntoPlayer(
+  sessionId: string,
+  takeId: string,
+  streamIds: string[],
+): Promise<boolean> {
+  const desk = getDeskSession(sessionId);
+  return await getPlayer().load(takeId, streamIds, (t, s) => desk.assembleFlac(t, s));
 }
 
 export function useDeskState(sessionId: string): DeskSessionState {

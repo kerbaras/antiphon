@@ -1,9 +1,10 @@
 // Mixing desk — /session/:uuid. Layout, geometry, and visual language follow
 // the prototype (docs/Antiphone DAW.dc.html) row for row: 48px top bar with
 // a centered transport cluster, 40px toolbar, arrange timeline with 232px
-// sticky track headers, a 272px right rail, and the mixer footer. Controls
-// that only make sense after the DAW milestone (edit tools, pan/gain, M/S,
-// Session view, playback) are present but visibly inert — never fake.
+// sticky track headers, a 272px right rail, and the mixer footer.
+// Record/stop/chirp, playback with a moving playhead + click-to-seek,
+// chirp auto-alignment, and the gain/mute/solo mixer are all live; only
+// editing tools and pan (mono v1) remain visibly inert.
 
 import QRCode from "qrcode";
 import { useEffect, useMemo, useRef, useState } from "react";
@@ -39,7 +40,16 @@ import {
   VUVertical,
   ZoomControl,
 } from "./daw";
-import { getDeskSession, type ServerStreamStatus, useDeskState, useServerStatus } from "./use-desk";
+import type { PlayerSnapshot } from "./player";
+import {
+  getDeskSession,
+  getPlayer,
+  loadTakeIntoPlayer,
+  type ServerStreamStatus,
+  useDeskState,
+  usePlayer,
+  useServerStatus,
+} from "./use-desk";
 
 const TRACK_COLORS = [
   "#4fb8a8",
@@ -200,6 +210,59 @@ function Desk({ sessionId }: { sessionId: string }) {
     return desk.complete && server?.complete && desk.digest === server.digest;
   }).length;
 
+  // ---- playback ----------------------------------------------------------
+  const playerSnap = usePlayer();
+  const [pickedTakeId, setPickedTakeId] = useState<string | null>(null);
+  // Selected take: explicit pick, else the latest take fully complete at
+  // the desk (loadable without holes).
+  const selectedTakeId = useMemo(() => {
+    if (pickedTakeId && takes.has(pickedTakeId)) return pickedTakeId;
+    const completeTakes = [...takes.keys()].filter((takeId) => {
+      const streams = state.deskStatus.filter((s) => s.takeId === takeId);
+      return streams.length > 0 && streams.every((s) => s.complete);
+    });
+    return completeTakes[completeTakes.length - 1] ?? null;
+  }, [pickedTakeId, takes, state.deskStatus]);
+  const selectedStreamIds = useMemo(
+    () =>
+      state.deskStatus
+        .filter((s) => s.takeId === selectedTakeId && s.complete)
+        .map((s) => s.streamId),
+    [state.deskStatus, selectedTakeId],
+  );
+
+  // Load (and, when a chirp was emitted this session, auto-align) the
+  // selected take as soon as it is complete at the desk.
+  const chirped = state.lastChirpAt !== null;
+  useEffect(() => {
+    if (!selectedTakeId || selectedStreamIds.length === 0 || recording) return;
+    void loadTakeIntoPlayer(sessionId, selectedTakeId, selectedStreamIds).then((ok) => {
+      if (ok && chirped) void getPlayer().align();
+    });
+  }, [sessionId, selectedTakeId, selectedStreamIds, recording, chirped]);
+
+  const selectedSlot = selectedTakeId ? (takes.get(selectedTakeId) ?? null) : null;
+  const playerLoaded = playerSnap.loadedTakeId === selectedTakeId && playerSnap.tracks.length > 0;
+  const alignmentByStream = useMemo(() => {
+    const map = new Map<string, boolean>();
+    for (const t of playerSnap.tracks) map.set(t.streamId, t.alignment?.applied ?? false);
+    return map;
+  }, [playerSnap.tracks]);
+
+  function seekTimeline(sec: number) {
+    if (!selectedSlot || !playerLoaded) return;
+    getPlayer().seek(Math.max(0, sec - selectedSlot.offsetSec));
+  }
+
+  // Playhead position on the shared timeline.
+  const playheadSec = recording
+    ? state.activeTakeId && takes.has(state.activeTakeId)
+      ? (takes.get(state.activeTakeId) as TakeSlot).offsetSec + elapsed
+      : null
+    : selectedSlot && playerLoaded
+      ? selectedSlot.offsetSec + playerSnap.positionSec
+      : null;
+
   const joinUrl = `${location.origin}/join/${sessionId}`;
 
   function share() {
@@ -243,14 +306,27 @@ function Desk({ sessionId }: { sessionId: string }) {
         {/* Centered transport cluster, as in the prototype */}
         <div className="absolute left-1/2 flex -translate-x-1/2 items-center gap-2.5">
           <TransportGroup>
-            <TransportButton label="Return to start" disabled>
+            <TransportButton
+              label="Return to start"
+              disabled={!playerLoaded || recording}
+              onClick={() => getPlayer().seek(0)}
+            >
               ⏮
+            </TransportButton>
+            <TransportButton
+              label={playerSnap.playing ? "Pause" : "Play"}
+              tone="accent"
+              active={playerSnap.playing}
+              disabled={!playerLoaded || recording || playerSnap.loading}
+              onClick={() => getPlayer().toggle()}
+            >
+              {playerSnap.playing ? "⏸" : "▶"}
             </TransportButton>
             <TransportButton
               label="Record take"
               tone="rec"
               active={recording}
-              disabled={!state.signalingConnected || recording}
+              disabled={!state.signalingConnected || recording || playerSnap.playing}
               onClick={() => getDeskSession(sessionId).startTake()}
             >
               ●
@@ -265,13 +341,13 @@ function Desk({ sessionId }: { sessionId: string }) {
             <TransportButton
               label="Chirp"
               tone="accent"
-              disabled={recording}
+              disabled={!recording}
               onClick={() => void getDeskSession(sessionId).playChirp()}
             >
               ♫
             </TransportButton>
           </TransportGroup>
-          <Timecode seconds={elapsed} />
+          <Timecode seconds={recording ? elapsed : playerLoaded ? playerSnap.positionSec : 0} />
           <div className="flex gap-1.5">
             <InfoChip value="48.0" unit="kHz" />
             <InfoChip value={takes.size} unit={takes.size === 1 ? "take" : "takes"} />
@@ -315,18 +391,33 @@ function Desk({ sessionId }: { sessionId: string }) {
           <ToolGroup />
           <div className="h-[18px] w-px bg-edge" />
           <SnapGrid />
-          <span
-            className={`flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[10.5px] font-semibold ${
-              state.lastChirpAt ? "border-accent text-accent" : "border-edge-strong text-text-faint"
+          <button
+            type="button"
+            aria-label="Auto-align"
+            disabled={!playerLoaded || playerSnap.aligning || recording}
+            onClick={() => void getPlayer().align()}
+            className={`flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[10.5px] font-semibold transition-colors disabled:cursor-not-allowed ${
+              playerSnap.tracks.some((t) => t.alignment?.applied)
+                ? "border-accent text-accent"
+                : state.lastChirpAt
+                  ? "border-accent/50 text-accent/80 hover:text-accent"
+                  : "border-edge-strong text-text-faint"
             }`}
           >
             <span className="text-[8px]">●</span>
-            {state.lastChirpAt ? "auto-align armed" : "auto-align idle"}
-          </span>
+            {playerSnap.aligning
+              ? "aligning…"
+              : playerSnap.tracks.some((t) => t.alignment?.applied)
+                ? "auto-align on"
+                : "auto-align"}
+          </button>
           {state.lastChirpAt && (
             <span className="font-mono text-[9px] text-text-faint">
               chirp emitted {new Date(state.lastChirpAt).toLocaleTimeString()}
             </span>
+          )}
+          {playerSnap.error && (
+            <span className="font-mono text-[9px] text-warn">{playerSnap.error}</span>
           )}
           {state.errors.length > 0 && (
             <span className="font-mono text-[9px] text-rec">
@@ -353,7 +444,11 @@ function Desk({ sessionId }: { sessionId: string }) {
               >
                 <SectionLabel>Tracks</SectionLabel>
               </div>
-              <LaneRuler pxPerSec={pxPerSec} widthPx={laneWidth} />
+              <LaneRuler
+                pxPerSec={pxPerSec}
+                widthPx={laneWidth}
+                {...(playerLoaded && !recording ? { onSeek: seekTimeline } : {})}
+              />
             </div>
 
             {/* track rows */}
@@ -383,18 +478,18 @@ function Desk({ sessionId }: { sessionId: string }) {
                 pxPerSec={pxPerSec}
                 laneWidth={laneWidth}
                 serverStatus={serverStatus}
+                selectedTakeId={selectedTakeId}
+                alignmentByStream={alignmentByStream}
+                onSelectTake={setPickedTakeId}
               />
             ))}
 
-            {/* Playhead: rides the live take's write head. */}
-            {recording && state.activeTakeId && takes.has(state.activeTakeId) && (
+            {/* Playhead: rides the live take's write head while recording,
+                the player position during playback. */}
+            {playheadSec !== null && (
               <div
                 className="pointer-events-none absolute top-0 bottom-0 z-[4] w-px bg-accent"
-                style={{
-                  left:
-                    TRACK_HEADER_W +
-                    ((takes.get(state.activeTakeId) as TakeSlot).offsetSec + elapsed) * pxPerSec,
-                }}
+                style={{ left: TRACK_HEADER_W + playheadSec * pxPerSec }}
               >
                 <div
                   className="absolute top-0 -left-[5px] size-[11px] bg-accent"
@@ -448,12 +543,12 @@ function Desk({ sessionId }: { sessionId: string }) {
       <div className="flex min-w-0 border-t border-divider bg-raised">
         <div className="flex min-w-0 flex-1 overflow-x-auto">
           {rows.map((row) => (
-            <MixerStrip
+            <RowMixerStrip
               key={row.key}
-              name={row.name}
-              color={row.color}
-              active={row.receiving}
-              db={row.receiving ? "rx" : "—"}
+              row={row}
+              selectedTakeId={selectedTakeId}
+              playerSnap={playerSnap}
+              playerLoaded={playerLoaded}
             />
           ))}
         </div>
@@ -462,10 +557,57 @@ function Desk({ sessionId }: { sessionId: string }) {
           color="var(--color-accent)"
           active={rows.some((r) => r.receiving)}
           master
-          db="—"
+          {...(playerLoaded
+            ? {
+                level: playerSnap.playing ? playerSnap.masterLevel : 0,
+                gainDb: playerSnap.masterDb,
+                onGainDb: (db: number) => getPlayer().setMasterDb(db),
+              }
+            : { dbText: "—" })}
         />
       </div>
     </main>
+  );
+}
+
+/** Mixer strip bound to a track row: controls the selected take's stream
+ * for that performer; falls back to activity display while recording. */
+function RowMixerStrip({
+  row,
+  selectedTakeId,
+  playerSnap,
+  playerLoaded,
+}: {
+  row: TrackRow;
+  selectedTakeId: string | null;
+  playerSnap: PlayerSnapshot;
+  playerLoaded: boolean;
+}) {
+  const streamId = row.streams.find((s) => s.takeId === selectedTakeId)?.streamId;
+  const track = playerLoaded ? playerSnap.tracks.find((t) => t.streamId === streamId) : undefined;
+  if (!track) {
+    return (
+      <MixerStrip
+        name={row.name}
+        color={row.color}
+        active={row.receiving}
+        dbText={row.receiving ? "rx" : "—"}
+      />
+    );
+  }
+  return (
+    <MixerStrip
+      name={row.name}
+      color={row.color}
+      active={row.receiving}
+      level={playerSnap.playing ? track.level : 0}
+      gainDb={track.gainDb}
+      onGainDb={(db) => getPlayer().setTrackDb(track.streamId, db)}
+      muted={track.muted}
+      onMute={() => getPlayer().toggleMute(track.streamId)}
+      soloed={track.soloed}
+      onSolo={() => getPlayer().toggleSolo(track.streamId)}
+    />
   );
 }
 
@@ -477,12 +619,18 @@ function TimelineRow({
   pxPerSec,
   laneWidth,
   serverStatus,
+  selectedTakeId,
+  alignmentByStream,
+  onSelectTake,
 }: {
   row: TrackRow;
   takes: Map<string, TakeSlot>;
   pxPerSec: number;
   laneWidth: number;
   serverStatus: Map<string, ServerStreamStatus>;
+  selectedTakeId: string | null;
+  alignmentByStream: Map<string, boolean>;
+  onSelectTake: (takeId: string) => void;
 }) {
   const clips: ClipModel[] = [];
   for (const stream of row.streams) {
@@ -491,6 +639,7 @@ function TimelineRow({
     const server = serverStatus.get(stream.streamId);
     const converged =
       stream.complete && (server?.complete ?? false) && stream.digest === server?.digest;
+    const aligned = alignmentByStream.get(stream.streamId) ?? false;
     const durationSec = Math.max(
       stream.totalSamples / SAMPLE_RATE,
       slot.live ? slot.durationSec : 1,
@@ -503,8 +652,10 @@ function TimelineRow({
       x: slot.offsetSec * pxPerSec,
       width: durationSec * pxPerSec - 3,
       live: slot.live,
-      badge: slot.live ? "rec" : converged ? "converged" : "syncing",
+      badge: slot.live ? "rec" : aligned ? "aligned" : converged ? "converged" : "syncing",
       energy: stream.energy,
+      selected: stream.takeId === selectedTakeId && !slot.live,
+      ...(slot.live ? {} : { onSelect: () => onSelectTake(stream.takeId) }),
     });
   }
 
