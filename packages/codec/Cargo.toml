@@ -1,0 +1,12 @@
+[package]
+name = "antiphon-codec"
+description = "FLAC encode/decode via flacenc — pure Rust, no C toolchain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+antiphon-core = { workspace = true }
+flacenc = { workspace = true }
+thiserror = { workspace = true }

@@ -1,0 +1,14 @@
+packages:
+  - apps/*
+  - packages/*
+  - e2e
+
+allowBuilds:
+  esbuild: true
+  node-datachannel: true
+
+catalog:
+  typescript: ^6.0.3
+  zod: ^4.4.3
+  vitest: ^4.1.9
+  "@types/node": ^26.1.0

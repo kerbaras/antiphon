@@ -1,0 +1,17 @@
+[package]
+name = "antiphon-wasm"
+description = "Thin wasm-bindgen facade over antiphon core/codec/dsp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+antiphon-core = { workspace = true }
+antiphon-codec = { workspace = true }
+antiphon-dsp = { workspace = true }
+wasm-bindgen = { workspace = true }
+js-sys = { workspace = true }

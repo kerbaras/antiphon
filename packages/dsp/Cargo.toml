@@ -1,0 +1,13 @@
+[package]
+name = "antiphon-dsp"
+description = "Alignment DSP: cross-correlation (realfft), drift resampling (rubato)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+antiphon-core = { workspace = true }
+realfft = { workspace = true }
+rubato = { workspace = true }
+thiserror = { workspace = true }
