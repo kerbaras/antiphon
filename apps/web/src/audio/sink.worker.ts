@@ -184,9 +184,13 @@ function energyFor(
     }
     buckets.push(peak);
   }
+  // FLAC payload sizes carry a large constant floor (frame headers, model
+  // cost); min-max normalization exposes the actual variation. The decoded
+  // waveform replaces this proxy once the take is loaded for playback.
   const max = Math.max(...buckets);
+  const min = Math.min(...buckets);
   return {
-    energy: buckets.map((v) => (max > 0 ? v / max : 0)),
+    energy: buckets.map((v) => (max > min ? 0.08 + (0.92 * (v - min)) / (max - min) : 0.3)),
     totalSamples,
   };
 }

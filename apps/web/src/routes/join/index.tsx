@@ -263,6 +263,14 @@ export function JoinRoute() {
               }
             />
             <MonoReadout
+              label="empty quanta"
+              value={
+                <span className={snap.ring?.emptyQuanta ? "text-warn" : undefined}>
+                  {snap.ring?.emptyQuanta ?? 0}
+                </span>
+              }
+            />
+            <MonoReadout
               label="gaps declared"
               value={
                 <span className={snap.stats?.gaps.length ? "text-rec" : undefined}>

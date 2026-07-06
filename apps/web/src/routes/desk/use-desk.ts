@@ -3,7 +3,7 @@
 
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { DeskSession, type DeskSessionState } from "../../net/desk-session";
-import { type PlayerSnapshot, TakePlayer } from "./player";
+import { computeWaveform, type PlayerSnapshot, TakePlayer } from "./player";
 
 let session: DeskSession | null = null;
 let latest: DeskSessionState | null = null;
@@ -15,6 +15,10 @@ export interface DeskUiMirror {
   clipStarts: Record<string, number>;
   playheadSec: number | null;
   selectedTakeId: string | null;
+  /** Recording-time master bus estimate (sum of live track peaks). */
+  liveMasterLevel: number;
+  /** Streams whose TRUE decoded waveform is cached. */
+  waveformsCached: number;
 }
 
 let uiMirror: DeskUiMirror | null = null;
@@ -67,7 +71,52 @@ export async function loadTakeIntoPlayer(
   streamIds: string[],
 ): Promise<boolean> {
   const desk = getDeskSession(sessionId);
-  return await getPlayer().load(takeId, streamIds, (t, s) => desk.assembleFlac(t, s));
+  const ok = await getPlayer().load(takeId, streamIds, (t, s) => desk.assembleFlac(t, s));
+  // The player just decoded these — keep their waveforms forever.
+  for (const track of getPlayer().snapshot().tracks) {
+    if (track.waveform.length > 0) waveformCache.set(track.streamId, track.waveform);
+  }
+  return ok;
+}
+
+// ---- persistent true-waveform cache -----------------------------------------
+// Clips must ALWAYS draw the real decoded waveform once a stream is
+// complete, independent of what the player has loaded. Streams are decoded
+// once in the background (transient OfflineAudioContext; only the ~240
+// floats are retained) and cached for the session's lifetime.
+
+const waveformCache = new Map<string, number[]>();
+const waveformInFlight = new Set<string>();
+
+export function getCachedWaveform(streamId: string): number[] | undefined {
+  return waveformCache.get(streamId);
+}
+
+export function waveformCacheSize(): number {
+  return waveformCache.size;
+}
+
+/** Decode one completed stream and cache its waveform. Returns true when
+ * the cache gained an entry. Serialized per stream; safe to spam. */
+export async function ensureWaveform(
+  sessionId: string,
+  takeId: string,
+  streamId: string,
+): Promise<boolean> {
+  if (waveformCache.has(streamId) || waveformInFlight.has(streamId)) return false;
+  waveformInFlight.add(streamId);
+  try {
+    const flac = await getDeskSession(sessionId).assembleFlac(takeId, streamId);
+    if (!flac) return false;
+    const scratch = new OfflineAudioContext(1, 1, 48_000);
+    const buffer = await scratch.decodeAudioData(flac);
+    waveformCache.set(streamId, computeWaveform(buffer));
+    return true;
+  } catch {
+    return false;
+  } finally {
+    waveformInFlight.delete(streamId);
+  }
 }
 
 export function useDeskState(sessionId: string): DeskSessionState {

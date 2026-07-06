@@ -7,7 +7,7 @@
 // editing tools and pan (mono v1) remain visibly inert.
 
 import QRCode from "qrcode";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useParams } from "react-router";
 import type { DeskStreamStatus } from "../../audio/sink-worker-protocol";
 import {
@@ -42,6 +42,8 @@ import {
 } from "./daw";
 import type { PlayerSnapshot } from "./player";
 import {
+  ensureWaveform,
+  getCachedWaveform,
   getDeskSession,
   getPlayer,
   loadTakeIntoPlayer,
@@ -50,6 +52,7 @@ import {
   useDeskState,
   usePlayer,
   useServerStatus,
+  waveformCacheSize,
 } from "./use-desk";
 
 const TRACK_COLORS = [
@@ -224,12 +227,22 @@ function Desk({ sessionId }: { sessionId: string }) {
     });
     return completeTakes[completeTakes.length - 1] ?? null;
   }, [pickedTakeId, takes, state.deskStatus]);
-  const selectedStreamIds = useMemo(
+  // Stable IDENTITY across status polls (deskStatus is a fresh array every
+  // second): effects keyed off this must not re-fire unless membership
+  // actually changes — a spurious re-run reaches align()/re-schedule and
+  // audibly cuts playback.
+  const selectedStreamKey = useMemo(
     () =>
       state.deskStatus
         .filter((s) => s.takeId === selectedTakeId && s.complete)
-        .map((s) => s.streamId),
+        .map((s) => s.streamId)
+        .sort()
+        .join(","),
     [state.deskStatus, selectedTakeId],
+  );
+  const selectedStreamIds = useMemo(
+    () => (selectedStreamKey ? selectedStreamKey.split(",") : []),
+    [selectedStreamKey],
   );
 
   // Load (and, when a chirp was emitted this session, auto-align) the
@@ -241,6 +254,24 @@ function Desk({ sessionId }: { sessionId: string }) {
       if (ok && chirped) void getPlayer().align();
     });
   }, [sessionId, selectedTakeId, selectedStreamIds, recording, chirped]);
+
+  // Background-decode every completed stream so clips always draw the true
+  // waveform, regardless of which take is selected/loaded.
+  const [, bumpWaveforms] = useReducer((n: number) => n + 1, 0);
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      for (const stream of state.deskStatus) {
+        if (!stream.complete || getCachedWaveform(stream.streamId)) continue;
+        const added = await ensureWaveform(sessionId, stream.takeId, stream.streamId);
+        if (cancelled) return;
+        if (added) bumpWaveforms();
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId, state.deskStatus]);
 
   const playerLoaded = playerSnap.loadedTakeId === selectedTakeId && playerSnap.tracks.length > 0;
   const alignmentByStream = useMemo(() => {
@@ -279,6 +310,11 @@ function Desk({ sessionId }: { sessionId: string }) {
       );
       const takeNumber = [...takes.keys()].indexOf(stream.takeId) + 1;
       const startSec = clipStartSec(stream.streamId, stream.takeId);
+      // Completed streams ALWAYS draw the true decoded waveform (background
+      // cache); the encoded-complexity proxy only covers the live take
+      // still growing under the record head.
+      const waveform = getCachedWaveform(stream.streamId) ?? stream.energy;
+      const recordedSec = stream.totalSamples / SAMPLE_RATE;
       return [
         {
           id: stream.streamId,
@@ -296,7 +332,8 @@ function Desk({ sessionId }: { sessionId: string }) {
               : converged
                 ? ("converged" as const)
                 : ("syncing" as const),
-          energy: stream.energy,
+          energy: waveform,
+          fillFraction: slot.live && durationSec > 0 ? Math.min(1, recordedSec / durationSec) : 1,
           selected: selection.includes(stream.streamId) && !slot.live,
           ...(slot.live
             ? {}
@@ -452,6 +489,15 @@ function Desk({ sessionId }: { sessionId: string }) {
       ? selectedBaseSec + playerSnap.positionSec
       : null;
 
+  /** Recording-time master bus estimate: the live track peaks summed (all
+   * mics share one room, so amplitudes roughly add) and clamped. */
+  const liveMasterLevel = recording
+    ? Math.min(
+        1,
+        rows.reduce((sum, row) => sum + levelFor(row), 0),
+      )
+    : 0;
+
   // Mirror editing state for tests/diagnostics.
   useEffect(() => {
     publishUiMirror({
@@ -459,6 +505,8 @@ function Desk({ sessionId }: { sessionId: string }) {
       clipStarts: clipStartOverrides,
       playheadSec,
       selectedTakeId,
+      liveMasterLevel,
+      waveformsCached: waveformCacheSize(),
     });
   });
 
@@ -609,7 +657,7 @@ function Desk({ sessionId }: { sessionId: string }) {
             type="button"
             aria-label="Auto-align"
             disabled={!playerLoaded || playerSnap.aligning || recording}
-            onClick={() => void getPlayer().align()}
+            onClick={() => void getPlayer().align(true)}
             className={`flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[10.5px] font-semibold transition-colors disabled:cursor-not-allowed ${
               playerSnap.tracks.some((t) => t.alignment?.applied)
                 ? "border-accent text-accent"
@@ -792,13 +840,15 @@ function Desk({ sessionId }: { sessionId: string }) {
           color="var(--color-accent)"
           active={rows.some((r) => r.receiving)}
           master
-          {...(playerLoaded
-            ? {
-                level: playerSnap.playing ? playerSnap.masterLevel : 0,
-                gainDb: playerSnap.masterDb,
-                onGainDb: (db: number) => getPlayer().setMasterDb(db),
-              }
-            : { dbText: "—" })}
+          {...(recording
+            ? { level: liveMasterLevel, dbText: formatDbfs(liveMasterLevel) }
+            : playerLoaded
+              ? {
+                  level: playerSnap.playing ? playerSnap.masterLevel : 0,
+                  gainDb: playerSnap.masterDb,
+                  onGainDb: (db: number) => getPlayer().setMasterDb(db),
+                }
+              : { level: 0, dbText: "—" })}
         />
       </div>
     </main>

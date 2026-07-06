@@ -26,6 +26,8 @@ export interface PlayerTrackSnapshot {
   /** 0..1 instantaneous peak while playing. */
   level: number;
   alignment: AlignmentResult | null;
+  /** True absolute peak waveform from the decoded audio (0..1 per bucket). */
+  waveform: number[];
 }
 
 export interface PlayerSnapshot {
@@ -39,6 +41,9 @@ export interface PlayerSnapshot {
   masterLevel: number;
   tracks: PlayerTrackSnapshot[];
   error: string | null;
+  /** Times source scheduling ran since play() — a continuous, uncut
+   * playback stays at 1 (regression guard for re-schedule storms). */
+  scheduleCount: number;
 }
 
 interface Track {
@@ -51,6 +56,28 @@ interface Track {
   muted: boolean;
   soloed: boolean;
   alignment: AlignmentResult | null;
+  waveform: number[];
+}
+
+/** Peak-per-bucket waveform of the decoded audio — what a DAW draws.
+ * Absolute amplitude (not normalized): quiet audio draws small. */
+export function computeWaveform(buffer: AudioBuffer, buckets = 240): number[] {
+  const data = buffer.getChannelData(0);
+  if (data.length === 0) return [];
+  const perBucket = data.length / buckets;
+  const stride = Math.max(1, Math.floor(perBucket / 64));
+  const out: number[] = [];
+  for (let b = 0; b < buckets; b++) {
+    const start = Math.floor(b * perBucket);
+    const end = Math.min(data.length, Math.max(start + 1, Math.floor((b + 1) * perBucket)));
+    let peak = 0;
+    for (let i = start; i < end; i += stride) {
+      const v = Math.abs(data[i] as number);
+      if (v > peak) peak = v;
+    }
+    out.push(Math.min(1, peak));
+  }
+  return out;
 }
 
 export function dbToLinear(db: number): number {
@@ -75,6 +102,7 @@ export class TakePlayer {
   private startPos = 0;
   private masterDb = 0;
   private error: string | null = null;
+  private scheduleCount = 0;
   private raf: number | null = null;
   private listeners = new Set<(snap: PlayerSnapshot) => void>();
   private levels = new Map<string, number>();
@@ -103,8 +131,10 @@ export class TakePlayer {
         soloed: t.soloed,
         level: this.levels.get(t.streamId) ?? 0,
         alignment: t.alignment,
+        waveform: t.waveform,
       })),
       error: this.error,
+      scheduleCount: this.scheduleCount,
     };
   }
 
@@ -166,6 +196,7 @@ export class TakePlayer {
           muted: previous?.muted ?? false,
           soloed: previous?.soloed ?? false,
           alignment: previous?.alignment ?? null,
+          waveform: computeWaveform(buffer),
         });
       }
       for (const old of this.tracks.values()) {
@@ -187,9 +218,12 @@ export class TakePlayer {
   }
 
   /** Chirp correlation per track (RFC §10): the chirp position in each
-   * stream maps its sample domain onto the shared room clock. */
-  async align(): Promise<void> {
+   * stream maps its sample domain onto the shared room clock. Idempotent
+   * unless `force`: auto-align triggers ride on status polls, and both the
+   * correlation cost and the final re-schedule must not repeat. */
+  async align(force = false): Promise<void> {
     if (this.tracks.size === 0 || this.aligning) return;
+    if (!force && [...this.tracks.values()].every((t) => t.alignment !== null)) return;
     this.aligning = true;
     this.notify();
     try {
@@ -260,9 +294,23 @@ export class TakePlayer {
   }
 
   /** Update arrangement positions (from timeline clip drags). Re-schedules
-   * live so the change is audible immediately. */
+   * live so the change is audible immediately — but ONLY when a delay
+   * actually changed: callers fire on status polls, and a spurious
+   * re-schedule mid-playback is an audible cut. */
   setClipDelays(delays: Record<string, number>): void {
-    this.clipDelays = new Map(Object.entries(delays).map(([id, d]) => [id, Math.max(0, d)]));
+    const next = new Map(Object.entries(delays).map(([id, d]) => [id, Math.max(0, d)]));
+    let changed = next.size !== this.clipDelays.size;
+    if (!changed) {
+      for (const [id, d] of next) {
+        const prev = this.clipDelays.get(id);
+        if (prev === undefined || Math.abs(prev - d) > 1e-4) {
+          changed = true;
+          break;
+        }
+      }
+    }
+    if (!changed) return;
+    this.clipDelays = next;
     if (this.playing) {
       const pos = this.position();
       this.stopSources();
@@ -297,6 +345,7 @@ export class TakePlayer {
     const ctx = this.ensureGraph();
     void ctx.resume();
     this.stopSources();
+    this.scheduleCount = 0;
     const pos = fromSec ?? this.startPos;
     this.schedule(pos >= this.duration() - 0.05 ? 0 : pos);
   }
@@ -324,6 +373,7 @@ export class TakePlayer {
     this.startCtxTime = when;
     this.startPos = fromSec;
     this.playing = true;
+    this.scheduleCount += 1;
     this.startMeterLoop();
     this.notify();
   }
@@ -392,6 +442,8 @@ export class TakePlayer {
     if (this.master) this.master.gain.value = dbToLinear(this.masterDb);
   }
 
+  private lastMeterNotify = 0;
+
   private startMeterLoop(): void {
     if (this.raf !== null) return;
     const tick = () => {
@@ -412,7 +464,13 @@ export class TakePlayer {
         this.pause();
         this.startPos = 0;
       }
-      this.notify();
+      // Meters/playhead re-render at ~25 fps — a 60 Hz notify makes the
+      // whole desk re-render every frame for no visual gain.
+      const now = performance.now();
+      if (now - this.lastMeterNotify > 40) {
+        this.lastMeterNotify = now;
+        this.notify();
+      }
       this.raf = requestAnimationFrame(tick);
     };
     this.raf = requestAnimationFrame(tick);

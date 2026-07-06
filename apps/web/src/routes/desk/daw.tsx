@@ -262,10 +262,30 @@ export interface ClipModel {
   durationSec: number;
   live: boolean;
   badge: "rec" | "converged" | "syncing" | "aligned" | null;
+  /** Waveform samples 0..1: true decoded peaks for loaded takes, encoded
+   * signal-complexity proxy otherwise. */
   energy: number[];
+  /** Fraction of the clip that has audio (< 1 while a live take grows). */
+  fillFraction: number;
   selected?: boolean;
   /** Press = select; press-and-drag = move every selected clip. */
   onPointerDown?: (e: React.PointerEvent) => void;
+}
+
+/** Peak-preserving resample of a waveform to `n` bars. */
+function resampleBars(src: number[], n: number): number[] {
+  if (src.length === 0 || n <= 0) return [];
+  const out: number[] = [];
+  for (let i = 0; i < n; i++) {
+    const start = Math.floor((i * src.length) / n);
+    const end = Math.max(start + 1, Math.floor(((i + 1) * src.length) / n));
+    let peak = 0;
+    for (let j = start; j < end && j < src.length; j++) {
+      peak = Math.max(peak, src[j] as number);
+    }
+    out.push(peak);
+  }
+  return out;
 }
 
 export function ClipCard({ clip }: { clip: ClipModel }) {
@@ -275,6 +295,11 @@ export function ClipCard({ clip }: { clip: ClipModel }) {
       ? "var(--color-accent)"
       : hexA(clip.color, 0.55);
   const head = clip.live ? "var(--color-rec)" : clip.color;
+  const widthPx = Math.max(clip.width, 26);
+  // One 2px bar per 3px of AUDIO-holding width (prototype density), spread
+  // over the recorded fraction of the clip.
+  const audioWidth = Math.max(0, (widthPx - 10) * Math.min(1, clip.fillFraction));
+  const bars = resampleBars(clip.energy, Math.floor(audioWidth / 3));
   return (
     <button
       type="button"
@@ -288,12 +313,17 @@ export function ClipCard({ clip }: { clip: ClipModel }) {
       )}
       style={{
         left: clip.x,
-        width: Math.max(clip.width, 26),
+        width: widthPx,
         background: hexA(clip.color, clip.live ? 0.16 : 0.24),
         borderColor: edge,
       }}
     >
-      <div className="flex h-[14px] items-center gap-1.5 px-1.5" style={{ background: head }}>
+      {/* Header strip pinned to the top: buttons vertically center their
+          flow content by default, so this must be absolute. */}
+      <div
+        className="absolute inset-x-0 top-0 flex h-[14px] items-center gap-1.5 px-1.5"
+        style={{ background: head }}
+      >
         <span className="truncate text-[8.5px] font-semibold text-void">{clip.name}</span>
         {clip.badge === "rec" && (
           <span className="ml-auto flex flex-none items-center gap-[3px] rounded-[3px] bg-rec px-[5px] font-mono text-[7px] font-bold text-white uppercase animate-recpulse">
@@ -317,12 +347,12 @@ export function ClipCard({ clip }: { clip: ClipModel }) {
         )}
       </div>
       <div className="absolute inset-x-0 top-[14px] bottom-0 flex items-center gap-px overflow-hidden px-[5px]">
-        {clip.energy.map((v, i) => (
+        {bars.map((v, i) => (
           <div
             // biome-ignore lint/suspicious/noArrayIndexKey: bars are positional
             key={i}
             className="w-[2px] flex-none rounded-[1px] bg-white/50"
-            style={{ height: `${Math.max(6, v * 82)}%` }}
+            style={{ height: `${Math.max(4, Math.min(1, v) * 92)}%` }}
           />
         ))}
       </div>

@@ -84,6 +84,15 @@ await desk.waitForTimeout(1200);
 const meterCount = (await deskLevels()).length;
 check("desk receives live meter telemetry for all 3 streams", meterCount === 3, `${meterCount}/3`);
 
+// Master meter during recording = bus sum of the live track levels.
+const trackLevels = await deskLevels();
+const masterLive = await desk.evaluate(() => window.__antiphonDesk?.ui?.()?.liveMasterLevel ?? 0);
+check(
+  "master meter is the mix of live tracks while recording",
+  masterLive > 0 && masterLive >= Math.max(...trackLevels) * 0.9,
+  `master ${masterLive.toFixed(4)} vs tracks ${trackLevels.map((l) => l.toFixed(4)).join(", ")}`,
+);
+
 // Sample ambient peak before the chirp, then chirp and watch the mic hear it.
 const peaksBefore = await Promise.all(phones.map((p) => phoneState(p).then((s) => s.peak)));
 const deskLevelsBefore = await deskLevels();
@@ -158,6 +167,19 @@ log(
 );
 const appliedCount = alignments.filter((a) => a?.applied).length;
 check("chirp correlation confident on all 3 streams", appliedCount === 3, `${appliedCount}/3`);
+
+// True waveforms appear for ALL completed streams without any clicking.
+let cachedWaves = 0;
+for (let t = 0; t < 30; t++) {
+  cachedWaves = await desk.evaluate(() => window.__antiphonDesk?.ui?.()?.waveformsCached ?? 0);
+  if (cachedWaves >= 3) break;
+  await desk.waitForTimeout(400);
+}
+check(
+  "true waveforms cached for all streams (no click needed)",
+  cachedWaves >= 3,
+  `${cachedWaves}/3`,
+);
 if (appliedCount >= 2) {
   const lags = alignments.filter((a) => a?.applied).map((a) => a.lagSamples);
   const spreadMs = ((Math.max(...lags) - Math.min(...lags)) / 48_000) * 1000;
@@ -182,6 +204,21 @@ for (let t = 0; t < 8; t++) {
   masterPeak = Math.max(masterPeak, (await playerSnap()).masterLevel);
 }
 check("master meter shows real level during playback", masterPeak > 0.003, masterPeak.toFixed(4));
+// Gapless playback: sources must be scheduled exactly once for the whole
+// run — every extra schedule() is an audible cut (regression guard for the
+// status-poll re-schedule storm).
+await desk.waitForTimeout(2500);
+const schedules = (await playerSnap()).scheduleCount;
+check(
+  "continuous playback never re-schedules (no audible cuts)",
+  schedules === 1,
+  `scheduleCount ${schedules}`,
+);
+// Capture never stuttered either (mic delivery gaps would also click).
+for (const [i, page] of phones.entries()) {
+  const empty = await page.evaluate(() => window.__antiphon?.snapshot?.()?.ring?.emptyQuanta ?? -1);
+  check(`phone ${i + 1} no capture stutter`, empty === 0, `empty quanta ${empty}`);
+}
 await desk.screenshot({ path: "screens/live-playing.png" });
 
 // Mute track 1: its meter must die while others live.
