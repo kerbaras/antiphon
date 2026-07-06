@@ -12,6 +12,5 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 antiphon-core = { workspace = true }
 antiphon-codec = { workspace = true }
-antiphon-dsp = { workspace = true }
 wasm-bindgen = { workspace = true }
 js-sys = { workspace = true }

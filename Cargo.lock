@@ -37,7 +37,6 @@ version = "0.1.0"
 dependencies = [
  "antiphon-codec",
  "antiphon-core",
- "antiphon-dsp",
  "js-sys",
  "wasm-bindgen",
 ]

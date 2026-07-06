@@ -3,16 +3,19 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Built wasm artifacts from rust/wasm — the ONLY way TS consumes Rust",
+  "description": "Built wasm artifacts from packages/wasm — the ONLY way TS consumes Rust",
   "exports": {
     ".": "./src/index.ts",
     "./pkg/*": "./pkg/*"
   },
   "scripts": {
     "build": "wasm-pack build ../wasm --target web --out-dir ../core-wasm/pkg --out-name antiphon",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
   },
   "devDependencies": {
-    "typescript": "catalog:"
+    "@types/node": "catalog:",
+    "typescript": "catalog:",
+    "vitest": "catalog:"
   }
 }

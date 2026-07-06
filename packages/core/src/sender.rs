@@ -193,10 +193,20 @@ impl StreamSender {
 
     // ---- sink management -------------------------------------------------
 
-    /// Register a sink. A brand-new sink starts with nothing proven; the
-    /// ACK-driven requeue feeds it the backlog once it connects and acks.
+    /// Register a sink. A brand-new sink starts with nothing proven and is
+    /// immediately owed everything still resident in the ring (a sink added
+    /// after arm() must still receive seq 0 without waiting for an ACK
+    /// round-trip). Re-adding an existing sink is a no-op.
     pub fn add_sink(&mut self, id: SinkId) {
-        self.sinks.entry(id).or_insert_with(SinkTx::new);
+        if self.sinks.contains_key(&id) {
+            return;
+        }
+        let mut tx = SinkTx::new();
+        for seq in self.ring.seqs() {
+            tx.queued.insert(seq);
+            tx.backfill.push_back(seq);
+        }
+        self.sinks.insert(id, tx);
     }
 
     pub fn remove_sink(&mut self, id: SinkId) {

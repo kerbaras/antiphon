@@ -69,6 +69,11 @@ impl ChunkRing {
         self.chunks.get(&seq)
     }
 
+    /// Resident seqs, ascending.
+    pub fn seqs(&self) -> impl Iterator<Item = u32> + '_ {
+        self.chunks.keys().copied()
+    }
+
     /// Was `seq` evicted before any sink acknowledged it? (= a declared gap)
     pub fn is_gap(&self, seq: u32) -> bool {
         self.evicted_unacked.contains(seq)
