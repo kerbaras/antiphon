@@ -8,8 +8,15 @@ import type { DeskStreamStatus, FromSinkWorker, ToSinkWorker } from "./sink-work
 
 let engine: SinkEngine | null = null;
 let root: FileSystemDirectoryHandle | null = null;
-/** streamKey (`take_stream`) → seq → crc32c (digest input). */
-const metas = new Map<string, Map<number, number>>();
+
+interface ChunkMetaLite {
+  crc32c: number;
+  payloadLen: number;
+  sampleCount: number;
+}
+
+/** streamKey (`take_stream`) → seq → meta (digest + waveform inputs). */
+const metas = new Map<string, Map<number, ChunkMetaLite>>();
 
 let chain: Promise<void> = Promise.resolve();
 
@@ -52,7 +59,7 @@ async function rebuild(): Promise<number> {
     if (!takeId || !streamId) continue;
     const streamDir = handle as FileSystemDirectoryHandle;
     const key = streamDirName(takeId, streamId);
-    const streamMetas = new Map<number, number>();
+    const streamMetas = new Map<number, ChunkMetaLite>();
     metas.set(key, streamMetas);
     for await (const [name, fileHandle] of streamDir.entries()) {
       if (fileHandle.kind !== "file") continue;
@@ -88,7 +95,11 @@ async function rebuild(): Promise<number> {
           meta.sampleCount,
           meta.payloadLen,
         );
-        streamMetas.set(meta.seq, meta.crc32c);
+        streamMetas.set(meta.seq, {
+          crc32c: meta.crc32c,
+          payloadLen: meta.payloadLen,
+          sampleCount: meta.sampleCount,
+        });
         count += 1;
       } catch {
         // Unreadable file: leave it, the hole machinery re-fetches.
@@ -101,19 +112,22 @@ async function rebuild(): Promise<number> {
 async function persistChunk(
   takeId: string,
   streamId: string,
-  seq: number,
-  crc32c: number,
+  meta: { seq: number; crc32c: number; payloadLen: number; sampleCount: number },
   bytes: Uint8Array,
 ): Promise<void> {
   if (!root) throw new Error("no OPFS root");
   const dir = await root.getDirectoryHandle(streamDirName(takeId, streamId), { create: true });
-  await writeFile(dir, String(seq), bytes);
+  await writeFile(dir, String(meta.seq), bytes);
   let streamMetas = metas.get(streamDirName(takeId, streamId));
   if (!streamMetas) {
     streamMetas = new Map();
     metas.set(streamDirName(takeId, streamId), streamMetas);
   }
-  streamMetas.set(seq, crc32c);
+  streamMetas.set(meta.seq, {
+    crc32c: meta.crc32c,
+    payloadLen: meta.payloadLen,
+    sampleCount: meta.sampleCount,
+  });
 }
 
 async function digestFor(takeId: string, streamId: string): Promise<string> {
@@ -124,10 +138,51 @@ async function digestFor(takeId: string, streamId: string): Promise<string> {
   const dv = new DataView(buf.buffer);
   seqs.forEach((seq, i) => {
     dv.setUint32(i * 8, seq, true);
-    dv.setUint32(i * 8 + 4, (streamMetas.get(seq) as number) >>> 0, true);
+    dv.setUint32(i * 8 + 4, ((streamMetas.get(seq) as ChunkMetaLite).crc32c ?? 0) >>> 0, true);
   });
   const hash = await crypto.subtle.digest("SHA-256", buf);
   return [...new Uint8Array(hash)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/** Waveform proxy for clip bars: per-chunk payload sizes (seq order,
+ * audio chunks only), normalized against the stream's own peak and
+ * downsampled to at most `maxBars`. Denser audio compresses worse, so this
+ * is a real signal-complexity contour, not decoration. */
+function energyFor(
+  takeId: string,
+  streamId: string,
+  maxBars = 96,
+): {
+  energy: number[];
+  totalSamples: number;
+} {
+  const streamMetas = metas.get(streamDirName(takeId, streamId));
+  if (!streamMetas) return { energy: [], totalSamples: 0 };
+  const seqs = [...streamMetas.keys()].filter((s) => s > 0).sort((a, b) => a - b);
+  let totalSamples = 0;
+  const sizes = seqs.map((seq) => {
+    const meta = streamMetas.get(seq) as ChunkMetaLite;
+    totalSamples += meta.sampleCount;
+    return meta.payloadLen;
+  });
+  if (sizes.length === 0) return { energy: [], totalSamples };
+  const bucketCount = Math.min(maxBars, sizes.length);
+  const perBucket = sizes.length / bucketCount;
+  const buckets: number[] = [];
+  for (let b = 0; b < bucketCount; b++) {
+    const start = Math.floor(b * perBucket);
+    const end = Math.max(start + 1, Math.floor((b + 1) * perBucket));
+    let peak = 0;
+    for (let i = start; i < end && i < sizes.length; i++) {
+      peak = Math.max(peak, sizes[i] as number);
+    }
+    buckets.push(peak);
+  }
+  const max = Math.max(...buckets);
+  return {
+    energy: buckets.map((v) => (max > 0 ? v / max : 0)),
+    totalSamples,
+  };
 }
 
 async function handle(msg: ToSinkWorker): Promise<void> {
@@ -155,8 +210,10 @@ async function handle(msg: ToSinkWorker): Promise<void> {
               streamId: string;
               seq: number;
               crc32c: number;
+              payloadLen: number;
+              sampleCount: number;
             };
-            await persistChunk(meta.takeId, meta.streamId, meta.seq, meta.crc32c, bytes);
+            await persistChunk(meta.takeId, meta.streamId, meta, bytes);
             break;
           }
           case "gap-report": {
@@ -252,10 +309,16 @@ async function handle(msg: ToSinkWorker): Promise<void> {
         post({ type: "status-result", streams: [] });
         return;
       }
-      const raw = JSON.parse(engine.status_json()) as Array<Omit<DeskStreamStatus, "digest">>;
+      const raw = JSON.parse(engine.status_json()) as Array<
+        Omit<DeskStreamStatus, "digest" | "energy" | "totalSamples">
+      >;
       const streams: DeskStreamStatus[] = [];
       for (const s of raw) {
-        streams.push({ ...s, digest: await digestFor(s.takeId, s.streamId) });
+        streams.push({
+          ...s,
+          digest: await digestFor(s.takeId, s.streamId),
+          ...energyFor(s.takeId, s.streamId),
+        });
       }
       post({ type: "status-result", streams });
       break;

@@ -14,6 +14,12 @@ export interface DeskStreamStatus {
   /** sha256 over (seq, crc32c) LE pairs in seq order — must equal the
    * server's digest for the same stream when converged. */
   digest: string;
+  /** Total audio samples held (sum of chunk sample counts). */
+  totalSamples: number;
+  /** Per-chunk FLAC payload sizes in seq order, normalized 0..1 and
+   * downsampled — a real signal-complexity proxy that drives the clip
+   * waveform bars (louder/denser audio compresses worse). */
+  energy: number[];
 }
 
 export type ToSinkWorker =

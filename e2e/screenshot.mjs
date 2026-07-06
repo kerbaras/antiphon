@@ -7,23 +7,34 @@ const browser = await chromium.launch({
 });
 const sessionId = crypto.randomUUID();
 
-const desk = await (await browser.newContext({ viewport: { width: 1280, height: 800 } })).newPage();
+const desk = await (await browser.newContext({ viewport: { width: 1280, height: 900 } })).newPage();
 await desk.goto(`http://localhost:4173/session/${sessionId}`);
 
-const phone = await (
-  await browser.newContext({ ...devices["iPhone 15"], baseURL: "http://localhost:4173" })
-).newPage();
-await phone.goto(`http://localhost:4173/join/${sessionId}`);
-await phone.getByRole("button", { name: /enable microphone/i }).click();
-await desk.waitForTimeout(2500);
+const phones = [];
+for (let i = 0; i < 3; i++) {
+  const phone = await (
+    await browser.newContext({ ...devices["iPhone 15"], baseURL: "http://localhost:4173" })
+  ).newPage();
+  await phone.goto(`http://localhost:4173/join/${sessionId}`);
+  await phone.getByRole("button", { name: /enable microphone/i }).click();
+  phones.push(phone);
+}
+await desk.waitForTimeout(3000);
 
-await desk.getByRole("button", { name: /record take/i }).click();
-await desk.waitForTimeout(3500);
-await desk.screenshot({ path: "screens/desk-recording.png" });
-await phone.screenshot({ path: "screens/join-recording.png", fullPage: true });
-
-await desk.getByRole("button", { name: /stop take/i }).click();
+// Take 1: short, completed.
+await desk.getByRole("button", { name: "Record take" }).click();
 await desk.waitForTimeout(4000);
+await desk.getByRole("button", { name: "Stop take" }).click();
+await desk.waitForTimeout(3500);
+
+// Take 2: live while screenshotting.
+await desk.getByRole("button", { name: "Record take" }).click();
+await desk.waitForTimeout(5000);
+await desk.screenshot({ path: "screens/desk-recording.png" });
+await phones[0].screenshot({ path: "screens/join-recording.png", fullPage: true });
+
+await desk.getByRole("button", { name: "Stop take" }).click();
+await desk.waitForTimeout(5000);
 await desk.screenshot({ path: "screens/desk-converged.png" });
 
 await desk.goto("http://localhost:4173/");
