@@ -33,7 +33,9 @@ export async function init(): Promise<void> {
       readFile: (url: URL) => Promise<Uint8Array<ArrayBuffer>>;
     };
     const bytes = await readFile(new URL("../pkg/antiphon_bg.wasm", import.meta.url));
-    initSync({ module: new WebAssembly.Module(bytes) });
+    // initSync accepts raw bytes; avoids referencing the WebAssembly global
+    // type, which Node lib configs don't declare.
+    initSync({ module: bytes });
   } else {
     await wasmInit({
       module_or_path: new URL("../pkg/antiphon_bg.wasm", import.meta.url),

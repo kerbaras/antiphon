@@ -35,6 +35,9 @@ importers:
 
   apps/server:
     dependencies:
+      '@antiphon/core-wasm':
+        specifier: workspace:*
+        version: link:../../packages/core-wasm
       '@antiphon/protocol':
         specifier: workspace:*
         version: link:../../packages/protocol
