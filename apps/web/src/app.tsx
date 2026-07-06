@@ -1,6 +1,7 @@
-import { BrowserRouter, Route, Routes } from "react-router";
+import { BrowserRouter, Route, Routes, useNavigate } from "react-router";
 import { DeskRoute } from "./routes/desk";
 import { JoinRoute } from "./routes/join";
+import { Button, Wordmark } from "./ui/kit";
 
 export function App() {
   return (
@@ -15,11 +16,18 @@ export function App() {
 }
 
 function Home() {
+  const navigate = useNavigate();
   return (
-    <main className="grid min-h-dvh place-items-center">
-      <div className="text-center">
-        <h1 className="text-3xl font-semibold">Antiphon</h1>
-        <p className="mt-2 text-sm opacity-70">
+    <main className="grid min-h-dvh place-items-center bg-void">
+      <div className="flex flex-col items-center gap-6">
+        <Wordmark />
+        <p className="max-w-xs text-center text-[12px] leading-relaxed text-text-dim">
+          Phones are the microphones. The desk is the console. Every take survives the network.
+        </p>
+        <Button variant="accent" onClick={() => navigate(`/session/${crypto.randomUUID()}`)}>
+          Create session
+        </Button>
+        <p className="font-mono text-[9px] text-text-faint">
           cross-origin isolated: {String(globalThis.crossOriginIsolated)}
         </p>
       </div>

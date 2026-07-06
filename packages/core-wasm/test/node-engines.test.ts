@@ -5,7 +5,7 @@
 // browser leg of the same package is exercised by the Playwright smoke.)
 
 import { beforeAll, describe, expect, it } from "vitest";
-import { RecorderEngine, SinkEngine, TimeSyncSession, init, version } from "../src/index.ts";
+import { init, RecorderEngine, SinkEngine, TimeSyncSession, version } from "../src/index.ts";
 
 const TAKE_ID = new Uint8Array(16).fill(0xa1);
 const STREAM_ID = new Uint8Array(16).fill(0xb2);
@@ -207,16 +207,7 @@ describe("core-wasm in Node", () => {
   });
 
   it("runs NTP-style time sync over frames", () => {
-    const recorder = new RecorderEngine(
-      TAKE_ID,
-      STREAM_ID,
-      RATE,
-      24,
-      "t",
-      0,
-      0,
-      1 << 20,
-    );
+    const recorder = new RecorderEngine(TAKE_ID, STREAM_ID, RATE, 24, "t", 0, 0, 1 << 20);
     const session = new TimeSyncSession();
     // Recorder clock runs 250ms ahead of sink clock.
     const offset = 250_000;

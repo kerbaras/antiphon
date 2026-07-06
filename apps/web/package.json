@@ -13,14 +13,18 @@
   "dependencies": {
     "@antiphon/core-wasm": "workspace:*",
     "@antiphon/protocol": "workspace:*",
+    "@fontsource/ibm-plex-mono": "^5.2.7",
+    "@fontsource/ibm-plex-sans": "^5.2.8",
+    "qrcode": "^1.5.4",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
     "react-router": "^8.1.0",
-    "zustand": "^5.0.14",
-    "zod": "catalog:"
+    "zod": "catalog:",
+    "zustand": "^5.0.14"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.3.2",
+    "@types/qrcode": "^1.5.6",
     "@types/react": "^19.2.17",
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^6.0.3",

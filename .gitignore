@@ -17,6 +17,7 @@ playwright-report/
 test-results/
 coverage/
 proptest-regressions/
+screens/
 
 # editor / os
 .DS_Store

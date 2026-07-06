@@ -6,12 +6,16 @@
 import wasmInit, { initSync } from "../pkg/antiphon.js";
 
 export {
+  chunk_meta_json,
+  constants_json,
+  encode_have_summary,
+  extract_chunk_payload,
+  extract_codec_header,
   IngestResult,
   RecorderEngine,
   SinkEngine,
+  stream_header_json,
   TimeSyncSession,
-  constants_json,
-  encode_have_summary,
   version,
 } from "../pkg/antiphon.js";
 
@@ -20,13 +24,14 @@ let initialized = false;
 /** Idempotent. Resolves when the wasm module is instantiated. */
 export async function init(): Promise<void> {
   if (initialized) return;
-  const isNode =
-    typeof process !== "undefined" &&
-    typeof process.versions === "object" &&
-    process.versions !== null &&
-    "node" in process.versions;
-  if (isNode) {
-    const { readFile } = await import("node:fs/promises");
+  const proc = (globalThis as { process?: { versions?: { node?: string } } }).process;
+  if (typeof proc?.versions?.node === "string") {
+    // Specifier kept opaque so browser bundlers don't try to resolve the
+    // Node builtin into worker/client bundles.
+    const fsSpecifier = "node:fs/promises";
+    const { readFile } = (await import(/* @vite-ignore */ fsSpecifier)) as {
+      readFile: (url: URL) => Promise<Uint8Array<ArrayBuffer>>;
+    };
     const bytes = await readFile(new URL("../pkg/antiphon_bg.wasm", import.meta.url));
     initSync({ module: new WebAssembly.Module(bytes) });
   } else {

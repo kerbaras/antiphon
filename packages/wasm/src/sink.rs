@@ -379,6 +379,59 @@ impl TimeSyncSession {
     }
 }
 
+/// Extract the payload bytes of an AUDIO_CHUNK frame (storage layers slice
+/// payloads for .flac reconstruction without re-implementing wire layout).
+#[wasm_bindgen]
+pub fn extract_chunk_payload(frame: &[u8]) -> Result<Vec<u8>, JsError> {
+    match Frame::decode(frame) {
+        Ok(Decoded::Frame(Frame::AudioChunk(chunk))) => Ok(chunk.payload),
+        _ => Err(JsError::new("not an AUDIO_CHUNK frame")),
+    }
+}
+
+/// AUDIO_CHUNK header metadata as JSON (for storage layers).
+#[wasm_bindgen]
+pub fn chunk_meta_json(frame: &[u8]) -> Result<String, JsError> {
+    match Frame::decode(frame) {
+        Ok(Decoded::Frame(Frame::AudioChunk(chunk))) => Ok(key_obj(&chunk.stream)
+            .num("seq", chunk.seq)
+            .num("firstSampleIndex", chunk.first_sample_index as f64)
+            .num("sampleCount", chunk.sample_count)
+            .num("captureTsUs", chunk.capture_ts_us as f64)
+            .num("crc32c", chunk.crc32c)
+            .num("payloadLen", chunk.payload.len() as f64)
+            .build()),
+        _ => Err(JsError::new("not an AUDIO_CHUNK frame")),
+    }
+}
+
+/// Extract the codec bootstrap (`fLaC` + STREAMINFO) from a seq-0 payload.
+#[wasm_bindgen]
+pub fn extract_codec_header(seq0_payload: &[u8]) -> Result<Vec<u8>, JsError> {
+    antiphon_core::chunk::StreamHeaderV1::decode(seq0_payload)
+        .map(|h| h.codec_header)
+        .map_err(|e| JsError::new(&e.to_string()))
+}
+
+/// Stream header (seq-0 payload) metadata as JSON.
+#[wasm_bindgen]
+pub fn stream_header_json(seq0_payload: &[u8]) -> Result<String, JsError> {
+    let h = antiphon_core::chunk::StreamHeaderV1::decode(seq0_payload)
+        .map_err(|e| JsError::new(&e.to_string()))?;
+    // device_desc is free text: strip characters that would need escaping.
+    let safe_desc: String =
+        h.device_desc.chars().filter(|c| !matches!(c, '"' | '\\' | '\u{0}'..='\u{1f}')).collect();
+    Ok(Obj::new()
+        .num("codec", h.codec)
+        .num("channels", h.channels)
+        .num("bitsPerSample", h.bits_per_sample)
+        .num("sampleRate", h.sample_rate)
+        .num("clockEpochUs", h.clock_epoch_us as f64)
+        .num("wallClockHintMs", h.wall_clock_hint_ms as f64)
+        .str("deviceDesc", safe_desc)
+        .build())
+}
+
 /// Free helper for building RangeList-shaped frames from TS when the desk
 /// pushes chunks after HAVE reconciliation is done at the storage layer.
 #[wasm_bindgen]

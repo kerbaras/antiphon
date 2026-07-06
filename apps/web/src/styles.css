@@ -1,1 +1,148 @@
+/*
+ * Antiphon design tokens — extracted verbatim from the binding references:
+ * docs/image.png + "docs/Antiphone DAW.dc.html". Direction: dark, dense,
+ * pro-audio instrument panel. IBM Plex Sans for UI, IBM Plex Mono for every
+ * technical readout. Layered near-black surfaces cut by hard #0a0a0a
+ * dividers. All UI goes through these tokens — no ad-hoc hex in components.
+ * See docs/design-system.md.
+ */
+
+@import "@fontsource/ibm-plex-sans/400.css";
+@import "@fontsource/ibm-plex-sans/500.css";
+@import "@fontsource/ibm-plex-sans/600.css";
+@import "@fontsource/ibm-plex-sans/700.css";
+@import "@fontsource/ibm-plex-mono/400.css";
+@import "@fontsource/ibm-plex-mono/500.css";
+@import "@fontsource/ibm-plex-mono/600.css";
 @import "tailwindcss";
+
+@theme {
+  --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "SF Mono", monospace;
+
+  /* Surfaces, deepest to most raised */
+  --color-void: #111213;
+  --color-bg: #141516;
+  --color-lane: #161718;
+  --color-raised: #1a1b1c;
+  --color-panel: #1d1e1f;
+  --color-card: #202122;
+  --color-card-hi: #242526;
+  --color-well: #0e0f10;
+
+  /* Divider + border ladder */
+  --color-divider: #0a0a0a;
+  --color-edge: #2c2e30;
+  --color-edge-card: #2e3032;
+  --color-edge-inset: #303234;
+  --color-edge-btn: #333537;
+  --color-edge-strong: #3a3c3e;
+
+  /* Text ladder */
+  --color-text-hi: #f0f1f2;
+  --color-text-strong: #e8e9ea;
+  --color-text: #d6d7d8;
+  --color-text-body: #c0c1c3;
+  --color-text-mute: #a5a7aa;
+  --color-text-dim: #8b8d90;
+  --color-text-faint: #6b6d70;
+
+  /* Accent (theme options: #9A5CFF, #00C48F, #FF7A45) */
+  --color-accent: #2e8bff;
+
+  /* Semantics */
+  --color-rec: #e5484d;
+  --color-ok: #3fbf6f;
+  --color-warn: #d9c94b;
+  --color-pin: #f2b84b;
+
+  /* Track palette (8) */
+  --color-track-teal: #4fb8a8;
+  --color-track-gold: #d9a441;
+  --color-track-rose: #d96c7b;
+  --color-track-orange: #d97e4a;
+  --color-track-blue: #5b8dd9;
+  --color-track-violet: #9a7bd9;
+  --color-track-cyan: #55aec8;
+  --color-track-green: #7bb661;
+
+  --animate-recpulse: recpulse 1.4s infinite;
+  --animate-vu: vu 1.1s ease-in-out infinite;
+
+  @keyframes recpulse {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.35;
+    }
+  }
+  @keyframes vu {
+    0% {
+      transform: scaleY(0.45);
+    }
+    18% {
+      transform: scaleY(0.85);
+    }
+    34% {
+      transform: scaleY(0.6);
+    }
+    52% {
+      transform: scaleY(0.95);
+    }
+    70% {
+      transform: scaleY(0.5);
+    }
+    86% {
+      transform: scaleY(0.75);
+    }
+    100% {
+      transform: scaleY(0.45);
+    }
+  }
+}
+
+@layer base {
+  html,
+  body {
+    @apply bg-void text-text font-sans;
+  }
+
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: var(--color-raised);
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--color-edge-strong);
+    border-radius: 5px;
+    border: 2px solid var(--color-raised);
+  }
+
+  ::selection {
+    background: color-mix(in srgb, var(--color-accent) 40%, transparent);
+  }
+}
+
+@layer utilities {
+  /* The VU gradient used by every meter in the reference. */
+  .vu-gradient-v {
+    background: linear-gradient(
+      0deg,
+      var(--color-ok) 0 60%,
+      var(--color-warn) 60% 85%,
+      var(--color-rec) 85%
+    );
+  }
+  .vu-gradient-h {
+    background: linear-gradient(
+      90deg,
+      var(--color-ok) 0 70%,
+      var(--color-warn) 70% 90%,
+      var(--color-rec) 90%
+    );
+  }
+}

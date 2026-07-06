@@ -11,7 +11,16 @@ export default defineConfig({
     trace: "on-first-retry",
   },
   projects: [
-    { name: "chromium", use: { ...devices["Desktop Chrome"] } },
+    {
+      name: "chromium",
+      use: {
+        ...devices["Desktop Chrome"],
+        // Fake mic (sine tone) so capture-path tests run headless in CI.
+        launchOptions: {
+          args: ["--use-fake-device-for-media-stream", "--use-fake-ui-for-media-stream"],
+        },
+      },
+    },
     // Mobile Safari is the hostile baseline for the phone recorder.
     { name: "mobile-safari", use: { ...devices["iPhone 15"] } },
   ],

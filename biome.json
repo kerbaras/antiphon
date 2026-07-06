@@ -14,8 +14,14 @@
       "!**/node_modules",
       "!**/.turbo",
       "!**/playwright-report",
-      "!**/test-results"
+      "!**/test-results",
+      "!docs"
     ]
+  },
+  "css": {
+    "parser": {
+      "tailwindDirectives": true
+    }
   },
   "formatter": {
     "enabled": true,
