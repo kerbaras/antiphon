@@ -71,6 +71,40 @@ for (const [i, page] of phones.entries()) {
   check(`phone ${i + 1} streaming`, s.state === "streaming", s.state);
 }
 
+// Mixer strips are channel strips (per performer lane), NOT per-take: they
+// must be editable right now — mid-recording, with nothing loaded at all.
+const playerSnapEarly = () =>
+  desk.evaluate(() => window.__antiphonDesk?.playerSnapshot?.() ?? null);
+await desk.getByRole("button", { name: /^Mute/ }).first().click();
+const earlyChannels = (await playerSnapEarly())?.channels ?? [];
+check(
+  "mixer mute works while recording, no take loaded",
+  earlyChannels.some((c) => c.muted),
+  earlyChannels.map((c) => `${c.key.slice(0, 6)}:${c.muted}`).join(", ") || "no channels",
+);
+await desk.getByRole("button", { name: /^Mute/ }).first().click(); // restore
+
+// Pan knobs too: drag one right mid-recording, double-click to recenter.
+const panKnob = desk.getByRole("slider", { name: / pan$/ }).first();
+const pknob = await panKnob.boundingBox();
+await desk.mouse.move(pknob.x + pknob.width / 2, pknob.y + pknob.height / 2);
+await desk.mouse.down();
+await desk.mouse.move(pknob.x + pknob.width / 2 + 40, pknob.y + pknob.height / 2, { steps: 4 });
+await desk.mouse.up();
+const pannedChannels = (await playerSnapEarly())?.channels ?? [];
+check(
+  "pan knob drags while recording, no take loaded",
+  pannedChannels.some((c) => (c.pan ?? 0) > 0.3),
+  pannedChannels.map((c) => `${c.key.slice(0, 6)}:${c.pan}`).join(", ") || "no channels",
+);
+await panKnob.dblclick();
+const recentered = (await playerSnapEarly())?.channels ?? [];
+check(
+  "double-click recenters the pan knob",
+  recentered.every((c) => (c.pan ?? 0) === 0),
+  recentered.map((c) => `${c.pan}`).join(", "),
+);
+
 // Desk-side live meters (METER telemetry): fresh levels for every stream.
 const deskLevels = () =>
   desk.evaluate(() => {
@@ -241,8 +275,8 @@ await desk.mouse.move(box.x + box.width / 2, box.y + box.height - 8, { steps: 5 
 await desk.mouse.up();
 const afterFader = await playerSnap();
 check("master fader drag changes gain", afterFader.masterDb < -30, `${afterFader.masterDb} dB`);
-// Track fader too.
-const trackFader = desk.getByRole("slider").first();
+// Track fader too (pan knobs are sliders as well, so match by name).
+const trackFader = desk.getByRole("slider", { name: / gain$/ }).first();
 const tbox = await trackFader.boundingBox();
 await desk.mouse.move(tbox.x + 2, tbox.y + 10);
 await desk.mouse.down();
@@ -397,6 +431,132 @@ const takeStopped = await desk.evaluate(
   () => window.__antiphonDesk?.snapshot()?.activeTakeId === null,
 );
 check("space bar stops an ongoing recording", takeStopped);
+
+// --- per-lane record arm (the ● button in the track header) ------------------
+// Disarm lane 1, roll take 3: that phone must sit the take out while the
+// other two record; re-arm afterwards.
+await desk.getByRole("button", { name: /^Arm/ }).first().click();
+await desk.getByRole("button", { name: "Record take" }).click();
+await desk.waitForTimeout(2000);
+const armStates = await Promise.all(
+  phones.map((p) =>
+    p.evaluate(() => ({
+      state: window.__antiphon?.snapshot?.()?.stats?.state ?? "idle",
+      sittingOut: window.__antiphon?.sessionState?.()?.sittingOut ?? false,
+    })),
+  ),
+);
+const sitters = armStates.filter((s) => s.sittingOut && s.state !== "streaming").length;
+const rollers = armStates.filter((s) => s.state === "streaming").length;
+const deskDuringArm = await desk.evaluate(() => ({
+  active: window.__antiphonDesk?.snapshot?.()?.activeTakeId?.slice(0, 6) ?? null,
+  disarmed: window.__antiphonDesk?.snapshot?.()?.disarmedPeers?.length ?? -1,
+}));
+check(
+  "disarmed lane sits the take out; the rest record",
+  sitters === 1 && rollers === 2,
+  `${armStates.map((s) => (s.sittingOut ? "out" : s.state)).join(", ")} (desk take=${deskDuringArm.active} disarmed=${deskDuringArm.disarmed})`,
+);
+await desk.keyboard.press("Space"); // stop take 3
+await desk.waitForTimeout(800);
+await desk.getByRole("button", { name: /^Arm/ }).first().click(); // re-arm
+
+// --- take deletion: select clips, press Delete ------------------------------
+// Three takes exist now (3 + 3 + 2 streams; take 3 sat one lane out). Wait
+// for all eight streams to settle at the desk.
+let allStreams = [];
+for (let t = 0; t < 60; t++) {
+  allStreams = await deskStatus();
+  if (allStreams.length === 8 && allStreams.every((s) => s.complete)) break;
+  await desk.waitForTimeout(500);
+}
+check(
+  "all three takes complete before deletion",
+  allStreams.length === 8 && allStreams.every((s) => s.complete),
+  `${allStreams.filter((s) => s.complete).length}/8 complete`,
+);
+
+// Click one clip of take 2 → selects take 2, so the player loads it. The
+// lane strips (e.g. the −31 dB fader dragged during take 1) must carry
+// over — mixer state belongs to the performer lane, not the take.
+const take1LoadedId = (await playerSnap()).loadedTakeId;
+await desk.locator("[data-clip]", { hasText: "Take 2" }).first().click();
+let carried = null;
+for (let t = 0; t < 40; t++) {
+  carried = await playerSnap();
+  if (
+    carried.loadedTakeId &&
+    carried.loadedTakeId !== take1LoadedId &&
+    carried.tracks.length === 3 &&
+    !carried.loading
+  ) {
+    break;
+  }
+  await desk.waitForTimeout(400);
+}
+const carryDiag = await desk.evaluate(() => ({
+  selected: window.__antiphonDesk?.ui?.()?.selectedTakeId ?? null,
+  errors: window.__antiphonDesk?.snapshot?.()?.errors ?? [],
+}));
+check(
+  "mixer state carries across takes (lane strips, not per-take)",
+  carried.loadedTakeId !== take1LoadedId && carried.tracks.some((t) => t.gainDb < -5),
+  `gains ${carried.tracks.map((t) => t.gainDb.toFixed(0)).join(",")} loaded=${carried.loadedTakeId?.slice(0, 6)} was=${take1LoadedId?.slice(0, 6)} sel=${carryDiag.selected?.slice(0, 6)} loading=${carried.loading} err=${carried.error ?? carryDiag.errors.join(";") ?? ""}`,
+);
+await desk.keyboard.press("Delete");
+let afterSingleDelete = [];
+for (let t = 0; t < 20; t++) {
+  afterSingleDelete = await deskStatus();
+  if (afterSingleDelete.length === 7) break;
+  await desk.waitForTimeout(400);
+}
+check(
+  "Delete removes the selected clip's stream",
+  afterSingleDelete.length === 7 && (await desk.locator("[data-clip]").count()) === 7,
+  `${afterSingleDelete.length} streams, ${await desk.locator("[data-clip]").count()} clips`,
+);
+
+// Marquee everything, Delete → the timeline empties end to end.
+await desk.mouse.move(tbox2.x + HEADER_W + 560, tbox2.y + RULER_HEIGHT + 6);
+await desk.mouse.down();
+await desk.mouse.move(tbox2.x + HEADER_W + 10, tbox2.y + RULER_HEIGHT + 3 * ROW_H - 6, {
+  steps: 8,
+});
+await desk.mouse.up();
+await desk.waitForTimeout(300);
+await desk.keyboard.press("Backspace"); // both keys must work
+let afterFullDelete = [];
+for (let t = 0; t < 20; t++) {
+  afterFullDelete = await deskStatus();
+  if (afterFullDelete.length === 0) break;
+  await desk.waitForTimeout(400);
+}
+const playerAfterDelete = await playerSnap();
+check(
+  "deleting every clip empties the timeline and unloads the player",
+  afterFullDelete.length === 0 && playerAfterDelete.loadedTakeId === null,
+  `${afterFullDelete.length} streams, loaded=${playerAfterDelete.loadedTakeId}`,
+);
+
+// The server archive dropped the takes too.
+const serverTakes = await desk.evaluate(async (sid) => {
+  const res = await fetch(`/api/sessions/${sid}`);
+  return (await res.json()).takes.length;
+}, sessionId);
+check("server archive dropped the deleted takes", serverTakes === 0, `${serverTakes} takes left`);
+
+// And the deletion survives a desk reload: nothing rebuilds from OPFS.
+await desk.reload();
+await desk.waitForTimeout(2500);
+const reborn = await desk.evaluate(() => {
+  const snap = window.__antiphonDesk?.snapshot?.();
+  return { streams: snap?.deskStatus?.length ?? -1, rebuilt: snap?.rebuiltChunks ?? -1 };
+});
+check(
+  "deletion is durable across desk reload (OPFS wiped)",
+  reborn.streams === 0 && reborn.rebuilt === 0,
+  `streams ${reborn.streams}, rebuilt chunks ${reborn.rebuilt}`,
+);
 
 await desk.screenshot({ path: "screens/live-final.png" });
 

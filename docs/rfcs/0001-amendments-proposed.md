@@ -85,7 +85,40 @@ retransmitted; conformant receivers that don't know it ignore it (verified
 other implementations don't collide on 0x80 casually; not proposed for the
 normative protocol.
 
-## A9. Editorial
+## A9. `streams-delete` / `streams-deleted` control messages — addition to §5
+
+Deliberate removal of recorded material is a desk (session authority)
+decision the RFC does not cover. Desk→server:
+`{ v, type: "streams-delete", streams: [{takeId, streamId}, …] }`.
+Ordering rules, chosen so deletion can never race the never-lose-audio
+machinery:
+
+- The server MUST refuse deletion of any stream belonging to the active
+  take (`error code="take-active"`): inbound chunks would recreate receiver
+  state mid-delete and resurrect half a stream.
+- The server deletes durably FIRST — receiver state, then metadata rows,
+  then blobs — and only then fans out
+  `{ v, type: "streams-deleted", streams, deletedTakeIds }` to all peers.
+- Sinks drop their local copies (engine state + store) only on that
+  confirm; a failed delete therefore never leaves sinks disagreeing with
+  the archive.
+- Removed streams vanish from ACK/HAVE traffic on every sink, so
+  reconciliation cannot re-push (resurrect) them; deletion is idempotent
+  (unknown streams delete to nothing). Takes that lose their last stream
+  are removed and reported in `deletedTakeIds`.
+
+## A10. `disarmedPeerIds` on `take-start` — extension of §5
+
+Per-lane record-arm: `take-start` MAY carry
+`disarmedPeerIds: [peerId, …]`; listed recorders do not arm for that take
+(they keep their session running and re-arm normally on the next take).
+The session snapshot's active-take object carries the same list so late
+(re)joiners honor it. Omitted/empty = everyone records, so old peers are
+unaffected. Chosen over a per-peer unicast so the arm decision lives in
+exactly one message and the whole room shares one consistent view of who
+is rolling.
+
+## A11. Editorial
 
 - §15 says the property suite lives in `rust/core`; the crate lives at
   `packages/core` (Cargo workspace member `antiphon-core`).

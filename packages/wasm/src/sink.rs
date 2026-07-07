@@ -231,6 +231,18 @@ impl SinkEngine {
         Ok(())
     }
 
+    /// Control-plane `streams-delete`: drop all receiver state for a
+    /// stream. The caller removes its durable copy in the same operation;
+    /// afterwards the stream no longer appears in ACK/HAVE traffic, so
+    /// peers can never re-push (resurrect) it here.
+    pub fn remove_stream(&mut self, take_id: &[u8], stream_id: &[u8]) -> Result<bool, JsError> {
+        let stream = StreamKey {
+            take_id: parse_id(take_id, "take_id")?,
+            stream_id: parse_id(stream_id, "stream_id")?,
+        };
+        Ok(self.streams.remove(&stream).is_some())
+    }
+
     /// Control-plane `stream-final`: the sink now knows the last seq.
     pub fn set_final_seq(
         &mut self,

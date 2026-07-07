@@ -38,6 +38,11 @@ let peak = 0;
 let meterIds: { takeId: Uint8Array; streamId: Uint8Array } | null = null;
 /** Sinks registered before the engine exists (arm applies them). */
 const preArmSinks = new Map<number, boolean>();
+/** Arm requested while the previous take is still draining: queued, applied
+ * the moment the old engine closes. Discarding the old engine would break
+ * its backfill obligations; refusing the new take would lose a whole take —
+ * a short capture-start delay is the only lossless option. */
+let pendingArm: Extract<ToEncoderWorker, { type: "arm" }> | null = null;
 
 function post(msg: FromEncoderWorker, transfer: Transferable[] = []) {
   (self as unknown as Worker).postMessage(msg, transfer);
@@ -55,6 +60,11 @@ function uuidBytes(uuid: string): Uint8Array {
 }
 
 function pump() {
+  if (pendingArm && engine?.state() === "closed") {
+    const queued = pendingArm;
+    pendingArm = null;
+    doArm(queued);
+  }
   if (!ring || !engine) return;
   // Cap one pump at 2s of audio to bound slab size after long stalls.
   const slab = ring.read(sampleRate * 2);
@@ -133,6 +143,40 @@ function sendStats() {
   }
 }
 
+function doArm(msg: Extract<ToEncoderWorker, { type: "arm" }>): void {
+  if (!ring) return;
+  if (engine) {
+    engine.free();
+    engine = null;
+  }
+  ring.snapToWrite();
+  const epochUs = nowUs();
+  retainLocal = msg.retainLocal;
+  localSink = retainLocal ? new SinkEngine() : null;
+  meterIds = { takeId: msg.takeId.slice(), streamId: msg.streamId.slice() };
+  localPayloads.clear();
+  localCodecHeader = null;
+  engine = new RecorderEngine(
+    msg.takeId,
+    msg.streamId,
+    sampleRate,
+    msg.bitsPerSample,
+    msg.deviceDesc,
+    epochUs,
+    msg.wallClockHintMs,
+    msg.ringBudgetBytes,
+  );
+  if (retainLocal) {
+    engine.add_sink(LOCAL_SINK_ID);
+    engine.set_sink_connected(LOCAL_SINK_ID, true);
+  }
+  for (const [sinkId, connected] of preArmSinks) {
+    engine.add_sink(sinkId);
+    engine.set_sink_connected(sinkId, connected);
+  }
+  post({ type: "armed", epochUs });
+}
+
 async function handle(msg: ToEncoderWorker) {
   switch (msg.type) {
     case "configure": {
@@ -146,44 +190,25 @@ async function handle(msg: ToEncoderWorker) {
     }
     case "arm": {
       if (!ring) throw new Error("arm before configure");
-      if (engine) {
-        // One engine per take. A closed take can be replaced; a draining
-        // one still owes backfill from its ring — never discard it.
-        if (engine.state() !== "closed") {
-          throw new Error(`take in progress (${engine.state()})`);
-        }
-        engine.free();
-        engine = null;
+      if (engine && engine.state() !== "closed") {
+        // One engine per take, and a draining one still owes backfill from
+        // its ring — never discard it. Queue the new take; the pump arms it
+        // the moment the old engine settles (typically within one ACK
+        // interval). Audio before that arm belongs to no take.
+        pendingArm = msg;
+        return;
       }
-      ring.snapToWrite();
-      const epochUs = nowUs();
-      retainLocal = msg.retainLocal;
-      localSink = retainLocal ? new SinkEngine() : null;
-      meterIds = { takeId: msg.takeId.slice(), streamId: msg.streamId.slice() };
-      localPayloads.clear();
-      localCodecHeader = null;
-      engine = new RecorderEngine(
-        msg.takeId,
-        msg.streamId,
-        sampleRate,
-        msg.bitsPerSample,
-        msg.deviceDesc,
-        epochUs,
-        msg.wallClockHintMs,
-        msg.ringBudgetBytes,
-      );
-      if (retainLocal) {
-        engine.add_sink(LOCAL_SINK_ID);
-        engine.set_sink_connected(LOCAL_SINK_ID, true);
-      }
-      for (const [sinkId, connected] of preArmSinks) {
-        engine.add_sink(sinkId);
-        engine.set_sink_connected(sinkId, connected);
-      }
-      post({ type: "armed", epochUs });
+      doArm(msg);
       break;
     }
     case "stop": {
+      if (pendingArm) {
+        // The queued take was stopped before it ever armed: nothing was
+        // captured for it, and the old engine keeps draining untouched.
+        pendingArm = null;
+        post({ type: "stopped", finalSeq: null });
+        return;
+      }
       if (!engine) return;
       pump(); // consume anything still in the ring first
       engine.finish();

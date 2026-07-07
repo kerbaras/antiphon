@@ -35,6 +35,8 @@ export interface RecorderSessionState {
   activeTakeId: string | null;
   streamId: string | null;
   outageUntil: number | null;
+  /** A take is rolling but the desk disarmed this lane — we sit it out. */
+  sittingOut: boolean;
 }
 
 type Listener = (state: RecorderSessionState) => void;
@@ -48,6 +50,7 @@ export class RecorderSession {
   private outageUntil: number | null = null;
   private activeTakeId: string | null = null;
   private streamId: string | null = null;
+  private sittingOutTakeId: string | null = null;
   private stoppedForFinal: { takeId: string; streamId: string } | null = null;
 
   constructor(sessionId: string, controller: CaptureController) {
@@ -92,6 +95,7 @@ export class RecorderSession {
       activeTakeId: this.activeTakeId,
       streamId: this.streamId,
       outageUntil: this.outageUntil,
+      sittingOut: this.sittingOutTakeId !== null,
     };
   }
 
@@ -119,7 +123,8 @@ export class RecorderSession {
         this.ensureLinks();
         const active = msg.session.activeTake;
         if (active && this.activeTakeId !== active.takeId) {
-          this.armForTake(active.takeId);
+          if (this.isDisarmed(active.disarmedPeerIds)) this.sittingOutTakeId = active.takeId;
+          else this.armForTake(active.takeId);
         }
         break;
       }
@@ -127,9 +132,14 @@ export class RecorderSession {
         this.ensureLinks();
         break;
       case "take-start":
-        if (this.activeTakeId !== msg.takeId) this.armForTake(msg.takeId);
+        if (this.activeTakeId === msg.takeId) break;
+        // Desk disarmed this lane: capture stays idle for this take, but
+        // the session keeps flowing (next take re-arms normally).
+        if (this.isDisarmed(msg.disarmedPeerIds)) this.sittingOutTakeId = msg.takeId;
+        else this.armForTake(msg.takeId);
         break;
       case "take-stop":
+        if (this.sittingOutTakeId === msg.takeId) this.sittingOutTakeId = null;
         if (this.activeTakeId === msg.takeId) this.stopTake();
         break;
       default:
@@ -138,8 +148,14 @@ export class RecorderSession {
     this.publish();
   }
 
+  private isDisarmed(disarmedPeerIds: string[] | undefined): boolean {
+    const me = this.signaling.state.peerId;
+    return me !== null && (disarmedPeerIds?.includes(me) ?? false);
+  }
+
   private armForTake(takeId: string): void {
     const streamId = crypto.randomUUID();
+    this.sittingOutTakeId = null;
     this.activeTakeId = takeId;
     this.streamId = streamId;
     // The worker replays registered sinks + connectivity into each fresh

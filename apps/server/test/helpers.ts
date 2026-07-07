@@ -271,6 +271,7 @@ export class FakeRecorder {
 export class FakeDesk {
   ws!: WebSocket;
   peerId: string | null = null;
+  readonly received: SignalingMessage[] = [];
   private readonly baseUrl: string;
   private readonly sessionId: string;
 
@@ -288,7 +289,9 @@ export class FakeDesk {
     });
     this.ws.addEventListener("message", (ev) => {
       const msg = safeParse(String(ev.data));
-      if (msg?.type === "welcome") this.peerId = msg.peerId;
+      if (!msg) return;
+      this.received.push(msg);
+      if (msg.type === "welcome") this.peerId = msg.peerId;
     });
     this.ws.send(
       JSON.stringify({
@@ -319,6 +322,24 @@ export class FakeDesk {
 
   takeStop(takeId: string): void {
     this.ws.send(JSON.stringify({ v: 1, type: "take-stop", takeId }));
+  }
+
+  deleteStreams(streams: Array<{ takeId: string; streamId: string }>): void {
+    this.ws.send(JSON.stringify({ v: 1, type: "streams-delete", streams }));
+  }
+
+  /** Next already-received (or future) message of the given type. */
+  async waitForMessage<T extends SignalingMessage["type"]>(
+    type: T,
+    timeoutMs = 10_000,
+  ): Promise<Extract<SignalingMessage, { type: T }>> {
+    const start = Date.now();
+    for (;;) {
+      const found = this.received.find((m) => m.type === type);
+      if (found) return found as Extract<SignalingMessage, { type: T }>;
+      if (Date.now() - start > timeoutMs) throw new Error(`timeout waiting for ${type}`);
+      await new Promise((r) => setTimeout(r, 25));
+    }
   }
 
   close(): void {

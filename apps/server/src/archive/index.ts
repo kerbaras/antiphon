@@ -60,6 +60,20 @@ export class Archive {
       .where(and(eq(schema.takes.id, takeId)));
   }
 
+  /** Drop a take row that ended with zero streams (e.g. every lane was
+   * disarmed) so it never haunts the session summary. Safe against late
+   * chunks: persistence re-creates the take row on arrival. */
+  async deleteTakeIfEmpty(takeId: string): Promise<boolean> {
+    const remaining = await this.db
+      .select({ id: schema.streams.id })
+      .from(schema.streams)
+      .where(eq(schema.streams.takeId, takeId))
+      .limit(1);
+    if (remaining.length > 0) return false;
+    await this.db.delete(schema.takes).where(eq(schema.takes.id, takeId));
+    return true;
+  }
+
   async ensureStream(takeId: string, streamId: string, peerId?: string): Promise<void> {
     await this.db
       .insert(schema.streams)
@@ -138,6 +152,41 @@ export class Archive {
       .insert(schema.chirps)
       .values({ id: chirpId, sessionId, emitTsDeskUs, spec })
       .onConflictDoNothing();
+  }
+
+  /** Delete streams outright (desk-initiated take removal): rows first
+   * (stream delete cascades chunks + gaps), then blobs — a failed blob
+   * delete leaks bytes but can never resurrect a row. Takes that lose
+   * their last stream are removed too; returns those take ids. Idempotent:
+   * unknown streams delete to nothing. */
+  async deleteStreams(refs: Array<{ takeId: string; streamId: string }>): Promise<string[]> {
+    if (refs.length === 0) return [];
+    const streamIds = refs.map((r) => r.streamId);
+    const blobRows = await this.db
+      .select({ blobKey: schema.chunks.blobKey })
+      .from(schema.chunks)
+      .where(inArray(schema.chunks.streamId, streamIds));
+    await this.db.delete(schema.streams).where(inArray(schema.streams.id, streamIds));
+    for (const row of blobRows) {
+      try {
+        await this.blobs.delete(row.blobKey);
+      } catch {
+        // Orphaned blob: harmless, unreferenced by any row.
+      }
+    }
+    const deletedTakeIds: string[] = [];
+    for (const takeId of new Set(refs.map((r) => r.takeId))) {
+      const remaining = await this.db
+        .select({ id: schema.streams.id })
+        .from(schema.streams)
+        .where(eq(schema.streams.takeId, takeId))
+        .limit(1);
+      if (remaining.length === 0) {
+        await this.db.delete(schema.takes).where(eq(schema.takes.id, takeId));
+        deletedTakeIds.push(takeId);
+      }
+    }
+    return deletedTakeIds;
   }
 
   // ---- crash rebuild (RFC §8) ------------------------------------------

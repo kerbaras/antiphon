@@ -89,27 +89,31 @@ export function JoinRoute() {
         <div className="flex items-center justify-between">
           <StatusPill
             tone={
-              recording
-                ? "rec"
-                : state === "draining"
-                  ? "warn"
-                  : state === "closed"
-                    ? "ok"
-                    : capturing
-                      ? "accent"
-                      : "idle"
+              sessionState?.sittingOut
+                ? "warn"
+                : recording
+                  ? "rec"
+                  : state === "draining"
+                    ? "warn"
+                    : state === "closed"
+                      ? "ok"
+                      : capturing
+                        ? "accent"
+                        : "idle"
             }
           >
             {recording && <RecDot />}
-            {!capturing
-              ? "no mic"
-              : state === "idle"
-                ? "ready"
-                : state === "streaming"
-                  ? "recording"
-                  : state === "closed"
-                    ? "take saved"
-                    : state}
+            {sessionState?.sittingOut
+              ? "sitting out (desk disarmed)"
+              : !capturing
+                ? "no mic"
+                : state === "idle"
+                  ? "ready"
+                  : state === "streaming"
+                    ? "recording"
+                    : state === "closed"
+                      ? "take saved"
+                      : state}
           </StatusPill>
           <InsetDisplay className="px-3 py-1">
             <span className="font-mono text-[15px] font-semibold tracking-[1px] text-text-hi">

@@ -3,7 +3,7 @@
 // protocol mocks anywhere. Requires Postgres (docker compose up -d postgres
 // or CI service); skipped when TEST_DATABASE_URL is unreachable.
 
-import { mkdtempSync } from "node:fs";
+import { existsSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import nodeDataChannel from "node-datachannel";
@@ -198,6 +198,78 @@ suite("server ingest end-to-end", () => {
     expect(summary[0]?.chunkCount).toBe(finalSeq + 1);
     expect(summary[0]?.flagged).toBe(false);
     expect(summary[0]?.complete).toBe(true);
+
+    await recorder.close();
+    desk.close();
+  }, 60_000);
+
+  it("desk-initiated deletion: rows, blobs, and engine state all drop; live takes are protected", async () => {
+    const { sessionId } = (await (
+      await fetch(`${server.baseUrl}/api/sessions`, { method: "POST" })
+    ).json()) as { sessionId: string };
+    const desk = new FakeDesk(server.baseUrl, sessionId);
+    await desk.join();
+    const recorder = new FakeRecorder(server.baseUrl, sessionId);
+    await recorder.join();
+    await recorder.connectDataChannel();
+
+    const takeId = crypto.randomUUID();
+    const streamId = crypto.randomUUID();
+    const started = new Promise<void>((resolve) => {
+      recorder.onTakeStart(() => {
+        recorder.arm(takeId, streamId);
+        resolve();
+      });
+    });
+    desk.takeStart(takeId);
+    await started;
+    recorder.pushAudio(sine(1.2));
+
+    // Deleting under the live take must be refused outright.
+    await pollUntil(
+      () => takeSummary(server.baseUrl, sessionId, takeId),
+      (s) => (s[0]?.chunkCount ?? 0) >= 1,
+      "chunks archived before delete attempt",
+    );
+    desk.deleteStreams([{ takeId, streamId }]);
+    const refusal = await desk.waitForMessage("error");
+    expect(refusal.code).toBe("take-active");
+
+    const finalSeq = recorder.finish(takeId, streamId);
+    desk.takeStop(takeId);
+    await recorder.waitDrained();
+    await pollUntil(
+      () => takeSummary(server.baseUrl, sessionId, takeId),
+      (s) => s.length === 1 && (s[0]?.complete ?? false),
+      "archive complete before deletion",
+    );
+    const blobPath = join(blobRoot, takeId, streamId, String(finalSeq));
+    expect(existsSync(blobPath)).toBe(true);
+
+    // Now the take is settled: delete for real.
+    desk.deleteStreams([{ takeId, streamId }]);
+    const confirm = await desk.waitForMessage("streams-deleted");
+    expect(confirm.streams).toEqual([{ takeId, streamId }]);
+    expect(confirm.deletedTakeIds).toEqual([takeId]);
+
+    // Rows gone (summary empty), blobs gone, take gone from the session.
+    expect(await takeSummary(server.baseUrl, sessionId, takeId)).toEqual([]);
+    expect(existsSync(blobPath)).toBe(false);
+    const session = (await (await fetch(`${server.baseUrl}/api/sessions/${sessionId}`)).json()) as {
+      takes: Array<{ id: string }>;
+    };
+    expect(session.takes.map((t) => t.id)).not.toContain(takeId);
+
+    // Engine state gone too: the stream vanished from ingest status, so
+    // ACK/HAVE traffic can never resurrect it.
+    const ingest = (await (
+      await fetch(`${server.baseUrl}/api/sessions/${sessionId}/ingest`)
+    ).json()) as Array<{ streamId: string }>;
+    expect(ingest.map((s) => s.streamId)).not.toContain(streamId);
+
+    // FLAC reconstruction refuses an unknown stream.
+    const flacRes = await fetch(`${server.baseUrl}/api/streams/${streamId}/flac`);
+    expect(flacRes.status).toBe(409);
 
     await recorder.close();
     desk.close();

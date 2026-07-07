@@ -41,6 +41,8 @@ export interface DeskSessionState {
   errors: string[];
   /** Live capture peaks per stream (METER telemetry): value + received-at. */
   liveLevels: Record<string, { peak: number; at: number }>;
+  /** Lanes (peer ids) the desk disarmed: they sit out the next take. */
+  disarmedPeers: string[];
 }
 
 type Listener = (state: DeskSessionState) => void;
@@ -72,6 +74,7 @@ export class DeskSession {
     lastChirpAt: null,
     errors: [],
     liveLevels: {},
+    disarmedPeers: [],
   };
   private wasmReady = false;
   private timers: number[] = [];
@@ -86,6 +89,7 @@ export class DeskSession {
   >();
   private nextRequestId = 1;
   private audioContext: AudioContext | null = null;
+  private readonly deletedListeners = new Set<(streamIds: string[]) => void>();
 
   constructor(readonly sessionId: string) {
     this.signaling = new SignalingClient("desk", sessionId);
@@ -136,8 +140,19 @@ export class DeskSession {
       type: "take-start",
       takeId,
       wallClockHint: new Date().toISOString(),
+      ...(this.state.disarmedPeers.length > 0 ? { disarmedPeerIds: this.state.disarmedPeers } : {}),
     });
     return takeId;
+  }
+
+  /** Per-lane record-arm: a disarmed peer sits out subsequent takes until
+   * re-armed. Purely a control-plane instruction — the rolling take is
+   * never interrupted. */
+  toggleArm(peerId: string): void {
+    const disarmedPeers = this.state.disarmedPeers.includes(peerId)
+      ? this.state.disarmedPeers.filter((p) => p !== peerId)
+      : [...this.state.disarmedPeers, peerId];
+    this.patch({ disarmedPeers });
   }
 
   stopTake(): void {
@@ -176,6 +191,26 @@ export class DeskSession {
       spec,
     });
     this.patch({ lastChirpAt: Date.now() });
+  }
+
+  /** Ask the server (the archive authority) to delete streams. Local
+   * copies are dropped only when the `streams-deleted` confirm fans out —
+   * a failed delete never leaves the desk disagreeing with the archive. */
+  deleteStreams(refs: Array<{ takeId: string; streamId: string }>): void {
+    if (refs.length === 0) return;
+    if (!this.signaling.state.connected) {
+      this.patch({
+        errors: [...this.state.errors.slice(-4), "delete failed: signaling offline"],
+      });
+      return;
+    }
+    this.signaling.send({ v: 1, type: "streams-delete", streams: refs });
+  }
+
+  /** Fires with the stream ids removed after a server-confirmed deletion. */
+  onStreamsDeleted(listener: (streamIds: string[]) => void): () => void {
+    this.deletedListeners.add(listener);
+    return () => this.deletedListeners.delete(listener);
   }
 
   /** Reassemble a stream's playable FLAC from the desk's own OPFS store. */
@@ -228,6 +263,20 @@ export class DeskSession {
             s.streamId === msg.streamId ? { ...s, finalSeq: msg.finalSeq } : s,
           ),
         });
+        break;
+      }
+      case "streams-deleted": {
+        const ids = new Set(msg.streams.map((s) => s.streamId));
+        this.post({ type: "delete-streams", streams: msg.streams });
+        this.post({ type: "status" }); // worker chain: runs after the delete
+        const liveLevels = Object.fromEntries(
+          Object.entries(this.state.liveLevels).filter(([id]) => !ids.has(id)),
+        );
+        this.patch({
+          streams: this.state.streams.filter((s) => !ids.has(s.streamId)),
+          liveLevels,
+        });
+        for (const listener of this.deletedListeners) listener([...ids]);
         break;
       }
       case "ice-offer": {

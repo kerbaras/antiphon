@@ -20,6 +20,8 @@ export interface AlignmentResult {
 
 export interface PlayerTrackSnapshot {
   streamId: string;
+  /** Mixer channel this track plays through (the performer lane). */
+  channelKey: string;
   gainDb: number;
   muted: boolean;
   soloed: boolean;
@@ -30,6 +32,18 @@ export interface PlayerTrackSnapshot {
   waveform: number[];
 }
 
+/** Persistent mixer strip state, keyed by performer lane — NOT by stream:
+ * gain/pan/mute/solo belong to the track (channel), survive take switches,
+ * and are editable with nothing loaded at all. */
+export interface ChannelStrip {
+  key: string;
+  gainDb: number;
+  /** Stereo placement of the mono source, −1 (L) .. +1 (R). */
+  pan: number;
+  muted: boolean;
+  soloed: boolean;
+}
+
 export interface PlayerSnapshot {
   loadedTakeId: string | null;
   loading: boolean;
@@ -38,8 +52,10 @@ export interface PlayerSnapshot {
   positionSec: number;
   durationSec: number;
   masterDb: number;
+  masterPan: number;
   masterLevel: number;
   tracks: PlayerTrackSnapshot[];
+  channels: ChannelStrip[];
   error: string | null;
   /** Times source scheduling ran since play() — a continuous, uncut
    * playback stays at 1 (regression guard for re-schedule storms). */
@@ -48,13 +64,12 @@ export interface PlayerSnapshot {
 
 interface Track {
   streamId: string;
+  channelKey: string;
   buffer: AudioBuffer;
   gain: GainNode;
+  panner: StereoPannerNode;
   analyser: AnalyserNode;
   scratch: Float32Array<ArrayBuffer>;
-  gainDb: number;
-  muted: boolean;
-  soloed: boolean;
   alignment: AlignmentResult | null;
   waveform: number[];
 }
@@ -87,9 +102,11 @@ export function dbToLinear(db: number): number {
 export class TakePlayer {
   private ctx: AudioContext | null = null;
   private master: GainNode | null = null;
+  private masterPanner: StereoPannerNode | null = null;
   private masterAnalyser: AnalyserNode | null = null;
   private masterScratch: Float32Array<ArrayBuffer> | null = null;
   private tracks = new Map<string, Track>();
+  private readonly channels = new Map<string, ChannelStrip>();
   private sources: AudioBufferSourceNode[] = [];
   /** Per-clip timeline delay (seconds ≥ 0 relative to the take's base):
    * the arrangement position of each clip, set by timeline edits. */
@@ -101,6 +118,7 @@ export class TakePlayer {
   private startCtxTime = 0;
   private startPos = 0;
   private masterDb = 0;
+  private masterPan = 0;
   private error: string | null = null;
   private scheduleCount = 0;
   private raf: number | null = null;
@@ -123,16 +141,22 @@ export class TakePlayer {
       positionSec: this.position(),
       durationSec: this.duration(),
       masterDb: this.masterDb,
+      masterPan: this.masterPan,
       masterLevel: this.masterLevel,
-      tracks: [...this.tracks.values()].map((t) => ({
-        streamId: t.streamId,
-        gainDb: t.gainDb,
-        muted: t.muted,
-        soloed: t.soloed,
-        level: this.levels.get(t.streamId) ?? 0,
-        alignment: t.alignment,
-        waveform: t.waveform,
-      })),
+      tracks: [...this.tracks.values()].map((t) => {
+        const strip = this.channel(t.channelKey);
+        return {
+          streamId: t.streamId,
+          channelKey: t.channelKey,
+          gainDb: strip.gainDb,
+          muted: strip.muted,
+          soloed: strip.soloed,
+          level: this.levels.get(t.streamId) ?? 0,
+          alignment: t.alignment,
+          waveform: t.waveform,
+        };
+      }),
+      channels: [...this.channels.values()].map((c) => ({ ...c })),
       error: this.error,
       scheduleCount: this.scheduleCount,
     };
@@ -147,20 +171,36 @@ export class TakePlayer {
     if (!this.ctx) {
       this.ctx = new AudioContext();
       this.master = this.ctx.createGain();
+      this.masterPanner = this.ctx.createStereoPanner();
       this.masterAnalyser = this.ctx.createAnalyser();
       this.masterAnalyser.fftSize = 512;
       this.masterScratch = new Float32Array(this.masterAnalyser.fftSize);
-      this.master.connect(this.masterAnalyser);
+      this.master.connect(this.masterPanner);
+      this.masterPanner.connect(this.masterAnalyser);
       this.masterAnalyser.connect(this.ctx.destination);
+      this.applyGains();
     }
     return this.ctx;
   }
 
-  /** Decode and mount every stream of a take. Previous take is discarded. */
+  /** Get-or-create the persistent mixer strip for a lane. */
+  private channel(key: string): ChannelStrip {
+    let strip = this.channels.get(key);
+    if (!strip) {
+      strip = { key, gainDb: 0, pan: 0, muted: false, soloed: false };
+      this.channels.set(key, strip);
+    }
+    return strip;
+  }
+
+  /** Decode and mount every stream of a take. Previous take is discarded.
+   * `channelOf` maps each stream to its mixer lane (performer); mixer state
+   * lives on the lane, so it carries across takes untouched. */
   async load(
     takeId: string,
     streamIds: string[],
     assemble: (takeId: string, streamId: string) => Promise<ArrayBuffer | null>,
+    channelOf: (streamId: string) => string = (id) => id,
   ): Promise<boolean> {
     if (this.loading) return false;
     if (this.loadedTakeId === takeId && streamIds.every((id) => this.tracks.has(id))) {
@@ -181,26 +221,28 @@ export class TakePlayer {
         }
         const buffer = await ctx.decodeAudioData(flac);
         const gain = ctx.createGain();
+        const panner = ctx.createStereoPanner();
         const analyser = ctx.createAnalyser();
         analyser.fftSize = 512;
-        gain.connect(analyser);
+        gain.connect(panner);
+        panner.connect(analyser);
         analyser.connect(this.master as GainNode);
         const previous = this.tracks.get(streamId);
         next.set(streamId, {
           streamId,
+          channelKey: channelOf(streamId),
           buffer,
           gain,
+          panner,
           analyser,
           scratch: new Float32Array(analyser.fftSize),
-          gainDb: previous?.gainDb ?? 0,
-          muted: previous?.muted ?? false,
-          soloed: previous?.soloed ?? false,
           alignment: previous?.alignment ?? null,
           waveform: computeWaveform(buffer),
         });
       }
       for (const old of this.tracks.values()) {
         old.gain.disconnect();
+        old.panner.disconnect();
         old.analyser.disconnect();
       }
       this.tracks = next;
@@ -291,6 +333,35 @@ export class TakePlayer {
 
   private alignDelta(track: Track): number {
     return this.alignDeltas().get(track.streamId) ?? 0;
+  }
+
+  /** Drop tracks whose streams were deleted. Playback continues with the
+   * survivors (re-scheduled from the same position); an emptied player
+   * unloads entirely. */
+  removeTracks(streamIds: string[]): void {
+    let removed = false;
+    for (const streamId of streamIds) {
+      const track = this.tracks.get(streamId);
+      if (!track) continue;
+      track.gain.disconnect();
+      track.panner.disconnect();
+      track.analyser.disconnect();
+      this.tracks.delete(streamId);
+      this.levels.delete(streamId);
+      this.clipDelays.delete(streamId);
+      removed = true;
+    }
+    if (!removed) return;
+    if (this.tracks.size === 0) {
+      this.pause();
+      this.loadedTakeId = null;
+      this.startPos = 0;
+    } else if (this.playing) {
+      const pos = this.position();
+      this.stopSources();
+      this.schedule(pos);
+    }
+    this.notify();
   }
 
   /** Update arrangement positions (from timeline clip drags). Re-schedules
@@ -403,26 +474,32 @@ export class TakePlayer {
     }
   }
 
-  setTrackDb(streamId: string, db: number): void {
-    const track = this.tracks.get(streamId);
-    if (!track) return;
-    track.gainDb = Math.max(MIN_DB, Math.min(MAX_DB, db));
+  // Channel-strip controls: keyed by lane, valid at ANY time — before the
+  // first load, while recording, across take switches. State persists for
+  // the page's lifetime and applies to whatever that lane plays.
+
+  setChannelDb(channelKey: string, db: number): void {
+    this.channel(channelKey).gainDb = Math.max(MIN_DB, Math.min(MAX_DB, db));
     this.applyGains();
     this.notify();
   }
 
-  toggleMute(streamId: string): void {
-    const track = this.tracks.get(streamId);
-    if (!track) return;
-    track.muted = !track.muted;
+  setChannelPan(channelKey: string, pan: number): void {
+    this.channel(channelKey).pan = Math.max(-1, Math.min(1, pan));
     this.applyGains();
     this.notify();
   }
 
-  toggleSolo(streamId: string): void {
-    const track = this.tracks.get(streamId);
-    if (!track) return;
-    track.soloed = !track.soloed;
+  toggleChannelMute(channelKey: string): void {
+    const strip = this.channel(channelKey);
+    strip.muted = !strip.muted;
+    this.applyGains();
+    this.notify();
+  }
+
+  toggleChannelSolo(channelKey: string): void {
+    const strip = this.channel(channelKey);
+    strip.soloed = !strip.soloed;
     this.applyGains();
     this.notify();
   }
@@ -433,13 +510,24 @@ export class TakePlayer {
     this.notify();
   }
 
+  setMasterPan(pan: number): void {
+    this.masterPan = Math.max(-1, Math.min(1, pan));
+    this.applyGains();
+    this.notify();
+  }
+
   private applyGains(): void {
-    const anySolo = [...this.tracks.values()].some((t) => t.soloed);
+    // Solo is a property of the mixer, not of the loaded take: a soloed
+    // lane silences every other lane in whatever take plays.
+    const anySolo = [...this.channels.values()].some((c) => c.soloed);
     for (const track of this.tracks.values()) {
-      const audible = !track.muted && (!anySolo || track.soloed);
-      track.gain.gain.value = audible ? dbToLinear(track.gainDb) : 0;
+      const strip = this.channel(track.channelKey);
+      const audible = !strip.muted && (!anySolo || strip.soloed);
+      track.gain.gain.value = audible ? dbToLinear(strip.gainDb) : 0;
+      track.panner.pan.value = strip.pan;
     }
     if (this.master) this.master.gain.value = dbToLinear(this.masterDb);
+    if (this.masterPanner) this.masterPanner.pan.value = this.masterPan;
   }
 
   private lastMeterNotify = 0;

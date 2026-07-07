@@ -236,6 +236,7 @@ export class SessionIngest {
   noteTakeStop(takeId: string): void {
     this.enqueue(async () => {
       await this.archive.stopTake(takeId);
+      if (await this.archive.deleteTakeIfEmpty(takeId)) this.knownTakes.delete(takeId);
       await this.sendAcks();
     });
   }
@@ -252,6 +253,36 @@ export class SessionIngest {
       this.engine?.set_final_seq(uuidBytes(takeId), uuidBytes(streamId), finalSeq);
       await this.archive.setFinalSeq(streamId, finalSeq);
       await this.sendAcks();
+    });
+  }
+
+  /** Desk-initiated stream deletion. Engine state goes first — the streams
+   * vanish from ACK/HAVE traffic, so no peer can re-push them — then the
+   * archive rows/blobs. Serialized on the ingest chain like all mutations;
+   * on archive failure the chain poisons and rebuilds from the database,
+   * which still holds the rows (delete failed = nothing lost). Resolves
+   * with the take ids that were removed entirely. */
+  deleteStreams(refs: Array<{ takeId: string; streamId: string }>): Promise<string[]> {
+    return new Promise((resolve, reject) => {
+      this.enqueue(async () => {
+        try {
+          for (const ref of refs) {
+            this.engine?.remove_stream(uuidBytes(ref.takeId), uuidBytes(ref.streamId));
+            this.knownStreams.delete(ref.streamId);
+            this.headerApplied.delete(ref.streamId);
+          }
+          const doomed = new Set(refs.map((r) => r.streamId));
+          for (const link of this.peers.values()) {
+            link.pushQueue = link.pushQueue.filter((q) => !doomed.has(q.streamId));
+          }
+          const deletedTakeIds = await this.archive.deleteStreams(refs);
+          for (const takeId of deletedTakeIds) this.knownTakes.delete(takeId);
+          resolve(deletedTakeIds);
+        } catch (error) {
+          reject(error);
+          throw error;
+        }
+      });
     });
   }
 

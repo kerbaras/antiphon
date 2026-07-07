@@ -6,6 +6,18 @@
       "dependsOn": ["^build"],
       "outputs": ["dist/**", "pkg/**"]
     },
+    "@antiphon/core-wasm#build": {
+      "dependsOn": ["^build"],
+      "outputs": ["pkg/**"],
+      "inputs": [
+        "$TURBO_DEFAULT$",
+        "../wasm/**",
+        "../core/src/**",
+        "../codec/src/**",
+        "../dsp/src/**",
+        "../../Cargo.toml"
+      ]
+    },
     "typecheck": {
       "dependsOn": ["^build"]
     },

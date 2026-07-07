@@ -6,7 +6,6 @@
 // chirp auto-alignment, and the gain/mute/solo mixer are all live; only
 // editing tools and pan (mono v1) remain visibly inert.
 
-import QRCode from "qrcode";
 import { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useParams } from "react-router";
 import type { DeskStreamStatus } from "../../audio/sink-worker-protocol";
@@ -16,6 +15,7 @@ import {
   MonoReadout,
   SectionLabel,
   StatusPill,
+  StyledQr,
   VUMeter,
   Wordmark,
 } from "../../ui/kit";
@@ -40,7 +40,7 @@ import {
   VUVertical,
   ZoomControl,
 } from "./daw";
-import type { PlayerSnapshot } from "./player";
+import type { ChannelStrip, PlayerSnapshot } from "./player";
 import {
   ensureWaveform,
   getCachedWaveform,
@@ -181,11 +181,21 @@ function Desk({ sessionId }: { sessionId: string }) {
     return order.map((k) => byKey.get(k) as TrackRow);
   }, [state.deskStatus, peerByStream, recorders, receiving, state.activeTakeId]);
 
-  // Takes in encounter order with sequential timeline offsets.
+  // Takes in CHRONOLOGICAL order with sequential timeline offsets. Stream
+  // announces arrive live (in take order); deskStatus alone is sorted by
+  // take-id bytes, which would shuffle take numbers/placement per session.
+  // Rebuilt-after-reload takes (no announce seen) append in status order.
   const takes = useMemo(() => {
     const seen: string[] = [];
+    for (const s of state.streams) {
+      if (!seen.includes(s.takeId)) seen.push(s.takeId);
+    }
     for (const s of state.deskStatus) {
       if (!seen.includes(s.takeId)) seen.push(s.takeId);
+    }
+    const present = new Set(state.deskStatus.map((s) => s.takeId));
+    for (let i = seen.length - 1; i >= 0; i--) {
+      if (!present.has(seen[i] as string)) seen.splice(i, 1);
     }
     const slots = new Map<string, TakeSlot>();
     let offset = 1; // leading second of lane
@@ -199,7 +209,7 @@ function Desk({ sessionId }: { sessionId: string }) {
       offset += durationSec + TAKE_GAP_SECONDS;
     }
     return slots;
-  }, [state.deskStatus, state.activeTakeId, state.takeStartedAt]);
+  }, [state.streams, state.deskStatus, state.activeTakeId, state.takeStartedAt]);
 
   const timelineSeconds = Math.max(
     60,
@@ -246,11 +256,16 @@ function Desk({ sessionId }: { sessionId: string }) {
   );
 
   // Load (and, when a chirp was emitted this session, auto-align) the
-  // selected take as soon as it is complete at the desk.
+  // selected take as soon as it is complete at the desk. Streams map to
+  // mixer lanes by performer (read through a ref: mapping identity churns
+  // every poll and must not re-fire this effect — see selectedStreamKey).
   const chirped = state.lastChirpAt !== null;
+  const peerByStreamRef = useRef(peerByStream);
+  peerByStreamRef.current = peerByStream;
   useEffect(() => {
     if (!selectedTakeId || selectedStreamIds.length === 0 || recording) return;
-    void loadTakeIntoPlayer(sessionId, selectedTakeId, selectedStreamIds).then((ok) => {
+    const channelOf = (streamId: string) => peerByStreamRef.current.get(streamId) ?? streamId;
+    void loadTakeIntoPlayer(sessionId, selectedTakeId, selectedStreamIds, channelOf).then((ok) => {
       if (ok && chirped) void getPlayer().align();
     });
   }, [sessionId, selectedTakeId, selectedStreamIds, recording, chirped]);
@@ -460,20 +475,38 @@ function Desk({ sessionId }: { sessionId: string }) {
   }
 
   // Space bar: stop the ongoing recording, otherwise toggle playback.
+  // Delete/Backspace: remove the selected takes' clips (server-authoritative;
+  // every sink drops its copy on the confirm).
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.code !== "Space") return;
       const target = e.target as HTMLElement;
       if (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable) {
         return;
       }
-      e.preventDefault();
-      if (recording) getDeskSession(sessionId).stopTake();
-      else if (playerLoaded) getPlayer().toggle();
+      if (e.code === "Space") {
+        e.preventDefault();
+        if (recording) getDeskSession(sessionId).stopTake();
+        else if (playerLoaded) getPlayer().toggle();
+        return;
+      }
+      if ((e.code === "Delete" || e.code === "Backspace") && selection.length > 0) {
+        e.preventDefault();
+        const refs = state.deskStatus
+          .filter((s) => selection.includes(s.streamId) && s.takeId !== state.activeTakeId)
+          .map((s) => ({ takeId: s.takeId, streamId: s.streamId }));
+        if (refs.length === 0) return;
+        getDeskSession(sessionId).deleteStreams(refs);
+        setSelection([]);
+        setClipStartOverrides((prev) => {
+          const next = { ...prev };
+          for (const ref of refs) delete next[ref.streamId];
+          return next;
+        });
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [recording, playerLoaded, sessionId]);
+  }, [recording, playerLoaded, sessionId, selection, state.deskStatus, state.activeTakeId]);
 
   function seekTimeline(sec: number) {
     if (!playerLoaded) return;
@@ -521,8 +554,7 @@ function Desk({ sessionId }: { sessionId: string }) {
       return live && Date.now() - live.at < 1_200 ? live.peak : 0;
     }
     if (playerLoaded && playerSnap.playing) {
-      const streamId = row.streams.find((s) => s.takeId === selectedTakeId)?.streamId;
-      return playerSnap.tracks.find((t) => t.streamId === streamId)?.level ?? 0;
+      return playerSnap.tracks.find((t) => t.channelKey === row.key)?.level ?? 0;
     }
     return 0;
   }
@@ -748,6 +780,9 @@ function Desk({ sessionId }: { sessionId: string }) {
                 pxPerSec={pxPerSec}
                 laneWidth={laneWidth}
                 level={levelFor(row)}
+                strip={playerSnap.channels.find((c) => c.key === row.key)}
+                armed={recording ? row.armed : !state.disarmedPeers.includes(row.key)}
+                onToggleArm={() => getDeskSession(sessionId).toggleArm(row.key)}
               />
             ))}
 
@@ -827,9 +862,7 @@ function Desk({ sessionId }: { sessionId: string }) {
             <RowMixerStrip
               key={row.key}
               row={row}
-              selectedTakeId={selectedTakeId}
               playerSnap={playerSnap}
-              playerLoaded={playerLoaded}
               recording={recording}
               liveLevel={levelFor(row)}
             />
@@ -840,64 +873,50 @@ function Desk({ sessionId }: { sessionId: string }) {
           color="var(--color-accent)"
           active={rows.some((r) => r.receiving)}
           master
-          {...(recording
-            ? { level: liveMasterLevel, dbText: formatDbfs(liveMasterLevel) }
-            : playerLoaded
-              ? {
-                  level: playerSnap.playing ? playerSnap.masterLevel : 0,
-                  gainDb: playerSnap.masterDb,
-                  onGainDb: (db: number) => getPlayer().setMasterDb(db),
-                }
-              : { level: 0, dbText: "—" })}
+          level={recording ? liveMasterLevel : playerSnap.playing ? playerSnap.masterLevel : 0}
+          gainDb={playerSnap.masterDb}
+          onGainDb={(db: number) => getPlayer().setMasterDb(db)}
+          pan={playerSnap.masterPan}
+          onPan={(p: number) => getPlayer().setMasterPan(p)}
+          {...(recording ? { dbText: formatDbfs(liveMasterLevel) } : {})}
         />
       </div>
     </main>
   );
 }
 
-/** Mixer strip bound to a track row: controls the selected take's stream
- * for that performer; while recording it meters the LIVE capture level
- * reported by the phone (METER telemetry). */
+/** Mixer strip bound to a track row (performer lane). Gain/mute/solo edit
+ * the lane's persistent channel strip — independent of which take is
+ * selected, loaded, or whether anything is loaded at all. Meters show the
+ * phone's LIVE capture level while recording (METER telemetry) and the
+ * playback analyser otherwise. */
 function RowMixerStrip({
   row,
-  selectedTakeId,
   playerSnap,
-  playerLoaded,
   recording,
   liveLevel,
 }: {
   row: TrackRow;
-  selectedTakeId: string | null;
   playerSnap: PlayerSnapshot;
-  playerLoaded: boolean;
   recording: boolean;
   liveLevel: number;
 }) {
-  const streamId = row.streams.find((s) => s.takeId === selectedTakeId)?.streamId;
-  const track = playerLoaded ? playerSnap.tracks.find((t) => t.streamId === streamId) : undefined;
-  if (recording || !track) {
-    return (
-      <MixerStrip
-        name={row.name}
-        color={row.color}
-        active={row.receiving}
-        level={liveLevel}
-        dbText={recording ? formatDbfs(liveLevel) : "—"}
-      />
-    );
-  }
+  const strip = playerSnap.channels.find((c) => c.key === row.key);
   return (
     <MixerStrip
       name={row.name}
       color={row.color}
       active={row.receiving}
-      level={playerSnap.playing ? track.level : 0}
-      gainDb={track.gainDb}
-      onGainDb={(db) => getPlayer().setTrackDb(track.streamId, db)}
-      muted={track.muted}
-      onMute={() => getPlayer().toggleMute(track.streamId)}
-      soloed={track.soloed}
-      onSolo={() => getPlayer().toggleSolo(track.streamId)}
+      level={liveLevel}
+      gainDb={strip?.gainDb ?? 0}
+      onGainDb={(db) => getPlayer().setChannelDb(row.key, db)}
+      pan={strip?.pan ?? 0}
+      onPan={(p) => getPlayer().setChannelPan(row.key, p)}
+      muted={strip?.muted ?? false}
+      onMute={() => getPlayer().toggleChannelMute(row.key)}
+      soloed={strip?.soloed ?? false}
+      onSolo={() => getPlayer().toggleChannelSolo(row.key)}
+      {...(recording ? { dbText: formatDbfs(liveLevel) } : {})}
     />
   );
 }
@@ -916,12 +935,18 @@ function TimelineRow({
   pxPerSec,
   laneWidth,
   level,
+  strip,
+  armed,
+  onToggleArm,
 }: {
   row: TrackRow;
   clips: ClipModel[];
   pxPerSec: number;
   laneWidth: number;
   level: number;
+  strip: ChannelStrip | undefined;
+  armed: boolean;
+  onToggleArm: () => void;
 }) {
   return (
     <div className="flex border-b border-[#0e0f10]" style={{ height: TRACK_ROW_H }}>
@@ -939,9 +964,26 @@ function TimelineRow({
             <Badge className="flex-none">audio</Badge>
           </div>
           <div className="flex items-center gap-[5px]">
-            <TrackMiniButton label="M" inert />
-            <TrackMiniButton label="S" inert />
-            <TrackMiniButton label="●" armed={row.armed} inert={!row.armed} />
+            <TrackMiniButton
+              label="M"
+              ariaLabel={`Mute ${row.name} (header)`}
+              active={strip?.muted ?? false}
+              tone="gold"
+              onClick={() => getPlayer().toggleChannelMute(row.key)}
+            />
+            <TrackMiniButton
+              label="S"
+              ariaLabel={`Solo ${row.name} (header)`}
+              active={strip?.soloed ?? false}
+              tone="teal"
+              onClick={() => getPlayer().toggleChannelSolo(row.key)}
+            />
+            <TrackMiniButton
+              label="●"
+              ariaLabel={`Arm ${row.name}`}
+              armed={armed}
+              onClick={onToggleArm}
+            />
             {row.peerLabel && (
               <span className="ml-[3px] flex min-w-0 items-center gap-1 rounded-[10px] border border-edge bg-[#17181a] py-px pr-[7px] pl-[2px]">
                 <span
@@ -996,14 +1038,6 @@ function PerformersPanel({
   levelForRow: (row: TrackRow) => number;
 }) {
   const [showQr, setShowQr] = useState<boolean | null>(null);
-  const [qr, setQr] = useState<string | null>(null);
-  useEffect(() => {
-    void QRCode.toDataURL(joinUrl, {
-      margin: 1,
-      width: 224,
-      color: { dark: "#f0f1f2", light: "#141516" },
-    }).then(setQr);
-  }, [joinUrl]);
   // Auto-open while the room is empty, tuck away once performers arrive;
   // manual toggling wins after the first click.
   const qrVisible = showQr ?? recorders.length === 0;
@@ -1064,8 +1098,8 @@ function PerformersPanel({
         </span>
       </button>
       {qrVisible && (
-        <div className="rounded-lg border border-edge-card bg-card p-2.5">
-          {qr && <img src={qr} alt="Join QR code" className="w-full rounded" />}
+        <div className="rounded-lg border border-edge-card bg-card p-3">
+          <StyledQr value={joinUrl} className="w-full" />
           <p className="mt-2 break-all font-mono text-[9px] leading-relaxed text-text-dim">
             {joinUrl}
           </p>

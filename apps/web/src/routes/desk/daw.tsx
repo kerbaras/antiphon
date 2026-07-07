@@ -416,21 +416,42 @@ export function TrackMiniButton({
   label,
   armed,
   inert,
+  active,
+  tone,
+  onClick,
+  ariaLabel,
 }: {
   label: string;
   armed?: boolean;
   inert?: boolean;
+  /** Engaged state for clickable buttons (mute gold, solo teal). */
+  active?: boolean;
+  tone?: "gold" | "teal";
+  onClick?: () => void;
+  ariaLabel?: string;
 }) {
+  const activeClass = tone === "teal" ? "bg-track-teal text-void" : "bg-track-gold text-void";
+  const className = cx(
+    "grid size-[18px] place-items-center rounded border border-edge-btn text-[9px] font-bold",
+    armed ? "bg-rec text-white" : active ? activeClass : "bg-[#232425] text-text-dim",
+    inert && "cursor-not-allowed",
+    onClick && "hover:brightness-125",
+  );
+  if (onClick) {
+    return (
+      <button
+        type="button"
+        aria-label={ariaLabel ?? label}
+        aria-pressed={active}
+        onClick={onClick}
+        className={className}
+      >
+        {label}
+      </button>
+    );
+  }
   return (
-    <span
-      aria-disabled={inert}
-      title={inert ? "Mix controls arrive with the DAW milestone" : undefined}
-      className={cx(
-        "grid size-[18px] place-items-center rounded border border-edge-btn text-[9px] font-bold",
-        armed ? "bg-rec text-white" : "bg-[#232425] text-text-dim",
-        inert && "cursor-not-allowed",
-      )}
-    >
+    <span aria-disabled={inert} className={className}>
       {label}
     </span>
   );
@@ -438,14 +459,58 @@ export function TrackMiniButton({
 
 // ---- mixer -----------------------------------------------------------------
 
-export function PanKnob() {
+/** Pan knob: drag horizontally (or vertically) to place the mono source in
+ * the stereo field; double-click recenters. The tick rotates ±135°. */
+export function PanKnob({
+  pan = 0,
+  onPan,
+  label,
+}: {
+  pan?: number;
+  onPan?: (pan: number) => void;
+  label?: string;
+}) {
+  function startDrag(downEvent: React.PointerEvent<HTMLDivElement>) {
+    if (!onPan) return;
+    downEvent.preventDefault();
+    const startX = downEvent.clientX;
+    const startY = downEvent.clientY;
+    const startPan = pan;
+    const move = (e: PointerEvent) => {
+      const delta = (e.clientX - startX - (e.clientY - startY)) / 60;
+      onPan(Math.round(Math.max(-1, Math.min(1, startPan + delta)) * 20) / 20);
+    };
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  }
+  const readout =
+    pan === 0 ? "C" : pan < 0 ? `L${Math.round(-pan * 100)}` : `R${Math.round(pan * 100)}`;
   return (
     <div
-      aria-disabled="true"
-      title="Pan arrives with stereo render (v1 streams are mono)"
-      className="relative size-6 cursor-not-allowed rounded-full border border-edge-strong bg-edge"
+      role="slider"
+      aria-label={label ?? "Pan"}
+      aria-valuenow={Math.round(pan * 100)}
+      aria-valuemin={-100}
+      aria-valuemax={100}
+      aria-valuetext={readout}
+      tabIndex={0}
+      title={`Pan ${readout} — drag to move, double-click to center`}
+      onPointerDown={startDrag}
+      onDoubleClick={() => onPan?.(0)}
+      className="relative size-6 cursor-ew-resize touch-none rounded-full border border-edge-strong bg-edge"
     >
-      <div className="absolute top-[2px] left-1/2 h-[9px] w-[2px] rounded-[1px] bg-[#c8c9cb]" />
+      <div className="absolute inset-0" style={{ transform: `rotate(${pan * 135}deg)` }}>
+        <div
+          className={cx(
+            "absolute top-[2px] left-1/2 h-[9px] w-[2px] -translate-x-1/2 rounded-[1px]",
+            pan === 0 ? "bg-[#c8c9cb]" : "bg-accent",
+          )}
+        />
+      </div>
     </div>
   );
 }
@@ -538,6 +603,8 @@ export interface MixerStripProps {
   level?: number | null;
   gainDb?: number;
   onGainDb?: (db: number) => void;
+  pan?: number;
+  onPan?: (pan: number) => void;
   muted?: boolean;
   onMute?: () => void;
   soloed?: boolean;
@@ -553,6 +620,8 @@ export function MixerStrip({
   level,
   gainDb = 0,
   onGainDb,
+  pan = 0,
+  onPan,
   muted,
   onMute,
   soloed,
@@ -578,7 +647,7 @@ export function MixerStrip({
         {name}
       </div>
       <div className="flex justify-center py-1">
-        <PanKnob />
+        <PanKnob pan={pan} {...(onPan ? { onPan } : {})} label={`${name} pan`} />
       </div>
       <div className="flex min-h-0 flex-1 justify-center gap-[9px] py-1">
         <Fader db={gainDb} {...(onGainDb ? { onChange: onGainDb } : {})} label={`${name} gain`} />

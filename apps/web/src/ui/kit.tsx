@@ -3,7 +3,8 @@
 // docs/Antiphone DAW.dc.html): inset displays, mono status pills, avatar
 // circles with status dots, VU meters, hard-divider panels.
 
-import type { ReactNode } from "react";
+import QRCode from "qrcode";
+import { type ReactNode, useMemo } from "react";
 
 function cx(...parts: Array<string | false | null | undefined>): string {
   return parts.filter(Boolean).join(" ");
@@ -191,6 +192,104 @@ export function RecDot({ active = true }: { active?: boolean }) {
         active ? "bg-rec animate-recpulse" : "bg-edge-strong",
       )}
     />
+  );
+}
+
+/**
+ * Styled QR code: transparent background, rounded dot modules in the text
+ * ladder, accent finder-pattern pupils, and the Antiphon "A" badge in the
+ * middle. Error correction H absorbs the logo hole (~4% of the symbol vs a
+ * 30% budget). Rendered as SVG straight from the QR matrix — no raster, no
+ * extra dependency, scales freely.
+ */
+export function StyledQr({ value, className }: { value: string; className?: string }) {
+  const { size, dark } = useMemo(() => {
+    const qr = QRCode.create(value, { errorCorrectionLevel: "H" });
+    return { size: qr.modules.size, dark: qr.modules.data as Uint8Array };
+  }, [value]);
+
+  const isFinder = (r: number, c: number) =>
+    (r < 7 && c < 7) || (r < 7 && c >= size - 7) || (r >= size - 7 && c < 7);
+
+  // Center hole for the logo badge (odd module count, ~18% linear).
+  const hole = Math.max(5, Math.floor(size * 0.18) | 1);
+  const holeStart = (size - hole) / 2;
+  const inHole = (r: number, c: number) =>
+    r >= holeStart && r < holeStart + hole && c >= holeStart && c < holeStart + hole;
+
+  const dots: ReactNode[] = [];
+  for (let r = 0; r < size; r++) {
+    for (let c = 0; c < size; c++) {
+      if (!dark[r * size + c] || isFinder(r, c) || inHole(r, c)) continue;
+      dots.push(
+        <circle key={`${r}-${c}`} cx={c + 0.5} cy={r + 0.5} r={0.44} fill="var(--color-text-hi)" />,
+      );
+    }
+  }
+
+  /** Finder eye: rounded ring + pupil. The pupil is accent tinted far
+   * toward white — scanners binarize by luminance (including an inversion
+   * pass for light-on-dark codes), so a pure-accent pupil would read as
+   * background and break the 1:1:3:1:1 finder ratio. */
+  const eye = (x: number, y: number) => (
+    <g key={`${x}-${y}`}>
+      <rect
+        x={x + 0.5}
+        y={y + 0.5}
+        width={6}
+        height={6}
+        rx={2}
+        fill="none"
+        stroke="var(--color-text-hi)"
+        strokeWidth={1}
+      />
+      <rect
+        x={x + 2}
+        y={y + 2}
+        width={3}
+        height={3}
+        rx={1.2}
+        style={{ fill: "color-mix(in srgb, var(--color-accent) 35%, white)" }}
+      />
+    </g>
+  );
+
+  const badge = hole - 0.7;
+  const badgeStart = (size - badge) / 2;
+
+  return (
+    <svg
+      viewBox={`-1.5 -1.5 ${size + 3} ${size + 3}`}
+      className={className}
+      role="img"
+      aria-label="Join QR code"
+    >
+      {dots}
+      {eye(0, 0)}
+      {eye(size - 7, 0)}
+      {eye(0, size - 7)}
+      {/* Antiphon badge, echoing the wordmark block */}
+      <rect
+        x={badgeStart}
+        y={badgeStart}
+        width={badge}
+        height={badge}
+        rx={badge * 0.27}
+        fill="var(--color-accent)"
+      />
+      <text
+        x={size / 2}
+        y={size / 2 + badge * 0.03}
+        textAnchor="middle"
+        dominantBaseline="central"
+        fill="#fff"
+        fontFamily="'IBM Plex Sans', sans-serif"
+        fontWeight={700}
+        fontSize={badge * 0.58}
+      >
+        A
+      </text>
+    </svg>
   );
 }
 

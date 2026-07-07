@@ -35,6 +35,12 @@ export function getDeskSession(sessionId: string): DeskSession {
     session.subscribe((s) => {
       latest = s;
     });
+    // Server-confirmed deletions: evict every local trace outside the
+    // sink store (the session already told the worker).
+    session.onStreamsDeleted((streamIds) => {
+      for (const id of streamIds) waveformCache.delete(id);
+      getPlayer().removeTracks(streamIds);
+    });
     session.start();
     (globalThis as Record<string, unknown>).__antiphonDesk = {
       session,
@@ -64,14 +70,22 @@ export function usePlayer(): PlayerSnapshot {
   return useSyncExternalStore(subscribe, () => playerSnap ?? getPlayer().snapshot());
 }
 
-/** Load a take into the player from the desk's OPFS store (idempotent). */
+/** Load a take into the player from the desk's OPFS store (idempotent).
+ * `channelOf` maps streams to mixer lanes so strip state follows the
+ * performer, not the take. */
 export async function loadTakeIntoPlayer(
   sessionId: string,
   takeId: string,
   streamIds: string[],
+  channelOf?: (streamId: string) => string,
 ): Promise<boolean> {
   const desk = getDeskSession(sessionId);
-  const ok = await getPlayer().load(takeId, streamIds, (t, s) => desk.assembleFlac(t, s));
+  const ok = await getPlayer().load(
+    takeId,
+    streamIds,
+    (t, s) => desk.assembleFlac(t, s),
+    channelOf,
+  );
   // The player just decoded these — keep their waveforms forever.
   for (const track of getPlayer().snapshot().tracks) {
     if (track.waveform.length > 0) waveformCache.set(track.streamId, track.waveform);

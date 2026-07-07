@@ -79,6 +79,8 @@ export const TakeStartMessage = z.object({
   type: z.literal("take-start"),
   takeId: TakeId,
   wallClockHint: z.iso.datetime(),
+  /** Per-lane record-arm: listed peers do NOT arm for this take. */
+  disarmedPeerIds: z.array(PeerId).max(64).optional(),
 });
 export type TakeStartMessage = z.infer<typeof TakeStartMessage>;
 
@@ -109,6 +111,31 @@ export const StreamFinalMessage = z.object({
   fromPeerId: PeerId.optional(),
 });
 export type StreamFinalMessage = z.infer<typeof StreamFinalMessage>;
+
+// ---- stream deletion (desk → server; server → all) --------------------------
+// Deletion is a control-plane decision by the desk (the session authority).
+// The server is the source of truth: it deletes durably FIRST, then fans out
+// `streams-deleted` — desks drop their local copies only on that confirm, so
+// a failed delete never leaves sinks disagreeing with the archive.
+
+export const StreamRef = z.object({ takeId: TakeId, streamId: StreamId });
+export type StreamRef = z.infer<typeof StreamRef>;
+
+export const StreamsDeleteMessage = z.object({
+  ...base,
+  type: z.literal("streams-delete"),
+  streams: z.array(StreamRef).min(1).max(256),
+});
+export type StreamsDeleteMessage = z.infer<typeof StreamsDeleteMessage>;
+
+export const StreamsDeletedMessage = z.object({
+  ...base,
+  type: z.literal("streams-deleted"),
+  streams: z.array(StreamRef),
+  /** Takes removed entirely because they lost their last stream. */
+  deletedTakeIds: z.array(TakeId),
+});
+export type StreamsDeletedMessage = z.infer<typeof StreamsDeletedMessage>;
 
 // ---- calibration (desk → server → all) -------------------------------------
 
@@ -182,6 +209,8 @@ export const SignalingMessage = z.discriminatedUnion("type", [
   TakeStopMessage,
   StreamAnnounceMessage,
   StreamFinalMessage,
+  StreamsDeleteMessage,
+  StreamsDeletedMessage,
   CalibrationChirpMessage,
   WelcomeMessage,
   PeerStatusMessage,

@@ -37,6 +37,9 @@ export const TakeInfo = z.object({
   takeId: TakeId,
   startedAt: z.iso.datetime(),
   stoppedAt: z.iso.datetime().nullable(),
+  /** Peers the desk disarmed for this take (they sit it out). Carried in
+   * the session snapshot so late (re)joiners also honor it. */
+  disarmedPeerIds: z.array(PeerId).max(64).optional(),
 });
 export type TakeInfo = z.infer<typeof TakeInfo>;
 

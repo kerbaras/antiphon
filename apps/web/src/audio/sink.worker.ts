@@ -367,6 +367,20 @@ async function handle(msg: ToSinkWorker): Promise<void> {
       }
       break;
     }
+    case "delete-streams": {
+      // Server-confirmed deletion: drop engine state (so the streams leave
+      // ACK/HAVE traffic and can't be re-pushed to us) and the OPFS copy.
+      for (const { takeId, streamId } of msg.streams) {
+        engine?.remove_stream(uuidBytes(takeId), uuidBytes(streamId));
+        metas.delete(streamDirName(takeId, streamId));
+        try {
+          await root?.removeEntry(streamDirName(takeId, streamId), { recursive: true });
+        } catch {
+          // Directory never existed (stream lived only at the server).
+        }
+      }
+      break;
+    }
     case "status": {
       if (!engine) {
         post({ type: "status-result", streams: [] });

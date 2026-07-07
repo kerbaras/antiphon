@@ -161,6 +161,7 @@ export class Signaling {
           takeId: msg.takeId,
           startedAt: new Date().toISOString(),
           stoppedAt: null,
+          ...(msg.disarmedPeerIds?.length ? { disarmedPeerIds: msg.disarmedPeerIds } : {}),
         };
         room.ingest.noteTake(msg.takeId, msg.wallClockHint);
         this.fanout(room, msg);
@@ -184,6 +185,37 @@ export class Signaling {
       case "stream-final": {
         room.ingest.setFinalSeq(msg.takeId, msg.streamId, msg.finalSeq);
         this.fanout(room, { ...msg, fromPeerId: from.peerId });
+        break;
+      }
+      case "streams-delete": {
+        // Deletion is a desk decision; the archive deletes durably FIRST,
+        // then every sink drops its copy on the streams-deleted confirm.
+        if (from.role !== "desk") {
+          this.send(ws, { v: 1, type: "error", code: "not-desk", message: "desk only" });
+          return;
+        }
+        // Never delete under a live take: inbound chunks would recreate
+        // receiver state mid-delete and resurrect half a stream.
+        if (msg.streams.some((s) => s.takeId === room.activeTake?.takeId)) {
+          this.send(ws, {
+            v: 1,
+            type: "error",
+            code: "take-active",
+            message: "cannot delete streams of the active take",
+          });
+          return;
+        }
+        try {
+          const deletedTakeIds = await room.ingest.deleteStreams(msg.streams);
+          this.fanout(room, {
+            v: 1,
+            type: "streams-deleted",
+            streams: msg.streams,
+            deletedTakeIds,
+          });
+        } catch (e) {
+          this.send(ws, { v: 1, type: "error", code: "delete-failed", message: String(e) });
+        }
         break;
       }
       case "calibration-chirp": {

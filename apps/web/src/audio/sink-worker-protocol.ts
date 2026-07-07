@@ -31,7 +31,8 @@ export type ToSinkWorker =
   | { type: "plan-push"; haveBytes: ArrayBuffer }
   | { type: "get-frames"; takeId: string; streamId: string; ranges: Array<[number, number]> }
   | { type: "status" }
-  | { type: "assemble-flac"; requestId: number; takeId: string; streamId: string };
+  | { type: "assemble-flac"; requestId: number; takeId: string; streamId: string }
+  | { type: "delete-streams"; streams: Array<{ takeId: string; streamId: string }> };
 
 export type FromSinkWorker =
   | { type: "ready"; rebuiltChunks: number }
