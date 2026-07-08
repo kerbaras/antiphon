@@ -16,6 +16,8 @@ import {
 import type { WSContext } from "hono/ws";
 import type { Archive } from "../archive/index.ts";
 import { SessionIngest } from "../ingest/index.ts";
+import { createLogger } from "../logger.ts";
+import { TokenBucket } from "../ratelimit.ts";
 
 interface RoomPeer {
   peerId: string;
@@ -50,15 +52,37 @@ export interface ConnState {
   pathRole: PeerRole;
   peerId: string | null;
   epoch: number;
+  /** Message flood guard (RFC §12), created lazily on first message. */
+  msgBucket?: TokenBucket;
 }
+
+/** Abuse/capacity limits enforced on the control plane (RFC §12). */
+export interface SignalingLimits {
+  msgRatePerSec: number;
+  msgBurst: number;
+  maxPeersPerSession: number;
+  maxActiveSessions: number;
+}
+
+const DEFAULT_LIMITS: SignalingLimits = {
+  msgRatePerSec: 100,
+  msgBurst: 200,
+  maxPeersPerSession: 32,
+  maxActiveSessions: 200,
+};
 
 export class Signaling {
   private readonly rooms = new Map<string, Promise<Room>>();
+  /** Rooms whose init has resolved (subset of `rooms`), for sync inspection. */
+  private readonly live = new Map<string, Room>();
   private readonly archive: Archive;
+  private readonly limits: SignalingLimits;
+  private readonly log = createLogger({ module: "signaling" });
   private epochs = 0;
 
-  constructor(archive: Archive) {
+  constructor(archive: Archive, limits: Partial<SignalingLimits> = {}) {
     this.archive = archive;
+    this.limits = { ...DEFAULT_LIMITS, ...limits };
   }
 
   private async getRoom(sessionId: string): Promise<Room> {
@@ -100,6 +124,7 @@ export class Signaling {
             joinedAt: row.joinedAt.toISOString(),
           });
         }
+        this.live.set(sessionId, room);
         return room;
       })();
       this.rooms.set(sessionId, pending);
@@ -112,10 +137,31 @@ export class Signaling {
   }
 
   async handleMessage(conn: ConnState, ws: WSContext, raw: string): Promise<void> {
+    conn.msgBucket ??= new TokenBucket(this.limits.msgBurst, this.limits.msgRatePerSec);
+    if (!conn.msgBucket.take()) {
+      this.log.warn("signaling message flood; disconnecting", {
+        sessionId: conn.sessionId,
+        peerId: conn.peerId,
+      });
+      this.send(ws, {
+        v: 1,
+        type: "error",
+        code: "rate-limited",
+        message: "signaling message rate exceeded",
+        fatal: true,
+      });
+      ws.close();
+      return;
+    }
     let msg: SignalingMessage | null;
     try {
       msg = parseSignalingMessage(raw);
-    } catch {
+    } catch (error) {
+      this.log.warn("malformed signaling message", {
+        sessionId: conn.sessionId,
+        peerId: conn.peerId,
+        error,
+      });
       this.send(ws, { v: 1, type: "error", code: "malformed", message: "unparseable message" });
       return;
     }
@@ -147,6 +193,11 @@ export class Signaling {
               sdp: answer.sdp,
             });
           } catch (e) {
+            this.log.warn("ingest offer failed", {
+              sessionId: room.sessionId,
+              peerId: from.peerId,
+              error: e,
+            });
             this.send(ws, {
               v: 1,
               type: "error",
@@ -189,6 +240,7 @@ export class Signaling {
           ...(msg.disarmedPeerIds?.length ? { disarmedPeerIds: msg.disarmedPeerIds } : {}),
         };
         room.ingest.noteTake(msg.takeId, msg.wallClockHint);
+        await this.archive.touchSession(room.sessionId);
         this.fanout(room, msg);
         break;
       }
@@ -199,6 +251,7 @@ export class Signaling {
         }
         if (room.activeTake?.takeId === msg.takeId) room.activeTake = null;
         room.ingest.noteTakeStop(msg.takeId);
+        await this.archive.touchSession(room.sessionId);
         this.fanout(room, msg);
         break;
       }
@@ -239,6 +292,11 @@ export class Signaling {
             deletedTakeIds,
           });
         } catch (e) {
+          this.log.error("stream deletion failed", {
+            sessionId: room.sessionId,
+            peerId: from.peerId,
+            error: e,
+          });
           this.send(ws, { v: 1, type: "error", code: "delete-failed", message: String(e) });
         }
         break;
@@ -319,6 +377,44 @@ export class Signaling {
       ws.close();
       return;
     }
+    // Caps (RFC §12), checked before any identity/room state changes. An A12
+    // deviceId resume that supersedes its own zombie socket does not raise
+    // occupancy, so it is exempt from the peer cap.
+    const resumedPeerId = msg.deviceInfo.deviceId
+      ? room.devices.get(`${msg.role}:${msg.deviceInfo.deviceId}`)?.peerId
+      : undefined;
+    const supersedesZombie = resumedPeerId !== undefined && room.peers.has(resumedPeerId);
+    const occupancy = room.peers.size - (supersedesZombie ? 1 : 0);
+    if (occupancy >= this.limits.maxPeersPerSession) {
+      this.log.warn("session peer cap reached; rejecting join", {
+        sessionId: room.sessionId,
+        cap: this.limits.maxPeersPerSession,
+      });
+      this.send(ws, {
+        v: 1,
+        type: "error",
+        code: "session-full",
+        message: `session peer cap (${this.limits.maxPeersPerSession}) reached`,
+        fatal: true,
+      });
+      ws.close();
+      return;
+    }
+    if (room.peers.size === 0 && this.activeSessionCount() >= this.limits.maxActiveSessions) {
+      this.log.warn("active session cap reached; rejecting join", {
+        sessionId: room.sessionId,
+        cap: this.limits.maxActiveSessions,
+      });
+      this.send(ws, {
+        v: 1,
+        type: "error",
+        code: "server-full",
+        message: `active session cap (${this.limits.maxActiveSessions}) reached`,
+        fatal: true,
+      });
+      ws.close();
+      return;
+    }
     await this.archive.ensureSession(conn.sessionId);
     // Identity resume (A12): the same device rejoining with the same role
     // gets its previous peerId back — the desk keeps the lane, the mixer
@@ -367,6 +463,8 @@ export class Signaling {
       deviceId,
       joinedAt: new Date(joinedAt),
     });
+    await this.archive.touchSession(room.sessionId);
+    this.log.info("peer joined", { sessionId: room.sessionId, peerId, role: msg.role });
     this.send(ws, {
       v: 1,
       type: "welcome",
@@ -432,9 +530,75 @@ export class Signaling {
   private send(ws: WSContext, msg: SignalingMessage): void {
     try {
       ws.send(JSON.stringify(msg));
-    } catch {
+    } catch (error) {
       // Peer went away mid-send; close handling reconciles.
+      this.log.debug("ws send failed; peer gone", { msgType: msg.type, error });
     }
+  }
+
+  // ---- retention hooks (RFC §12: expiry + hard deletion) -----------------
+
+  /** True while the session must not be expired: connected peers, an active
+   * take, live ingest links, or a room still initializing. */
+  sessionBusy(sessionId: string): boolean {
+    if (!this.rooms.has(sessionId)) return false;
+    const room = this.live.get(sessionId);
+    if (!room) return true; // init in flight — treat as busy
+    return (
+      room.peers.size > 0 || room.activeTake !== null || room.ingest.connectedPeerIds().length > 0
+    );
+  }
+
+  /** Disconnect all live peers and drop the room (session hard-delete path).
+   * A later join rebuilds state from the archive (RFC §8). */
+  async closeSession(sessionId: string): Promise<void> {
+    const pending = this.rooms.get(sessionId);
+    this.rooms.delete(sessionId);
+    this.live.delete(sessionId);
+    if (!pending) return;
+    const room = await pending.catch(() => null);
+    if (!room) return;
+    for (const peer of room.peers.values()) {
+      this.send(peer.ws, {
+        v: 1,
+        type: "error",
+        code: "session-deleted",
+        message: "session was deleted",
+        fatal: true,
+      });
+      try {
+        peer.ws.close();
+      } catch (error) {
+        this.log.debug("ws close failed; peer already gone", {
+          sessionId,
+          peerId: peer.peerId,
+          error,
+        });
+      }
+    }
+    room.peers.clear();
+    await room.ingest.close();
+  }
+
+  /** Drop in-memory rooms with no peers, no active take, and no ingest
+   * links (sweep hygiene — rooms are otherwise never evicted). */
+  async pruneIdleRooms(): Promise<void> {
+    for (const [sessionId, room] of this.live) {
+      if (room.peers.size > 0 || room.activeTake !== null) continue;
+      if (room.ingest.connectedPeerIds().length > 0) continue;
+      this.rooms.delete(sessionId);
+      this.live.delete(sessionId);
+      await room.ingest.close();
+      this.log.debug("pruned idle room", { sessionId });
+    }
+  }
+
+  private activeSessionCount(): number {
+    let count = 0;
+    for (const room of this.live.values()) {
+      if (room.peers.size > 0 || room.activeTake !== null) count += 1;
+    }
+    return count;
   }
 
   async close(): Promise<void> {
@@ -446,12 +610,17 @@ export class Signaling {
       for (const peer of room.peers.values()) {
         try {
           peer.ws.close();
-        } catch {
-          // already gone
+        } catch (error) {
+          this.log.debug("ws close failed; peer already gone", {
+            sessionId: room.sessionId,
+            peerId: peer.peerId,
+            error,
+          });
         }
       }
       await room.ingest.close();
     }
     this.rooms.clear();
+    this.live.clear();
   }
 }

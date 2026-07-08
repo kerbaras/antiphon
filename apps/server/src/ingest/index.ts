@@ -22,16 +22,19 @@ import {
 } from "@antiphon/core-wasm";
 import nodeDataChannel from "node-datachannel";
 import type { Archive } from "../archive/index.ts";
+import { createLogger, type Logger } from "../logger.ts";
 import { CHANNEL_LABELS, uuidBytes } from "./util.ts";
 
 const { PeerConnection } = nodeDataChannel;
 type DataChannel = nodeDataChannel.DataChannel;
 type NdcPeerConnection = nodeDataChannel.PeerConnection;
 
+const moduleLog = createLogger({ module: "ingest" });
+
 if (process.env.ANTIPHON_RTC_LOG) {
   nodeDataChannel.initLogger(
     (process.env.ANTIPHON_RTC_LOG as nodeDataChannel.LogLevel) ?? "Info",
-    (level, message) => console.error(`[rtc:${level}] ${message}`),
+    (level, message) => moduleLog.debug("rtc", { rtcLevel: level, message }),
   );
 }
 
@@ -95,11 +98,13 @@ export class SessionIngest {
   readonly sessionId: string;
   private readonly archive: Archive;
   private readonly callbacks: IngestCallbacks;
+  private readonly log: Logger;
 
   constructor(sessionId: string, archive: Archive, callbacks: IngestCallbacks) {
     this.sessionId = sessionId;
     this.archive = archive;
     this.callbacks = callbacks;
+    this.log = moduleLog.child({ sessionId });
   }
 
   /** Rebuild receiver state from durable storage (RFC §8): the server
@@ -195,8 +200,9 @@ export class SessionIngest {
   addRemoteCandidate(peerId: string, candidate: string, mid: string): void {
     try {
       this.peers.get(peerId)?.pc.addRemoteCandidate(candidate, mid);
-    } catch {
+    } catch (error) {
       // Late/malformed candidates after close are routine noise.
+      this.log.debug("remote candidate rejected", { peerId, error });
     }
   }
 
@@ -209,8 +215,9 @@ export class SessionIngest {
       link.dataChannel?.close();
       link.syncChannel?.close();
       link.pc.close();
-    } catch {
+    } catch (error) {
       // teardown races are fine
+      this.log.debug("peer teardown race", { peerId, error });
     }
   }
 
@@ -422,9 +429,10 @@ export class SessionIngest {
       };
       await this.archive.applyStreamHeader(streamId, header);
       this.headerApplied.add(streamId);
-    } catch {
+    } catch (error) {
       // A malformed header payload is a recorder bug; the chunk itself is
       // still archived verbatim.
+      this.log.warn("malformed seq-0 stream header; chunk archived verbatim", { streamId, error });
     }
   }
 
@@ -513,8 +521,9 @@ export class SessionIngest {
           try {
             const frame = await this.archive.getFrameBytes(next.takeId, next.streamId, next.seq);
             safeSend(dc, frame);
-          } catch {
+          } catch (error) {
             // Blob missing (e.g. gap seq requested): nothing to push.
+            this.log.debug("push skipped; frame blob unavailable", { ...next, error });
           }
         }
       } finally {
@@ -533,13 +542,13 @@ export class SessionIngest {
   /** Serialize ingest work; poison-and-rebuild on persistence failure. */
   private enqueue(task: () => Promise<void>): void {
     this.chain = this.chain.then(task).catch(async (error) => {
-      console.error(`[ingest ${this.sessionId}] persistence failure, rebuilding:`, error);
+      this.log.error("persistence failure; rebuilding engine from archive", { error });
       for (const peerId of [...this.peers.keys()]) this.closePeer(peerId);
       this.headerApplied.clear();
       this.knownTakes.clear();
       this.knownStreams.clear();
-      await this.init().catch((e) => {
-        console.error(`[ingest ${this.sessionId}] rebuild failed; ingest offline:`, e);
+      await this.init().catch((e: unknown) => {
+        this.log.error("engine rebuild failed; ingest offline", { error: e });
         this.engine = null;
       });
     });
@@ -555,8 +564,9 @@ function toBytes(msg: string | Buffer | ArrayBuffer): Uint8Array | null {
 function safeSend(dc: DataChannel, bytes: Uint8Array): void {
   try {
     if (dc.isOpen()) dc.sendMessageBinary(bytes);
-  } catch {
+  } catch (error) {
     // Channel died mid-send; reconnection reconciles.
+    moduleLog.debug("datachannel send failed", { bytes: bytes.byteLength, error });
   }
 }
 

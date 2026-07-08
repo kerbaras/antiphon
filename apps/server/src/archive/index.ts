@@ -5,10 +5,11 @@
 
 import { createHash } from "node:crypto";
 import { extract_chunk_payload, extract_codec_header } from "@antiphon/core-wasm";
-import { and, asc, eq, inArray } from "drizzle-orm";
+import { and, asc, eq, inArray, lt } from "drizzle-orm";
 import { type BlobStore, chunkBlobKey } from "../blob/index.ts";
 import type { Db } from "../db/index.ts";
 import { schema } from "../db/index.ts";
+import { createLogger } from "../logger.ts";
 
 export interface ChunkMetaRecord {
   takeId: string;
@@ -33,6 +34,7 @@ export interface StreamHeaderRecord {
 export class Archive {
   private readonly db: Db;
   private readonly blobs: BlobStore;
+  private readonly log = createLogger({ module: "archive" });
 
   constructor(db: Db, blobs: BlobStore) {
     this.db = db;
@@ -43,6 +45,15 @@ export class Archive {
 
   async ensureSession(sessionId: string): Promise<void> {
     await this.db.insert(schema.sessions).values({ id: sessionId }).onConflictDoNothing();
+  }
+
+  /** Bump the expiry-sweep clock. Signaling-level events only (join,
+   * take start/stop) — never per-chunk. */
+  async touchSession(sessionId: string): Promise<void> {
+    await this.db
+      .update(schema.sessions)
+      .set({ lastActivityAt: new Date() })
+      .where(eq(schema.sessions.id, sessionId));
   }
 
   async ensureTake(sessionId: string, takeId: string, wallClockHint?: string): Promise<void> {
@@ -209,8 +220,12 @@ export class Archive {
     for (const row of blobRows) {
       try {
         await this.blobs.delete(row.blobKey);
-      } catch {
-        // Orphaned blob: harmless, unreferenced by any row.
+      } catch (error) {
+        // Orphaned blob: harmless (unreferenced by any row) but worth eyes.
+        this.log.warn("blob delete failed after stream delete; blob orphaned", {
+          blobKey: row.blobKey,
+          error,
+        });
       }
     }
     const deletedTakeIds: string[] = [];
@@ -226,6 +241,57 @@ export class Archive {
       }
     }
     return deletedTakeIds;
+  }
+
+  // ---- session retention (RFC §12: expiry + hard deletion) --------------
+
+  /** Sessions whose last signaling activity predates `cutoff`. */
+  async listSessionsIdleSince(cutoff: Date): Promise<string[]> {
+    const rows = await this.db
+      .select({ id: schema.sessions.id })
+      .from(schema.sessions)
+      .where(lt(schema.sessions.lastActivityAt, cutoff));
+    return rows.map((r) => r.id);
+  }
+
+  /** Hard-delete a whole session: blobs FIRST, then rows (chunks, gaps,
+   * streams, takes, chirps, peers, session). A failed blob delete aborts
+   * with rows intact, so a retry re-attempts every blob — a hard delete
+   * must never leak recordings of identifiable people (RFC §12).
+   * Idempotent: an unknown session deletes to nothing. */
+  async deleteSession(sessionId: string): Promise<void> {
+    const takes = await this.db
+      .select({ id: schema.takes.id })
+      .from(schema.takes)
+      .where(eq(schema.takes.sessionId, sessionId));
+    const takeIds = takes.map((t) => t.id);
+    const streams = takeIds.length
+      ? await this.db
+          .select({ id: schema.streams.id })
+          .from(schema.streams)
+          .where(inArray(schema.streams.takeId, takeIds))
+      : [];
+    const streamIds = streams.map((s) => s.id);
+    const blobRows = streamIds.length
+      ? await this.db
+          .select({ blobKey: schema.chunks.blobKey })
+          .from(schema.chunks)
+          .where(inArray(schema.chunks.streamId, streamIds))
+      : [];
+    for (const row of blobRows) {
+      await this.blobs.delete(row.blobKey);
+    }
+    if (streamIds.length) {
+      await this.db.delete(schema.chunks).where(inArray(schema.chunks.streamId, streamIds));
+      await this.db.delete(schema.gaps).where(inArray(schema.gaps.streamId, streamIds));
+      await this.db.delete(schema.streams).where(inArray(schema.streams.id, streamIds));
+    }
+    if (takeIds.length) {
+      await this.db.delete(schema.takes).where(inArray(schema.takes.id, takeIds));
+    }
+    await this.db.delete(schema.chirps).where(eq(schema.chirps.sessionId, sessionId));
+    await this.db.delete(schema.peers).where(eq(schema.peers.sessionId, sessionId));
+    await this.db.delete(schema.sessions).where(eq(schema.sessions.id, sessionId));
   }
 
   // ---- crash rebuild (RFC §8) ------------------------------------------

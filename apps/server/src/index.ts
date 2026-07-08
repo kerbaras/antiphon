@@ -3,18 +3,26 @@
 // (Postgres + blobs + reconciliation). Needs real UDP — deploys to a
 // VM/Fly.io, never serverless. (docs/ARCHITECTURE.md §2.3)
 
-import { serve } from "@hono/node-server";
+import { type HttpBindings, serve } from "@hono/node-server";
 import { createNodeWebSocket } from "@hono/node-ws";
+import { sql } from "drizzle-orm";
+import type { Context } from "hono";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { Archive } from "./archive/index.ts";
 import { FsBlobStore, S3BlobStore } from "./blob/index.ts";
 import { loadConfig, type ServerConfig } from "./config.ts";
 import { createDb, migrateDb } from "./db/index.ts";
+import { createLogger, setLogLevel } from "./logger.ts";
+import { KeyedRateLimiter } from "./ratelimit.ts";
 import type { ConnState } from "./signaling/index.ts";
 import { Signaling } from "./signaling/index.ts";
 
+type Env = { Bindings: HttpBindings };
+
 export async function createServer(config: ServerConfig = loadConfig()) {
+  setLogLevel(config.logLevel);
+  const log = createLogger({ module: "server" });
   const db = createDb(config.databaseUrl);
   await migrateDb(db);
   const blobs =
@@ -22,13 +30,70 @@ export async function createServer(config: ServerConfig = loadConfig()) {
       ? new S3BlobStore(config.blob.endpoint, config.blob.bucket)
       : new FsBlobStore(config.blob.root);
   const archive = new Archive(db, blobs);
-  const signaling = new Signaling(archive);
+  const signaling = new Signaling(archive, config.limits);
+  let ready = false;
 
-  const app = new Hono();
-  const { injectWebSocket, upgradeWebSocket } = createNodeWebSocket({ app });
+  const app = new Hono<Env>();
 
-  app.use("/api/*", cors());
-  app.get("/health", (c) => c.json({ ok: true }));
+  app.onError((err, c) => {
+    log.error("unhandled request error", { method: c.req.method, path: c.req.path, error: err });
+    return c.json({ error: "internal" }, 500);
+  });
+
+  app.use("*", async (c, next) => {
+    const start = performance.now();
+    await next();
+    const level = c.req.path === "/health" || c.req.path === "/ready" ? "debug" : "info";
+    log[level]("http", {
+      method: c.req.method,
+      path: c.req.path,
+      status: c.res.status,
+      ms: Math.round(performance.now() - start),
+    });
+  });
+
+  // CORS allowlist (RFC §12 hygiene): unset means wide open — dev only.
+  if (config.corsOrigins) {
+    app.use("/api/*", cors({ origin: config.corsOrigins }));
+  } else {
+    log.warn("CORS_ORIGINS unset; allowing all origins on /api/* (dev only)");
+    app.use("/api/*", cors());
+  }
+
+  // ---- health / readiness --------------------------------------------------
+  const checkDb = async (): Promise<boolean> => {
+    try {
+      await Promise.race([
+        db.execute(sql`select 1`),
+        new Promise((_, reject) => {
+          setTimeout(() => reject(new Error("db health check timeout (2s)")), 2_000).unref();
+        }),
+      ]);
+      return true;
+    } catch (error) {
+      log.warn("db health check failed", { error });
+      return false;
+    }
+  };
+  const checkBlob = async (): Promise<boolean> => {
+    try {
+      const key = ".health/probe";
+      const payload = new TextEncoder().encode(`probe-${Date.now()}`);
+      await blobs.put(key, payload);
+      const back = await blobs.get(key);
+      await blobs.delete(key);
+      return Buffer.from(back).equals(Buffer.from(payload));
+    } catch (error) {
+      log.warn("blob health probe failed", { error });
+      return false;
+    }
+  };
+  app.get("/health", async (c) => {
+    const [dbOk, blobOk] = await Promise.all([checkDb(), checkBlob()]);
+    const ok = dbOk && blobOk;
+    return c.json({ ok, db: dbOk, blob: blobOk }, ok ? 200 : 503);
+  });
+  app.get("/ready", (c) => c.json({ ready }, ready ? 200 : 503));
 
   // ---- session CRUD -------------------------------------------------------
   app.post("/api/sessions", async (c) => {
@@ -39,6 +104,20 @@ export async function createServer(config: ServerConfig = loadConfig()) {
 
   app.get("/api/sessions/:sessionId", async (c) => {
     return c.json(await archive.sessionSummary(c.req.param("sessionId")));
+  });
+
+  /** Hard deletion (RFC §12 MUST). A9 ordering: disconnect live peers so
+   * nothing can recreate state mid-delete, then delete durably (blobs, then
+   * rows). Idempotent — deleting an unknown session is a 204 no-op. */
+  const destroySession = async (sessionId: string): Promise<void> => {
+    await signaling.closeSession(sessionId);
+    await archive.deleteSession(sessionId);
+  };
+  app.delete("/api/sessions/:sessionId", async (c) => {
+    const sessionId = c.req.param("sessionId");
+    await destroySession(sessionId);
+    log.info("session deleted", { sessionId });
+    return c.body(null, 204);
   });
 
   // ---- archive status / retrieval -----------------------------------------
@@ -67,6 +146,35 @@ export async function createServer(config: ServerConfig = loadConfig()) {
 
   // ---- control plane (WSS) --------------------------------------------------
   // RFC §4.1: desk connects via /session/{uuid}, recorders via /join/{uuid}.
+  // RFC §12 MUST: join attempts are rate-limited per IP before upgrade.
+  const { injectWebSocket, upgradeWebSocket } = createNodeWebSocket({ app });
+
+  const joinLimiter = new KeyedRateLimiter(
+    config.limits.joinBurst,
+    config.limits.joinRatePerMin / 60,
+  );
+  const clientIp = (c: Context<Env>): string => {
+    if (config.trustProxy) {
+      const forwarded = c.req.header("x-forwarded-for")?.split(",")[0]?.trim();
+      if (forwarded) return forwarded;
+    }
+    return c.env.incoming.socket?.remoteAddress ?? "unknown";
+  };
+  const joinRateLimit = async (
+    c: Context<Env>,
+    next: () => Promise<void>,
+  ): Promise<Response | undefined> => {
+    const ip = clientIp(c);
+    if (!joinLimiter.allow(ip)) {
+      log.warn("join attempt rate-limited", { ip, path: c.req.path });
+      return c.json({ error: "rate-limited" }, 429);
+    }
+    await next();
+    return undefined;
+  };
+  app.use("/session/:sessionId/ws", joinRateLimit);
+  app.use("/join/:sessionId/ws", joinRateLimit);
+
   const wsHandler = (role: "desk" | "recorder") =>
     upgradeWebSocket((c: { req: { param(name: "sessionId"): string } }) => {
       const conn: ConnState = {
@@ -77,7 +185,13 @@ export async function createServer(config: ServerConfig = loadConfig()) {
       };
       return {
         onMessage(event: MessageEvent, ws: Parameters<Signaling["handleMessage"]>[1]) {
-          void signaling.handleMessage(conn, ws, String(event.data));
+          void signaling.handleMessage(conn, ws, String(event.data)).catch((error: unknown) => {
+            log.error("signaling message handling failed", {
+              sessionId: conn.sessionId,
+              peerId: conn.peerId,
+              error,
+            });
+          });
         },
         onClose() {
           signaling.handleClose(conn);
@@ -87,14 +201,65 @@ export async function createServer(config: ServerConfig = loadConfig()) {
   app.get("/session/:sessionId/ws", wsHandler("desk"));
   app.get("/join/:sessionId/ws", wsHandler("recorder"));
 
-  return { app, injectWebSocket, signaling, archive, db, config };
+  // ---- session expiry sweep (RFC §12 MUST) ----------------------------------
+  const sweepIdleSessions = async (): Promise<void> => {
+    await signaling.pruneIdleRooms();
+    const cutoff = new Date(Date.now() - config.retention.sessionTtlHours * 3_600_000);
+    for (const sessionId of await archive.listSessionsIdleSince(cutoff)) {
+      if (signaling.sessionBusy(sessionId)) continue;
+      log.info("expiring idle session", {
+        sessionId,
+        ttlHours: config.retention.sessionTtlHours,
+      });
+      await destroySession(sessionId);
+    }
+  };
+  const sweepTimer = setInterval(() => {
+    sweepIdleSessions().catch((error: unknown) => log.error("session sweep failed", { error }));
+  }, config.retention.sweepIntervalMs);
+  sweepTimer.unref();
+
+  /** Graceful teardown: stop timers, drain WS peers + ingest, close the pool. */
+  const close = async (): Promise<void> => {
+    ready = false;
+    clearInterval(sweepTimer);
+    await signaling.close();
+    await db.$client.end({ timeout: 5 });
+  };
+
+  ready = true;
+  return { app, injectWebSocket, signaling, archive, db, config, close };
 }
 
 // Entrypoint (skipped when imported by tests).
 if (import.meta.url === `file://${process.argv[1]}`) {
-  const { app, injectWebSocket, config } = await createServer();
+  const { app, injectWebSocket, config, close } = await createServer();
+  const log = createLogger({ module: "main" });
   const server = serve({ fetch: app.fetch, port: config.port }, (info) => {
-    console.log(`antiphon server listening on :${info.port}`);
+    log.info("antiphon server listening", { port: info.port });
   });
   injectWebSocket(server);
+
+  let shuttingDown = false;
+  const shutdown = (signal: string): void => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    log.info("shutting down", { signal });
+    setTimeout(() => {
+      log.error("graceful shutdown timed out (10s); exiting hard");
+      process.exit(1);
+    }, 10_000).unref();
+    server.close(); // stop accepting new connections; WS peers drain below
+    void close()
+      .then(() => {
+        log.info("shutdown complete");
+        process.exit(0);
+      })
+      .catch((error: unknown) => {
+        log.error("shutdown failed", { error });
+        process.exit(1);
+      });
+  };
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
 }

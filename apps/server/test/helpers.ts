@@ -11,6 +11,7 @@ import {
 } from "@antiphon/protocol";
 import { serve } from "@hono/node-server";
 import nodeDataChannel from "node-datachannel";
+import type { ServerConfig } from "../src/config.ts";
 import { createServer } from "../src/index.ts";
 
 const { PeerConnection } = nodeDataChannel;
@@ -23,11 +24,39 @@ export interface TestServer {
   stop(): Promise<void>;
 }
 
-export async function startTestServer(dbUrl: string, blobRoot: string): Promise<TestServer> {
-  const { app, injectWebSocket, signaling } = await createServer({
+/** Test overrides on top of generous defaults (rate limits are effectively
+ * off unless a test opts in — the harness joins fast from one IP). */
+export type TestConfigOverrides = {
+  limits?: Partial<ServerConfig["limits"]>;
+  retention?: Partial<ServerConfig["retention"]>;
+};
+
+export async function startTestServer(
+  dbUrl: string,
+  blobRoot: string,
+  overrides: TestConfigOverrides = {},
+): Promise<TestServer> {
+  const { app, injectWebSocket, close } = await createServer({
     databaseUrl: dbUrl,
     blob: { driver: "fs", root: blobRoot },
     port: 0,
+    logLevel: "error",
+    corsOrigins: null,
+    trustProxy: false,
+    limits: {
+      joinRatePerMin: 6_000,
+      joinBurst: 1_000,
+      msgRatePerSec: 1_000,
+      msgBurst: 2_000,
+      maxPeersPerSession: 32,
+      maxActiveSessions: 200,
+      ...overrides.limits,
+    },
+    retention: {
+      sessionTtlHours: 720,
+      sweepIntervalMs: 600_000,
+      ...overrides.retention,
+    },
   });
   return await new Promise((resolve) => {
     const server = serve({ fetch: app.fetch, port: 0 }, (info) => {
@@ -35,7 +64,7 @@ export async function startTestServer(dbUrl: string, blobRoot: string): Promise<
         port: info.port,
         baseUrl: `http://localhost:${info.port}`,
         stop: async () => {
-          await signaling.close();
+          await close();
           // Sever WS upgrade sockets too, or close() waits forever.
           (server as unknown as { closeAllConnections?: () => void }).closeAllConnections?.();
           await new Promise<void>((done) => server.close(() => done()));

@@ -18,6 +18,9 @@ import {
 export const sessions = pgTable("sessions", {
   id: uuid("id").primaryKey(),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  /** Touched on join and take start/stop (signaling-level, never per-chunk);
+   * the expiry sweep hard-deletes sessions idle past SESSION_TTL_HOURS. */
+  lastActivityAt: timestamp("last_activity_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
 export const peers = pgTable("peers", {
