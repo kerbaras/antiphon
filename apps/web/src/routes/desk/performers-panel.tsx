@@ -4,9 +4,11 @@ import type { PeerInfo } from "@antiphon/protocol";
 import { useState } from "react";
 import { Avatar, StatusPill, StyledQr, VUMeter } from "../../ui/kit";
 import { DeskInputBlock } from "./desk-input-block";
+import { MidiInputBlock } from "./midi-input-block";
 import { deviceName, initialsOf, TRACK_COLORS, type TrackRow } from "./track-model";
 import { getDeskSession } from "./use-desk";
 import type { DeskInputState } from "./use-desk-input";
+import type { DeskMidiState } from "./use-desk-midi";
 
 export function PerformersPanel({
   sessionId,
@@ -17,6 +19,8 @@ export function PerformersPanel({
   streams,
   levelForRow,
   deskInput,
+  deskMidi,
+  midiColor,
 }: {
   sessionId: string;
   recorders: PeerInfo[];
@@ -26,6 +30,9 @@ export function PerformersPanel({
   streams: Array<{ streamId: string; takeId: string; peerId: string | null }>;
   levelForRow: (row: TrackRow) => number;
   deskInput: DeskInputState;
+  deskMidi: DeskMidiState;
+  /** Track-palette color the MIDI lane draws with (card avatar matches). */
+  midiColor: string;
 }) {
   const [showQr, setShowQr] = useState<boolean | null>(null);
   // Auto-open while the room is empty, tuck away once performers arrive;
@@ -89,6 +96,13 @@ export function PerformersPanel({
         input={deskInput}
         takeRolling={activeTakeId !== null}
         color={rows.find((r) => r.peerId === deskInput.peerId)?.color ?? null}
+      />
+
+      <MidiInputBlock
+        sessionId={sessionId}
+        midi={deskMidi}
+        takeRolling={activeTakeId !== null}
+        color={midiColor}
       />
 
       <button

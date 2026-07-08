@@ -14,11 +14,14 @@ export interface ExportMenuProps {
   canFlac: boolean;
   songs: Song[];
   takeDurationSec: number;
+  /** Captured MIDI events on the loaded take (W3-C); 0 hides the item. */
+  midiEventCount: number;
   onMaster: () => void;
   onStems: () => void;
   onSong: (song: Song) => void;
   onAllSongs: () => void;
   onFlac: () => void;
+  onMidi: () => void;
   // Projects section (W3-B) — DAW-ready packages of the loaded take.
   onProjectPackage: () => void;
   onAbleton: () => void;
@@ -46,11 +49,13 @@ export function ExportMenu({
   canFlac,
   songs,
   takeDurationSec,
+  midiEventCount,
   onMaster,
   onStems,
   onSong,
   onAllSongs,
   onFlac,
+  onMidi,
   onProjectPackage,
   onAbleton,
   onLogic,
@@ -67,7 +72,7 @@ export function ExportMenu({
         aria-expanded={open}
         aria-haspopup="menu"
         onClick={() => setOpen((o) => !o)}
-        disabled={busy !== null || (!canRender && !canFlac)}
+        disabled={busy !== null || (!canRender && !canFlac && midiEventCount === 0)}
         className={`rounded-md bg-accent px-3.5 py-1.5 text-[11px] font-semibold text-white hover:brightness-110 ${
           busy !== null
             ? "animate-pulse cursor-wait"
@@ -159,6 +164,16 @@ export function ExportMenu({
               disabled={!canFlac}
               onClick={pick(onFlac)}
             />
+            {/* MIDI export (W3-C) — self-contained block, appears only
+                when the loaded take captured events. */}
+            {midiEventCount > 0 && (
+              <ExportItem
+                title="MIDI (.mid)"
+                hint={`SMF · ${midiEventCount} events`}
+                disabled={false}
+                onClick={pick(onMidi)}
+              />
+            )}
           </div>
         </>
       )}

@@ -20,6 +20,8 @@ import type { ClipModel } from "./daw";
 import { RULER_H, TRACK_HEADER_W, TRACK_ROW_H } from "./daw";
 import type { ExportJob, ExportMenuProps } from "./export-menu";
 import { type Song, songFileName, songsOf } from "./markers";
+import { noteSpansOf } from "./midi";
+import type { MidiLaneModel } from "./midi-lane";
 import { MixerDock } from "./mixer-dock";
 import { PerformersPanel } from "./performers-panel";
 import type { DriftResult } from "./player";
@@ -48,6 +50,7 @@ import {
   exportAbletonProject,
   exportLogicPackage,
   exportMasterWav,
+  exportMidiFile,
   exportProjectPackage,
   exportSongsZip,
   exportStemsZip,
@@ -65,6 +68,7 @@ import {
   waveformCacheSize,
 } from "./use-desk";
 import { useDeskInput } from "./use-desk-input";
+import { getDeskMidi, useDeskMidi } from "./use-desk-midi";
 
 export function DeskRoute() {
   const { uuid } = useParams();
@@ -95,6 +99,8 @@ function Desk({ sessionId }: { sessionId: string }) {
   // The desk's own input joins as a recorder peer (W2-D); it gets a lane
   // like everyone else but is not a "phone" anywhere the copy says so.
   const deskInput = useDeskInput(sessionId);
+  // Desk MIDI capture (W3-C) — desk-local data lane, never on the wire.
+  const deskMidi = useDeskMidi(sessionId);
   const phones = recorders.filter((p) => p.peerId !== deskInput.peerId);
   const peerByStream = useMemo(() => {
     const map = new Map<string, string>();
@@ -396,6 +402,32 @@ function Desk({ sessionId }: { sessionId: string }) {
     return starts.length > 0 ? Math.min(...starts) : 0;
     // eslint-style deps handled below in the delays effect
   }, [selectedTakeId, state.deskStatus, clipStartOverrides, takes]);
+
+  // ---- captured MIDI (W3-C) --------------------------------------------------
+  // The selected take's events, in the same room-timeline domain as markers
+  // (drawing adds selectedBaseSec). `revision` bumps when a capture lands.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: revision re-reads the manager's store
+  const takeMidi = useMemo(
+    () =>
+      selectedTakeId
+        ? getDeskMidi(sessionId).takeMidi(selectedTakeId)
+        : { events: [], overflow: false },
+    [sessionId, selectedTakeId, deskMidi.revision],
+  );
+  const midiLane: MidiLaneModel | null = useMemo(() => {
+    if (takeMidi.events.length === 0) return null;
+    const lastSec = takeMidi.events[takeMidi.events.length - 1]?.atSec ?? 0;
+    return {
+      notes: noteSpansOf(takeMidi.events),
+      eventCount: takeMidi.events.length,
+      baseSec: selectedBaseSec,
+      durationSec: Math.max(playerSnap.durationSec, lastSec),
+      // Next palette slot after the audio lanes — the lane reads as a
+      // sibling track, not a duplicate of one.
+      color: TRACK_COLORS[rows.length % TRACK_COLORS.length] as string,
+      overflow: takeMidi.overflow,
+    };
+  }, [takeMidi, selectedBaseSec, playerSnap.durationSec, rows.length]);
 
   // Feed arrangement offsets into the playback engine.
   useEffect(() => {
@@ -744,11 +776,13 @@ function Desk({ sessionId }: { sessionId: string }) {
     canFlac: convergedCount > 0,
     songs,
     takeDurationSec: playerSnap.durationSec,
+    midiEventCount: takeMidi.events.length,
     onMaster: () => void exportMaster(),
     onStems: () => void exportStems(),
     onSong: (song) => void exportSong(song),
     onAllSongs: () => void exportAllSongs(),
     onFlac: exportFlacAll,
+    onMidi: () => exportMidiFile(`${takeTag}.mid`, takeMidi.events),
     onProjectPackage: () => void exportProject(),
     onAbleton: () => void exportAbleton(),
     onLogic: () => void exportLogic(),
@@ -810,6 +844,7 @@ function Desk({ sessionId }: { sessionId: string }) {
           selectedBaseSec={selectedBaseSec}
           markers={takeMarkers.markers}
           comments={takeComments.comments}
+          midiLane={midiLane}
           playheadSec={playheadSec}
           ghostPlayheads={ghostPlayheads}
           marquee={marquee}
@@ -837,6 +872,8 @@ function Desk({ sessionId }: { sessionId: string }) {
               streams={state.streams}
               levelForRow={levelFor}
               deskInput={deskInput}
+              deskMidi={deskMidi}
+              midiColor={TRACK_COLORS[rows.length % TRACK_COLORS.length] as string}
             />
           ) : tab === "songs" ? (
             <SongsPanel

@@ -20,6 +20,7 @@ import {
 } from "./daw";
 import { formatAt } from "./format";
 import type { Marker, Song } from "./markers";
+import { type MidiLaneModel, MidiLaneRow } from "./midi-lane";
 import type { ChannelStrip } from "./player";
 import type { TrackRow } from "./track-model";
 import { getDeskSession, getPlayer } from "./use-desk";
@@ -50,6 +51,7 @@ export function TimelineSection({
   selectedBaseSec,
   markers,
   comments,
+  midiLane,
   playheadSec,
   ghostPlayheads,
   marquee,
@@ -75,6 +77,8 @@ export function TimelineSection({
   selectedBaseSec: number;
   markers: Marker[];
   comments: TakeComment[];
+  /** The selected take's captured MIDI (W3-C), when it has any. */
+  midiLane: MidiLaneModel | null;
   playheadSec: number | null;
   /** Other desks' cursors (W3-A presence), arrangement-timeline seconds. */
   ghostPlayheads: Array<{ clientId: number; name: string; color: string; atSec: number }>;
@@ -195,6 +199,11 @@ export function TimelineSection({
               : {})}
           />
         ))}
+
+        {/* MIDI data lane (W3-C): under the audio rows, only when the
+            selected take captured events. Sits below every audio row, so
+            the marquee's row-indexed hit rects stay untouched. */}
+        {midiLane && <MidiLaneRow lane={midiLane} pxPerSec={pxPerSec} laneWidth={laneWidth} />}
 
         {/* Marquee selection rectangle */}
         {marquee && (

@@ -50,6 +50,91 @@ function crc32(data: Buffer): number {
   return (crc ^ 0xffffffff) >>> 0;
 }
 
+// ---- Standard MIDI File (W3-C export) -----------------------------------------
+
+export interface MidiChannelEvent {
+  /** Absolute tick (accumulated deltas — monotone by construction). */
+  tick: number;
+  status: number;
+  data: number[];
+}
+
+export interface MidiFileInfo {
+  format: number;
+  trackCount: number;
+  /** Ticks per quarter note (division). */
+  tpqn: number;
+  /** From the set-tempo meta event, when present. */
+  tempoUsPerQuarter: number | null;
+  events: MidiChannelEvent[];
+}
+
+function readVlq(bytes: Buffer, at: number): { value: number; next: number } {
+  let value = 0;
+  let i = at;
+  for (;;) {
+    const b = bytes[i] as number;
+    value = (value << 7) | (b & 0x7f);
+    i++;
+    if ((b & 0x80) === 0) return { value, next: i };
+    expect(i - at).toBeLessThan(4); // VLQ is at most 4 bytes
+  }
+}
+
+/** Parse a format-0 .mid from the spec's structure (independent of the
+ * app's writer): header chunk, one track, VLQ deltas, meta/channel events.
+ * Delta-time non-negativity is inherent to VLQ; ticks accumulate monotone. */
+export function parseMidi(bytes: Buffer): MidiFileInfo {
+  expect(bytes.subarray(0, 4).toString("latin1")).toBe("MThd");
+  expect(bytes.readUInt32BE(4)).toBe(6);
+  const format = bytes.readUInt16BE(8);
+  const trackCount = bytes.readUInt16BE(10);
+  const tpqn = bytes.readUInt16BE(12);
+  expect(tpqn & 0x8000).toBe(0); // ticks-per-quarter, not SMPTE
+  expect(bytes.subarray(14, 18).toString("latin1")).toBe("MTrk");
+  const trackLen = bytes.readUInt32BE(18);
+  expect(22 + trackLen).toBe(bytes.length);
+
+  let tempoUsPerQuarter: number | null = null;
+  const events: MidiChannelEvent[] = [];
+  let tick = 0;
+  let i = 22;
+  let ended = false;
+  while (i < bytes.length && !ended) {
+    const delta = readVlq(bytes, i);
+    tick += delta.value;
+    i = delta.next;
+    const status = bytes[i] as number;
+    expect(status).toBeGreaterThanOrEqual(0x80); // running status not used
+    i++;
+    if (status === 0xff) {
+      const type = bytes[i] as number;
+      const len = readVlq(bytes, i + 1);
+      if (type === 0x51) {
+        expect(len.value).toBe(3);
+        tempoUsPerQuarter =
+          ((bytes[len.next] as number) << 16) |
+          ((bytes[len.next + 1] as number) << 8) |
+          (bytes[len.next + 2] as number);
+      }
+      if (type === 0x2f) ended = true;
+      i = len.next + len.value;
+    } else if (status === 0xf0 || status === 0xf7) {
+      const len = readVlq(bytes, i);
+      i = len.next + len.value;
+    } else {
+      const dataBytes = (status & 0xf0) === 0xc0 || (status & 0xf0) === 0xd0 ? 1 : 2;
+      const data = [...bytes.subarray(i, i + dataBytes)];
+      for (const d of data) expect(d).toBeLessThan(0x80);
+      events.push({ tick, status, data });
+      i += dataBytes;
+    }
+  }
+  expect(ended).toBe(true); // end-of-track present…
+  expect(i).toBe(bytes.length); // …and nothing after it
+  return { format, trackCount, tpqn, tempoUsPerQuarter, events };
+}
+
 /** Walk EOCD → central directory → local headers of a STORE-only ZIP,
  * asserting the structural invariants along the way. */
 export function parseZip(zip: Buffer): Array<{ name: string; data: Buffer }> {

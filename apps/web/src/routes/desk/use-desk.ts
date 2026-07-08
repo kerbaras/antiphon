@@ -36,6 +36,8 @@ import {
   saveMarkers,
   sortMarkers,
 } from "./markers";
+import type { MidiEvent } from "./midi";
+import { encodeMidiFile } from "./midi-file";
 import { computeWaveform, dbToLinear, type PlayerSnapshot, TakePlayer } from "./player";
 import { buildProjectManifest, type ProjectManifest } from "./project-manifest";
 import { RENDER_SAMPLE_RATE, type RenderModel, renderMaster, renderStems } from "./render";
@@ -214,6 +216,12 @@ export async function exportSongsZip(
     });
   }
   downloadBlob(fileName, new Blob([buildZip(entries)], { type: "application/zip" }));
+}
+
+/** Download the take's captured MIDI as a standard MIDI file (W3-C).
+ * Pure encode (midi-file.ts) — no render pass, so no busy state. */
+export function exportMidiFile(fileName: string, events: readonly MidiEvent[]): void {
+  downloadBlob(fileName, new Blob([encodeMidiFile(events)], { type: "audio/midi" }));
 }
 
 function channelData(buffer: AudioBuffer): Float32Array[] {
