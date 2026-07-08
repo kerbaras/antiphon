@@ -4,7 +4,9 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "predev": "node ../../scripts/check-node.cjs",
     "dev": "node --env-file-if-exists=.env --watch src/index.ts",
+    "prestart": "node ../../scripts/check-node.cjs",
     "start": "node --env-file-if-exists=.env src/index.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run --passWithNoTests",

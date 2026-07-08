@@ -23,7 +23,9 @@ docs/                  architecture doc + protocol RFC + design references
 
 ## Prerequisites
 
-- Node 24 LTS, pnpm 11 (`corepack enable`)
+- Node 24 LTS, pnpm 11 (`corepack enable`) — nvm users: `nvm use` (reads
+  `.nvmrc`); Node < 24 fails fast (the server runs TS via built-in type
+  stripping, so v20 dies with `ERR_UNKNOWN_FILE_EXTENSION` otherwise)
 - Rust (pinned by `rust-toolchain.toml`, includes `wasm32-unknown-unknown`)
 - [wasm-pack](https://rustwasm.github.io/wasm-pack/)
 - Docker (Postgres for the server: `docker compose up -d postgres`)
