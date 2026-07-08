@@ -1,8 +1,10 @@
-// File-format readers for downloaded exports, shared by export.spec.ts and
-// markers.spec.ts. Deliberately independent of the app's writers (wav.ts /
-// zip.ts): they assert the structural invariants of each format from the
-// spec, not from the implementation.
+// File-format readers for downloaded exports, shared by export.spec.ts,
+// markers.spec.ts and daw-export.spec.ts. Deliberately independent of the
+// app's writers (wav.ts / zip.ts / xml.ts / als.ts): they assert the
+// structural invariants of each format from the spec, not from the
+// implementation.
 
+import { gunzipSync } from "node:zlib";
 import { expect } from "@playwright/test";
 
 export interface WavInfo {
@@ -83,4 +85,100 @@ export function parseZip(zip: Buffer): Array<{ name: string; data: Buffer }> {
   }
   expect(cursor).toBe(centralOffset + centralSize);
   return entries;
+}
+
+// ---- .als (gzipped XML) readers — W3-B DAW project exports --------------------
+
+/** An .als is a gzip member wrapping UTF-8 XML; node's zlib is the
+ * independent decompressor here (the app writes via CompressionStream). */
+export function gunzipAls(als: Buffer): string {
+  expect(als[0]).toBe(0x1f); // gzip magic
+  expect(als[1]).toBe(0x8b);
+  return gunzipSync(als).toString("utf8");
+}
+
+/** Attribute-only XML element tree — the subset a Live set document uses
+ * (all scalar state lives in attributes; no text nodes). */
+export interface XmlNode {
+  tag: string;
+  attrs: Record<string, string>;
+  children: XmlNode[];
+}
+
+/** Minimal hand-rolled XML reader with real well-formedness teeth:
+ * unbalanced tags, unquoted attributes or trailing garbage all throw. */
+export function parseXmlTree(doc: string): XmlNode {
+  let src = doc.trim();
+  if (src.startsWith("<?xml")) {
+    const end = src.indexOf("?>");
+    expect(end).toBeGreaterThan(0);
+    src = src.slice(end + 2);
+  }
+  let pos = 0;
+  const skipWs = () => {
+    while (pos < src.length && /\s/.test(src[pos] as string)) pos++;
+  };
+  const unescapeXml = (s: string): string =>
+    s
+      .replaceAll("&lt;", "<")
+      .replaceAll("&gt;", ">")
+      .replaceAll("&quot;", '"')
+      .replaceAll("&apos;", "'")
+      .replaceAll("&amp;", "&");
+  function parseElement(): XmlNode {
+    skipWs();
+    if (src[pos] !== "<") throw new Error(`xml: expected < at ${pos}`);
+    pos++;
+    const tagMatch = /^[A-Za-z_][A-Za-z0-9._-]*/.exec(src.slice(pos));
+    if (!tagMatch) throw new Error(`xml: bad tag at ${pos}`);
+    const tag = tagMatch[0];
+    pos += tag.length;
+    const attrs: Record<string, string> = {};
+    for (;;) {
+      skipWs();
+      if (src.startsWith("/>", pos)) {
+        pos += 2;
+        return { tag, attrs, children: [] };
+      }
+      if (src[pos] === ">") {
+        pos++;
+        break;
+      }
+      const attrMatch = /^([A-Za-z_][A-Za-z0-9._-]*)="([^"<>]*)"/.exec(src.slice(pos));
+      if (!attrMatch) throw new Error(`xml: bad attribute at ${pos}: ${src.slice(pos, pos + 40)}`);
+      attrs[attrMatch[1] as string] = unescapeXml(attrMatch[2] as string);
+      pos += attrMatch[0].length;
+    }
+    const children: XmlNode[] = [];
+    for (;;) {
+      skipWs();
+      if (src.startsWith(`</${tag}>`, pos)) {
+        pos += tag.length + 3;
+        return { tag, attrs, children };
+      }
+      if (pos >= src.length) throw new Error(`xml: unclosed <${tag}>`);
+      children.push(parseElement());
+    }
+  }
+  const root = parseElement();
+  skipWs();
+  expect(pos).toBe(src.length); // exactly one root element
+  return root;
+}
+
+/** Walk a fixed child path, asserting each hop exists. */
+export function xmlGet(node: XmlNode, ...path: string[]): XmlNode {
+  return path.reduce((n, tag) => {
+    const next = n.children.find((c) => c.tag === tag);
+    if (!next) throw new Error(`xml: missing <${tag}> under <${n.tag}>`);
+    return next;
+  }, node);
+}
+
+/** Read the Live "Value" attribute idiom at a child path. */
+export function xmlValue(node: XmlNode, ...path: string[]): string {
+  const target = xmlGet(node, ...path);
+  const v = target.attrs.Value;
+  if (v === undefined) throw new Error(`xml: <${target.tag}> has no Value`);
+  return v;
 }

@@ -18,7 +18,7 @@ import { loadAuthorPref, saveAuthorPref } from "./comments";
 import { type CommentLane, CommentsPanel } from "./comments-panel";
 import type { ClipModel } from "./daw";
 import { RULER_H, TRACK_HEADER_W, TRACK_ROW_H } from "./daw";
-import type { ExportMenuProps } from "./export-menu";
+import type { ExportJob, ExportMenuProps } from "./export-menu";
 import { type Song, songFileName, songsOf } from "./markers";
 import { MixerDock } from "./mixer-dock";
 import { PerformersPanel } from "./performers-panel";
@@ -45,7 +45,10 @@ import {
 import { useCollabArrange, useCollabPresence } from "./use-collab";
 import {
   ensureWaveform,
+  exportAbletonProject,
+  exportLogicPackage,
   exportMasterWav,
+  exportProjectPackage,
   exportSongsZip,
   exportStemsZip,
   getCachedWaveform,
@@ -668,13 +671,13 @@ function Desk({ sessionId }: { sessionId: string }) {
   // the player's scheduling math), so they gate on playback readiness: the
   // selected take loaded, alignment settled, transport idle.
   const canRenderTake = playerLoaded && !recording && !playerSnap.loading && !playerSnap.aligning;
-  const [exportBusy, setExportBusy] = useState<"master" | "stems" | "songs" | null>(null);
+  const [exportBusy, setExportBusy] = useState<ExportJob | null>(null);
   const [exportError, setExportError] = useState<string | null>(null);
 
   const takeNumber = selectedTakeId ? [...takes.keys()].indexOf(selectedTakeId) + 1 : 0;
   const takeTag = `take-${String(Math.max(1, takeNumber)).padStart(2, "0")}`;
 
-  async function runExport(kind: "master" | "stems" | "songs", job: () => Promise<void>) {
+  async function runExport(kind: ExportJob, job: () => Promise<void>) {
     if (exportBusy) return;
     setExportBusy(kind);
     setExportError(null);
@@ -717,6 +720,24 @@ function Desk({ sessionId }: { sessionId: string }) {
       ),
     );
 
+  // ---- DAW project exports (W3-B): same gating/busy as the renders above.
+  /** Lane names/peers + markers/comments the packages carry (use-desk). */
+  const projectCtx = () => ({
+    sessionId,
+    lanes: rows.map((row) => ({ key: row.key, name: row.name, peerId: row.peerId })),
+    markers: takeMarkers.markers,
+    comments: takeComments.comments,
+  });
+
+  const exportProject = () =>
+    runExport("project", () => exportProjectPackage(`${takeTag}-project.zip`, projectCtx()));
+
+  const exportAbleton = () =>
+    runExport("ableton", () => exportAbletonProject(takeTag, projectCtx()));
+
+  const exportLogic = () =>
+    runExport("logic", () => exportLogicPackage(`${takeTag}-logic-stems.zip`, projectCtx()));
+
   const exportMenu: ExportMenuProps = {
     busy: exportBusy,
     canRender: canRenderTake,
@@ -728,6 +749,9 @@ function Desk({ sessionId }: { sessionId: string }) {
     onSong: (song) => void exportSong(song),
     onAllSongs: () => void exportAllSongs(),
     onFlac: exportFlacAll,
+    onProjectPackage: () => void exportProject(),
+    onAbleton: () => void exportAbleton(),
+    onLogic: () => void exportLogic(),
   };
 
   return (

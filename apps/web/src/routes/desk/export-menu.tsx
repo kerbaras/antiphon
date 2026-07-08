@@ -5,8 +5,11 @@ import { SectionLabel } from "../../ui/kit";
 import { formatSpan } from "./format";
 import type { Song } from "./markers";
 
+/** One export job at a time; the button carries the busy label. */
+export type ExportJob = "master" | "stems" | "songs" | "project" | "ableton" | "logic";
+
 export interface ExportMenuProps {
-  busy: "master" | "stems" | "songs" | null;
+  busy: ExportJob | null;
   canRender: boolean;
   canFlac: boolean;
   songs: Song[];
@@ -16,7 +19,20 @@ export interface ExportMenuProps {
   onSong: (song: Song) => void;
   onAllSongs: () => void;
   onFlac: () => void;
+  // Projects section (W3-B) — DAW-ready packages of the loaded take.
+  onProjectPackage: () => void;
+  onAbleton: () => void;
+  onLogic: () => void;
 }
+
+const BUSY_LABELS: Record<ExportJob, string> = {
+  master: "Rendering mix…",
+  stems: "Rendering stems…",
+  songs: "Rendering songs…",
+  project: "Packaging project…",
+  ableton: "Building Live set…",
+  logic: "Packaging stems…",
+};
 
 /** Top-bar "Export ▾" dropdown (the prototype's decorative button, live):
  * offline renders of the loaded take — master WAV, stems ZIP, and (when
@@ -35,6 +51,9 @@ export function ExportMenu({
   onSong,
   onAllSongs,
   onFlac,
+  onProjectPackage,
+  onAbleton,
+  onLogic,
 }: ExportMenuProps) {
   const [open, setOpen] = useState(false);
   const pick = (action: () => void) => () => {
@@ -55,13 +74,7 @@ export function ExportMenu({
             : "disabled:cursor-not-allowed disabled:opacity-40"
         }`}
       >
-        {busy === "master"
-          ? "Rendering mix…"
-          : busy === "stems"
-            ? "Rendering stems…"
-            : busy === "songs"
-              ? "Rendering songs…"
-              : "Export ▾"}
+        {busy !== null ? BUSY_LABELS[busy] : "Export ▾"}
       </button>
       {open && (
         <>
@@ -89,6 +102,31 @@ export function ExportMenu({
               disabled={!canRender}
               onClick={pick(onStems)}
             />
+            {/* ---- Projects (W3-B): DAW-ready packages — keep this block
+                self-contained; sibling branches add their own entries. */}
+            <div className="mx-1.5 my-1 h-px bg-divider" />
+            <div className="px-2.5 pt-1 pb-0.5">
+              <SectionLabel>Projects</SectionLabel>
+            </div>
+            <ExportItem
+              title="Project package"
+              hint="ZIP · stems + mix + manifest"
+              disabled={!canRender}
+              onClick={pick(onProjectPackage)}
+            />
+            <ExportItem
+              title="Ableton Live project"
+              hint="ZIP · .als + samples"
+              disabled={!canRender}
+              onClick={pick(onAbleton)}
+            />
+            <ExportItem
+              title="Logic / generic stems"
+              hint="ZIP · stems + guide"
+              disabled={!canRender}
+              onClick={pick(onLogic)}
+            />
+            {/* ---- end Projects (W3-B) ---- */}
             {songs.length > 0 && (
               <>
                 <div className="mx-1.5 my-1 h-px bg-divider" />
