@@ -4,6 +4,18 @@
 // Anything not yet functional is visibly inert (aria-disabled), never fake.
 
 import type { ReactNode } from "react";
+import {
+  EQ_DB_RANGE,
+  EQ_MID_HZ_DEFAULT,
+  EQ_MID_HZ_MAX,
+  EQ_MID_HZ_MIN,
+  type EqBandPatch,
+  type EqState,
+  formatEqDb,
+  formatEqHz,
+  midHzToNorm,
+  normToMidHz,
+} from "./eq";
 
 export const TRACK_HEADER_W = 232;
 export const TRACK_ROW_H = 66;
@@ -515,6 +527,201 @@ export function PanKnob({
   );
 }
 
+// ---- channel EQ -------------------------------------------------------------
+
+/** Mini EQ gain knob (±12 dB) — the pan-knob interaction pattern at track-
+ * button scale: drag vertically (up boosts), double-click resets to 0 dB,
+ * arrows step 0.5 dB, Home/End jump to the rails. */
+function EqKnob({ label, db, onDb }: { label: string; db: number; onDb?: (db: number) => void }) {
+  const clamp = (v: number) => Math.max(-EQ_DB_RANGE, Math.min(EQ_DB_RANGE, v));
+  function startDrag(down: React.PointerEvent<HTMLDivElement>) {
+    if (!onDb) return;
+    down.preventDefault();
+    const startY = down.clientY;
+    const startDb = db;
+    const move = (e: PointerEvent) => {
+      onDb(clamp(Math.round((startDb + (startY - e.clientY) / 6) * 2) / 2));
+    };
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  }
+  function onKeyDown(e: React.KeyboardEvent<HTMLDivElement>) {
+    if (!onDb) return;
+    const next =
+      e.key === "ArrowUp" || e.key === "ArrowRight"
+        ? clamp(db + 0.5)
+        : e.key === "ArrowDown" || e.key === "ArrowLeft"
+          ? clamp(db - 0.5)
+          : e.key === "Home"
+            ? -EQ_DB_RANGE
+            : e.key === "End"
+              ? EQ_DB_RANGE
+              : null;
+    if (next === null) return;
+    e.preventDefault();
+    onDb(next);
+  }
+  return (
+    <div
+      role="slider"
+      aria-label={label}
+      aria-valuenow={db}
+      aria-valuemin={-EQ_DB_RANGE}
+      aria-valuemax={EQ_DB_RANGE}
+      aria-valuetext={`${formatEqDb(db)} dB`}
+      tabIndex={0}
+      title={`${label} ${formatEqDb(db)} dB — drag to adjust, double-click to reset`}
+      onPointerDown={startDrag}
+      onDoubleClick={() => onDb?.(0)}
+      onKeyDown={onKeyDown}
+      className="relative size-4 cursor-ns-resize touch-none rounded-full border border-edge-strong bg-edge"
+    >
+      <div
+        className="absolute inset-0"
+        style={{ transform: `rotate(${(db / EQ_DB_RANGE) * 135}deg)` }}
+      >
+        <div
+          className={cx(
+            "absolute top-[1px] left-1/2 h-[6px] w-[2px] -translate-x-1/2 rounded-[1px]",
+            db === 0 ? "bg-[#c8c9cb]" : "bg-accent",
+          )}
+        />
+      </div>
+    </div>
+  );
+}
+
+/** Mid-band center frequency as a draggable mono readout: vertical drag
+ * sweeps 200 Hz–8 kHz on a log scale, double-click recalls 1 kHz. */
+function EqFreq({ label, hz, onHz }: { label: string; hz: number; onHz?: (hz: number) => void }) {
+  const NORM_STEP = 1 / 24;
+  function startDrag(down: React.PointerEvent<HTMLDivElement>) {
+    if (!onHz) return;
+    down.preventDefault();
+    const startY = down.clientY;
+    const startNorm = midHzToNorm(hz);
+    const move = (e: PointerEvent) => {
+      onHz(Math.round(normToMidHz(startNorm + (startY - e.clientY) / 140)));
+    };
+    const up = () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", up);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  }
+  function onKeyDown(e: React.KeyboardEvent<HTMLDivElement>) {
+    if (!onHz) return;
+    const norm = midHzToNorm(hz);
+    const next =
+      e.key === "ArrowUp" || e.key === "ArrowRight"
+        ? normToMidHz(norm + NORM_STEP)
+        : e.key === "ArrowDown" || e.key === "ArrowLeft"
+          ? normToMidHz(norm - NORM_STEP)
+          : e.key === "Home"
+            ? EQ_MID_HZ_MIN
+            : e.key === "End"
+              ? EQ_MID_HZ_MAX
+              : null;
+    if (next === null) return;
+    e.preventDefault();
+    onHz(Math.round(next));
+  }
+  return (
+    <div
+      role="slider"
+      aria-label={label}
+      aria-valuenow={Math.round(hz)}
+      aria-valuemin={EQ_MID_HZ_MIN}
+      aria-valuemax={EQ_MID_HZ_MAX}
+      aria-valuetext={`${formatEqHz(hz)}Hz`}
+      tabIndex={0}
+      title={`${label} ${formatEqHz(hz)}Hz — drag to sweep, double-click for ${formatEqHz(EQ_MID_HZ_DEFAULT)}Hz`}
+      onPointerDown={startDrag}
+      onDoubleClick={() => onHz?.(EQ_MID_HZ_DEFAULT)}
+      onKeyDown={onKeyDown}
+      className="min-w-[30px] cursor-ns-resize touch-none rounded-[3px] border border-edge-inset bg-bg px-1 py-px text-center font-mono text-[8px] text-text-dim"
+    >
+      {formatEqHz(hz)}
+    </div>
+  );
+}
+
+const EQ_BANDS = [
+  { param: "lowDb", short: "L", band: "low" },
+  { param: "midDb", short: "M", band: "mid" },
+  { param: "highDb", short: "H", band: "high" },
+] as const;
+
+/** Strip EQ block: L/M/H mini-knobs with dB readouts, the mid-frequency
+ * sweep, and the EQ in/bypass pill. Bypassed state dims the whole block —
+ * the signal path really does reconnect around the filters. */
+function EqSection({
+  name,
+  eq,
+  onEq,
+  onEqBypass,
+}: {
+  name: string;
+  eq: EqState;
+  onEq?: (patch: EqBandPatch) => void;
+  onEqBypass?: () => void;
+}) {
+  return (
+    <div className="border-y border-divider px-1 pt-[4px] pb-[3px]">
+      <div className={cx("flex justify-center gap-[9px]", eq.bypassed && "opacity-45")}>
+        {EQ_BANDS.map(({ param, short, band }) => (
+          <div key={param} className="flex flex-col items-center gap-[2px]">
+            <EqKnob
+              label={`${name} EQ ${band}`}
+              db={eq[param]}
+              {...(onEq ? { onDb: (db: number) => onEq({ [param]: db }) } : {})}
+            />
+            <span
+              className={cx(
+                "font-mono text-[7.5px] leading-none",
+                eq[param] === 0 ? "text-text-faint" : "text-text-mute",
+              )}
+            >
+              {short} {formatEqDb(eq[param])}
+            </span>
+          </div>
+        ))}
+      </div>
+      <div className="flex items-center justify-center gap-1.5 pt-[3px]">
+        <button
+          type="button"
+          aria-label={`${name} EQ bypass`}
+          aria-pressed={eq.bypassed}
+          disabled={!onEqBypass}
+          onClick={onEqBypass}
+          title={eq.bypassed ? "EQ bypassed — click to engage" : "EQ in — click to bypass"}
+          className={cx(
+            "rounded-[3px] border px-[5px] py-px font-mono text-[7.5px] font-bold tracking-[0.5px]",
+            eq.bypassed
+              ? "border-edge-btn bg-[#232425] text-text-faint"
+              : "border-accent/40 bg-accent/15 text-accent",
+            onEqBypass ? "hover:brightness-125" : "cursor-not-allowed",
+          )}
+        >
+          EQ
+        </button>
+        <div className={cx(eq.bypassed && "opacity-45")}>
+          <EqFreq
+            label={`${name} EQ mid frequency`}
+            hz={eq.midHz}
+            {...(onEq ? { onHz: (hz: number) => onEq({ midHz: hz }) } : {})}
+          />
+        </div>
+      </div>
+    </div>
+  );
+}
+
 const FADER_MAX_DB = 6;
 const FADER_MIN_DB = -60;
 
@@ -605,6 +812,10 @@ export interface MixerStripProps {
   onGainDb?: (db: number) => void;
   pan?: number;
   onPan?: (pan: number) => void;
+  /** 3-band strip EQ state; omitted → no EQ block rendered. */
+  eq?: EqState;
+  onEq?: (patch: EqBandPatch) => void;
+  onEqBypass?: () => void;
   muted?: boolean;
   onMute?: () => void;
   soloed?: boolean;
@@ -622,6 +833,9 @@ export function MixerStrip({
   onGainDb,
   pan = 0,
   onPan,
+  eq,
+  onEq,
+  onEqBypass,
   muted,
   onMute,
   soloed,
@@ -649,6 +863,14 @@ export function MixerStrip({
       <div className="flex justify-center py-1">
         <PanKnob pan={pan} {...(onPan ? { onPan } : {})} label={`${name} pan`} />
       </div>
+      {eq && (
+        <EqSection
+          name={name}
+          eq={eq}
+          {...(onEq ? { onEq } : {})}
+          {...(onEqBypass ? { onEqBypass } : {})}
+        />
+      )}
       <div className="flex min-h-0 flex-1 justify-center gap-[9px] py-1">
         <Fader db={gainDb} {...(onGainDb ? { onChange: onGainDb } : {})} label={`${name} gain`} />
         <div className="flex items-end gap-[2px]">

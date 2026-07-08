@@ -41,6 +41,7 @@ import {
   VUVertical,
   ZoomControl,
 } from "./daw";
+import { defaultEq } from "./eq";
 import type { ChannelStrip, DriftResult, PlayerSnapshot } from "./player";
 import {
   ensureWaveform,
@@ -652,7 +653,7 @@ function Desk({ sessionId }: { sessionId: string }) {
   }
 
   return (
-    <main className="grid h-dvh grid-cols-[minmax(0,1fr)] grid-rows-[48px_40px_1fr_218px] overflow-hidden bg-bg text-[12px]">
+    <main className="grid h-dvh grid-cols-[minmax(0,1fr)] grid-rows-[48px_40px_1fr_264px] overflow-hidden bg-bg text-[12px]">
       {/* ================= TOP BAR (48px) ================= */}
       <header className="relative flex items-center justify-between gap-4 border-b border-divider bg-panel px-3.5">
         <div className="flex min-w-0 items-center gap-3.5">
@@ -941,7 +942,7 @@ function Desk({ sessionId }: { sessionId: string }) {
         </aside>
       </div>
 
-      {/* ================= MIXER (218px) ================= */}
+      {/* ============ MIXER (264px: prototype's 218 + the EQ block) ============ */}
       <div className="flex min-w-0 border-t border-divider bg-raised">
         <div className="flex min-w-0 flex-1 overflow-x-auto">
           {rows.map((row) => (
@@ -964,6 +965,9 @@ function Desk({ sessionId }: { sessionId: string }) {
           onGainDb={(db: number) => getPlayer().setMasterDb(db)}
           pan={playerSnap.masterPan}
           onPan={(p: number) => getPlayer().setMasterPan(p)}
+          eq={playerSnap.masterEq}
+          onEq={(patch) => getPlayer().setMasterEq(patch)}
+          onEqBypass={() => getPlayer().toggleMasterEqBypass()}
           {...(recording ? { dbText: formatDbfs(liveMasterLevel) } : {})}
         />
       </div>
@@ -1104,6 +1108,9 @@ function RowMixerStrip({
       onGainDb={(db) => getPlayer().setChannelDb(row.key, db)}
       pan={strip?.pan ?? 0}
       onPan={(p) => getPlayer().setChannelPan(row.key, p)}
+      eq={strip?.eq ?? defaultEq()}
+      onEq={(patch) => getPlayer().setChannelEq(row.key, patch)}
+      onEqBypass={() => getPlayer().toggleChannelEqBypass(row.key)}
       muted={strip?.muted ?? false}
       onMute={() => getPlayer().toggleChannelMute(row.key)}
       soloed={strip?.soloed ?? false}

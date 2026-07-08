@@ -14,6 +14,7 @@
 // resamples sources to 48 kHz exactly like live playback resamples to the
 // device rate, so exports are device-independent.
 
+import { createEqChain, type EqState } from "./eq";
 import { planSource, type RenderRange, resolveRange, type TrackTiming } from "./timeline-math";
 
 export const RENDER_SAMPLE_RATE = 48_000;
@@ -30,6 +31,9 @@ export interface RenderTrackModel {
   gain: number;
   /** Strip pan, −1 (L) .. +1 (R). */
   pan: number;
+  /** Strip 3-band EQ (bypass included) — built through the same
+   * createEqChain live monitoring uses. */
+  eq: EqState;
 }
 
 /** Everything an export needs, snapshotted from the player at render time
@@ -40,6 +44,7 @@ export interface RenderModel {
   durationSec: number;
   masterGain: number;
   masterPan: number;
+  masterEq: EqState;
   tracks: RenderTrackModel[];
 }
 
@@ -50,8 +55,8 @@ export interface Stem {
 }
 
 /** Master mixdown: 48 kHz stereo, exactly what monitoring plays — per-track
- * gain/pan/mute/solo, master gain/pan, alignment and drift correction all
- * applied. `range` selects a slice of the take's room timeline (the
+ * EQ/gain/pan/mute/solo, master EQ/gain/pan, alignment and drift correction
+ * all applied. `range` selects a slice of the take's room timeline (the
  * player.position() domain) for W2-B marker renders; omitted = whole take. */
 export async function renderMaster(model: RenderModel, range?: RenderRange): Promise<AudioBuffer> {
   const { startSec, endSec } = resolveRange(model.durationSec, range);
@@ -60,22 +65,38 @@ export async function renderMaster(model: RenderModel, range?: RenderRange): Pro
     Math.max(1, Math.round((endSec - startSec) * RENDER_SAMPLE_RATE)),
     RENDER_SAMPLE_RATE,
   );
-  // Mirror the playback graph: track gain → pan → master gain → master pan.
-  // (The player's analysers are metering taps — acoustically transparent.)
+  // Mirror the playback graph: track EQ → gain → pan → master EQ → master
+  // gain → master pan. Bypassed EQs are omitted outright — the render of a
+  // bypassed strip must equal the render of a strip with no EQ at all,
+  // exactly like the player's true-bypass edge swap. (The player's unity
+  // input/bus nodes and analysers are wiring/metering conveniences —
+  // acoustically transparent, so they have no offline counterpart.)
   const master = ctx.createGain();
   master.gain.value = model.masterGain;
   const masterPanner = ctx.createStereoPanner();
   masterPanner.pan.value = model.masterPan;
   master.connect(masterPanner);
   masterPanner.connect(ctx.destination);
+  let bus: AudioNode = master;
+  if (!model.masterEq.bypassed) {
+    const masterEq = createEqChain(ctx, model.masterEq);
+    masterEq.high.connect(master);
+    bus = masterEq.low;
+  }
   for (const track of model.tracks) {
     const gain = ctx.createGain();
     gain.gain.value = track.gain;
     const panner = ctx.createStereoPanner();
     panner.pan.value = track.pan;
     gain.connect(panner);
-    panner.connect(master);
-    startSource(ctx, track, startSec, gain);
+    panner.connect(bus);
+    let stripInput: AudioNode = gain;
+    if (!track.eq.bypassed) {
+      const eq = createEqChain(ctx, track.eq);
+      eq.high.connect(gain);
+      stripInput = eq.low;
+    }
+    startSource(ctx, track, startSec, stripInput);
   }
   return ctx.startRendering();
 }
@@ -84,9 +105,9 @@ export async function renderMaster(model: RenderModel, range?: RenderRange): Pro
  * up at 0 when imported into a DAW. Deliberately PRE-mix: only the
  * room-clock mapping (chirp alignment + drift correction + clip delay) is
  * baked — that is what makes lanes line up and cannot be reproduced
- * downstream. Strip gain/pan/mute/solo are NOT baked: stems are source
- * material, and mixer moves stay editable in the importing DAW (the mix
- * itself ships as the master WAV). */
+ * downstream. Strip gain/pan/mute/solo/EQ are NOT baked: stems are source
+ * material, and mixer moves (EQ included) stay editable in the importing
+ * DAW (the mix itself ships as the master WAV). */
 export async function renderStems(model: RenderModel, range?: RenderRange): Promise<Stem[]> {
   const { startSec, endSec } = resolveRange(model.durationSec, range);
   const length = Math.max(1, Math.round((endSec - startSec) * RENDER_SAMPLE_RATE));

@@ -1,11 +1,21 @@
 // Take playback engine: decodes each stream's archived FLAC into an
-// AudioBuffer and plays them through per-track gain → analyser → master
-// gain → analyser → speakers. Alignment offsets from chirp correlation and
-// per-stream drift ratios are applied at schedule time — stored audio is
-// never touched (RFC §13).
+// AudioBuffer and plays them through per-track EQ → gain → pan → analyser
+// → master EQ → master gain → master pan → analyser → speakers. Alignment
+// offsets from chirp correlation and per-stream drift ratios are applied
+// at schedule time — stored audio is never touched (RFC §13).
 
 import { DriftEstimator, find_chirp_offset, init as initWasm } from "@antiphon/core-wasm";
 import { DEFAULT_CHIRP_SPEC } from "@antiphon/protocol";
+import {
+  applyEqPatch,
+  createEqChain,
+  defaultEq,
+  disconnectEqChain,
+  type EqBandPatch,
+  type EqChain,
+  type EqState,
+  updateEqChain,
+} from "./eq";
 import type { RenderModel } from "./render";
 import { normalizeAlignDeltas, planSource, type TrackTiming, trackEndSec } from "./timeline-math";
 
@@ -58,8 +68,8 @@ export interface PlayerTrackSnapshot {
 }
 
 /** Persistent mixer strip state, keyed by performer lane — NOT by stream:
- * gain/pan/mute/solo belong to the track (channel), survive take switches,
- * and are editable with nothing loaded at all. */
+ * gain/pan/mute/solo/EQ belong to the track (channel), survive take
+ * switches, and are editable with nothing loaded at all. */
 export interface ChannelStrip {
   key: string;
   gainDb: number;
@@ -67,6 +77,8 @@ export interface ChannelStrip {
   pan: number;
   muted: boolean;
   soloed: boolean;
+  /** 3-band strip EQ, inserted before the strip gain. */
+  eq: EqState;
 }
 
 export interface PlayerSnapshot {
@@ -78,6 +90,7 @@ export interface PlayerSnapshot {
   durationSec: number;
   masterDb: number;
   masterPan: number;
+  masterEq: EqState;
   masterLevel: number;
   tracks: PlayerTrackSnapshot[];
   channels: ChannelStrip[];
@@ -91,6 +104,10 @@ interface Track {
   streamId: string;
   channelKey: string;
   buffer: AudioBuffer;
+  /** Stable node sources connect to; feeds `eq` or (bypassed) `gain`. */
+  input: GainNode;
+  /** Strip EQ biquads; `eq.high` stays wired into `gain` in both modes. */
+  eq: EqChain;
   gain: GainNode;
   panner: StereoPannerNode;
   analyser: AnalyserNode;
@@ -127,6 +144,10 @@ export function dbToLinear(db: number): number {
 
 export class TakePlayer {
   private ctx: AudioContext | null = null;
+  /** Stable node track analysers feed; routes into `masterEqChain` or
+   * (bypassed) straight into `master`. */
+  private masterBus: GainNode | null = null;
+  private masterEqChain: EqChain | null = null;
   private master: GainNode | null = null;
   private masterPanner: StereoPannerNode | null = null;
   private masterAnalyser: AnalyserNode | null = null;
@@ -152,6 +173,7 @@ export class TakePlayer {
   private startPos = 0;
   private masterDb = 0;
   private masterPan = 0;
+  private masterEq: EqState = defaultEq();
   private error: string | null = null;
   private scheduleCount = 0;
   private raf: number | null = null;
@@ -175,6 +197,7 @@ export class TakePlayer {
       durationSec: this.duration(),
       masterDb: this.masterDb,
       masterPan: this.masterPan,
+      masterEq: { ...this.masterEq },
       masterLevel: this.masterLevel,
       tracks: [...this.tracks.values()].map((t) => {
         const strip = this.channel(t.channelKey);
@@ -190,7 +213,7 @@ export class TakePlayer {
           waveform: t.waveform,
         };
       }),
-      channels: [...this.channels.values()].map((c) => ({ ...c })),
+      channels: [...this.channels.values()].map((c) => ({ ...c, eq: { ...c.eq } })),
       error: this.error,
       scheduleCount: this.scheduleCount,
     };
@@ -204,11 +227,15 @@ export class TakePlayer {
   private ensureGraph(): AudioContext {
     if (!this.ctx) {
       this.ctx = new AudioContext();
+      this.masterBus = this.ctx.createGain();
+      this.masterEqChain = createEqChain(this.ctx, this.masterEq);
       this.master = this.ctx.createGain();
       this.masterPanner = this.ctx.createStereoPanner();
       this.masterAnalyser = this.ctx.createAnalyser();
       this.masterAnalyser.fftSize = 512;
       this.masterScratch = new Float32Array(this.masterAnalyser.fftSize);
+      this.masterEqChain.high.connect(this.master);
+      this.routeMasterEq();
       this.master.connect(this.masterPanner);
       this.masterPanner.connect(this.masterAnalyser);
       this.masterAnalyser.connect(this.ctx.destination);
@@ -221,7 +248,7 @@ export class TakePlayer {
   private channel(key: string): ChannelStrip {
     let strip = this.channels.get(key);
     if (!strip) {
-      strip = { key, gainDb: 0, pan: 0, muted: false, soloed: false };
+      strip = { key, gainDb: 0, pan: 0, muted: false, soloed: false, eq: defaultEq() };
       this.channels.set(key, strip);
     }
     return strip;
@@ -254,18 +281,25 @@ export class TakePlayer {
           continue;
         }
         const buffer = await ctx.decodeAudioData(flac);
+        const channelKey = channelOf(streamId);
+        const input = ctx.createGain();
+        const eq = createEqChain(ctx, this.channel(channelKey).eq);
         const gain = ctx.createGain();
         const panner = ctx.createStereoPanner();
         const analyser = ctx.createAnalyser();
         analyser.fftSize = 512;
+        eq.high.connect(gain);
         gain.connect(panner);
         panner.connect(analyser);
-        analyser.connect(this.master as GainNode);
+        // Meters tap AFTER the whole strip — post-EQ/gain/pan by construction.
+        analyser.connect(this.masterBus as GainNode);
         const previous = this.tracks.get(streamId);
-        next.set(streamId, {
+        const track: Track = {
           streamId,
-          channelKey: channelOf(streamId),
+          channelKey,
           buffer,
+          input,
+          eq,
           gain,
           panner,
           analyser,
@@ -273,9 +307,13 @@ export class TakePlayer {
           alignment: previous?.alignment ?? null,
           drift: previous?.drift ?? null,
           waveform: computeWaveform(buffer),
-        });
+        };
+        this.routeTrackEq(track);
+        next.set(streamId, track);
       }
       for (const old of this.tracks.values()) {
+        old.input.disconnect();
+        disconnectEqChain(old.eq);
         old.gain.disconnect();
         old.panner.disconnect();
         old.analyser.disconnect();
@@ -493,6 +531,8 @@ export class TakePlayer {
     for (const streamId of streamIds) {
       const track = this.tracks.get(streamId);
       if (!track) continue;
+      track.input.disconnect();
+      disconnectEqChain(track.eq);
       track.gain.disconnect();
       track.panner.disconnect();
       track.analyser.disconnect();
@@ -578,6 +618,7 @@ export class TakePlayer {
       durationSec: this.duration(),
       masterGain: dbToLinear(this.masterDb),
       masterPan: this.masterPan,
+      masterEq: { ...this.masterEq },
       tracks: [...this.tracks.values()].map((track) => {
         const strip = this.channel(track.channelKey);
         const audible = !strip.muted && (!anySolo || strip.soloed);
@@ -588,6 +629,7 @@ export class TakePlayer {
           timing: this.timing(track),
           gain: audible ? dbToLinear(strip.gainDb) : 0,
           pan: strip.pan,
+          eq: { ...strip.eq },
         };
       }),
     };
@@ -620,7 +662,7 @@ export class TakePlayer {
       const source = ctx.createBufferSource();
       source.buffer = track.buffer;
       source.playbackRate.value = timing.ratio;
-      source.connect(track.gain);
+      source.connect(track.input);
       source.start(when + plan.whenSec, plan.offsetSec);
       this.sources.push(source);
     }
@@ -697,6 +739,57 @@ export class TakePlayer {
     this.masterPan = Math.max(-1, Math.min(1, pan));
     this.applyGains();
     this.notify();
+  }
+
+  // Strip/master EQ: band params re-target live biquads click-free; bypass
+  // is TRUE bypass — a single edge swap that reconnects the signal path
+  // around the filters (honest A/B, not a gains-cancel approximation).
+
+  setChannelEq(channelKey: string, patch: EqBandPatch): void {
+    const strip = this.channel(channelKey);
+    strip.eq = applyEqPatch(strip.eq, patch);
+    if (this.ctx) {
+      for (const track of this.tracks.values()) {
+        if (track.channelKey === channelKey) {
+          updateEqChain(track.eq, strip.eq, this.ctx.currentTime);
+        }
+      }
+    }
+    this.notify();
+  }
+
+  toggleChannelEqBypass(channelKey: string): void {
+    const strip = this.channel(channelKey);
+    strip.eq = { ...strip.eq, bypassed: !strip.eq.bypassed };
+    for (const track of this.tracks.values()) {
+      if (track.channelKey === channelKey) this.routeTrackEq(track);
+    }
+    this.notify();
+  }
+
+  setMasterEq(patch: EqBandPatch): void {
+    this.masterEq = applyEqPatch(this.masterEq, patch);
+    if (this.ctx && this.masterEqChain) {
+      updateEqChain(this.masterEqChain, this.masterEq, this.ctx.currentTime);
+    }
+    this.notify();
+  }
+
+  toggleMasterEqBypass(): void {
+    this.masterEq = { ...this.masterEq, bypassed: !this.masterEq.bypassed };
+    this.routeMasterEq();
+    this.notify();
+  }
+
+  private routeTrackEq(track: Track): void {
+    track.input.disconnect();
+    track.input.connect(this.channel(track.channelKey).eq.bypassed ? track.gain : track.eq.low);
+  }
+
+  private routeMasterEq(): void {
+    if (!this.masterBus || !this.master || !this.masterEqChain) return;
+    this.masterBus.disconnect();
+    this.masterBus.connect(this.masterEq.bypassed ? this.master : this.masterEqChain.low);
   }
 
   private applyGains(): void {
