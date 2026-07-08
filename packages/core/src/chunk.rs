@@ -63,7 +63,13 @@ impl StreamHeaderV1 {
         out.extend_from_slice(&self.clock_epoch_us.to_le_bytes());
         out.extend_from_slice(&self.wall_clock_hint_ms.to_le_bytes());
         let desc = self.device_desc.as_bytes();
-        let desc_len = desc.len().min(u16::MAX as usize);
+        // The length prefix is u16; oversize descriptions are truncated, but
+        // never mid-UTF-8-character — decode would reject the whole header
+        // as BadDeviceDesc, and an undecodable seq 0 costs the stream.
+        let mut desc_len = desc.len().min(usize::from(u16::MAX));
+        while desc_len > 0 && !self.device_desc.is_char_boundary(desc_len) {
+            desc_len -= 1;
+        }
         out.extend_from_slice(&(desc_len as u16).to_le_bytes());
         out.extend_from_slice(&desc[..desc_len]);
         let ch_len = self.codec_header.len().min(u16::MAX as usize);
@@ -92,17 +98,24 @@ impl StreamHeaderV1 {
         let codec = bytes[5];
         let channels = bytes[6];
         let bits_per_sample = bytes[7];
-        let sample_rate = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
-        let clock_epoch_us = u64::from_le_bytes(bytes[12..20].try_into().unwrap());
-        let wall_clock_hint_ms = u64::from_le_bytes(bytes[20..28].try_into().unwrap());
-        let desc_len = u16::from_le_bytes(bytes[28..30].try_into().unwrap()) as usize;
+        // The try_intos below cannot fail: each slice is a compile-time
+        // constant width, in bounds per the >= 30 check above.
+        let fixed = "constant-width slice within the checked 30-byte prefix";
+        let sample_rate = u32::from_le_bytes(bytes[8..12].try_into().expect(fixed));
+        let clock_epoch_us = u64::from_le_bytes(bytes[12..20].try_into().expect(fixed));
+        let wall_clock_hint_ms = u64::from_le_bytes(bytes[20..28].try_into().expect(fixed));
+        let desc_len = u16::from_le_bytes(bytes[28..30].try_into().expect(fixed)) as usize;
         let desc_end = 30usize.checked_add(desc_len).ok_or(E::Truncated)?;
         if bytes.len() < desc_end + 2 {
             return Err(E::Truncated);
         }
         let device_desc =
             String::from_utf8(bytes[30..desc_end].to_vec()).map_err(|_| E::BadDeviceDesc)?;
-        let ch_len = u16::from_le_bytes(bytes[desc_end..desc_end + 2].try_into().unwrap()) as usize;
+        let ch_len = u16::from_le_bytes(
+            bytes[desc_end..desc_end + 2]
+                .try_into()
+                .expect("2-byte slice, in bounds per the desc_end + 2 check above"),
+        ) as usize;
         let ch_end = (desc_end + 2).checked_add(ch_len).ok_or(E::Truncated)?;
         if bytes.len() < ch_end {
             return Err(E::Truncated);
@@ -189,6 +202,21 @@ mod tests {
         for cut in 0..bytes.len() {
             assert!(StreamHeaderV1::decode(&bytes[..cut]).is_err(), "cut={cut}");
         }
+    }
+
+    /// Oversize device descriptions truncate at the u16 length prefix, but
+    /// never mid-character: the emitted header must stay decodable (an
+    /// undecodable seq 0 would cost the whole stream).
+    #[test]
+    fn oversize_device_desc_truncates_on_char_boundary() {
+        let mut h = header();
+        // 65_534 ASCII bytes, then a 3-byte character straddling the 65_535
+        // cut: naive byte truncation would split it and decode would fail.
+        h.device_desc = format!("{}€€", "x".repeat(65_534));
+        let bytes = h.encode();
+        let decoded = StreamHeaderV1::decode(&bytes).expect("truncated header still decodes");
+        assert_eq!(decoded.device_desc, "x".repeat(65_534));
+        assert_eq!(decoded.codec_header, h.codec_header);
     }
 
     #[test]

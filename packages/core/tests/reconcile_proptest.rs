@@ -208,7 +208,7 @@ impl Sim {
             for s in 0..n_sinks {
                 sender.add_sink(s as u32);
             }
-            sender.arm(&stream_header());
+            sender.arm(&stream_header()).expect("fresh sender is Idle");
         }
         let mut sim = Self {
             n_streams,
@@ -271,7 +271,9 @@ impl Sim {
         }
         let seq = self.senders[stream].next_seq();
         let payload = payload_for(stream, seq);
-        self.senders[stream].push_audio(SAMPLES_PER_CHUNK, u64::from(seq) * 2_083, payload);
+        self.senders[stream]
+            .push_audio(SAMPLES_PER_CHUNK, u64::from(seq) * 2_083, payload)
+            .expect("state checked above");
     }
 
     fn pump(&mut self, stream: usize, sink: usize, n: usize) {
@@ -365,7 +367,7 @@ impl Sim {
             if self.senders[stream].state() == TakeState::Streaming {
                 // The final (possibly short) chunk, then DRAINING (§7.4).
                 self.produce(stream);
-                self.senders[stream].finish();
+                self.senders[stream].finish().expect("state checked above");
             }
         }
         for stream in 0..self.n_streams {

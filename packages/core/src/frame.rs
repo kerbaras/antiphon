@@ -169,6 +169,11 @@ impl Frame {
         }
     }
 
+    /// Encode one frame. Infallible by design: this sits on the recorder's
+    /// per-chunk hot path, and the size bounds it must respect are enforced
+    /// upstream (the codec splits chunks at `MAX_CHUNK_PAYLOAD_BYTES`;
+    /// range-list producers batch via `split_ranges_for_frames`), so the
+    /// `debug_assert`s below document invariants rather than validate input.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.encoded_len());
         out.extend_from_slice(&MAGIC);

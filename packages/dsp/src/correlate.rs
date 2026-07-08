@@ -23,10 +23,15 @@ pub struct ChirpMatch {
 /// Raw linear cross-correlation for every valid lag:
 /// `out[lag] = Σᵢ signal[lag+i]·reference[i]`, lag ∈ `0..=signal.len()-reference.len()`.
 /// The shared engine behind chirp location and drift window re-correlation.
-/// Returns `None` for degenerate inputs (empty reference, or reference
-/// longer than signal).
+/// Returns `None` for degenerate inputs (empty reference, reference longer
+/// than signal, or any non-finite sample — a NaN would spread through the
+/// FFT to every lag and surface as a garbage alignment instead of an honest
+/// "no match").
 pub fn correlation_series(signal: &[f32], reference: &[f32]) -> Option<Vec<f32>> {
     if reference.is_empty() || signal.len() < reference.len() {
+        return None;
+    }
+    if !signal.iter().chain(reference).all(|v| v.is_finite()) {
         return None;
     }
     let fft_len = (signal.len() + reference.len()).next_power_of_two();
@@ -96,7 +101,9 @@ pub fn cross_correlate_peak_excluding(
             best_lag = lag;
         }
     }
-    if best_val <= f32::EPSILON {
+    // Non-finite: energies overflowed f32 (absurd amplitudes) — no honest
+    // score is derivable, so report "no match" rather than NaN fields.
+    if !best_val.is_finite() || best_val <= f32::EPSILON {
         return None;
     }
 

@@ -185,6 +185,11 @@ impl StreamReceiver {
     /// `first_sample_index + sample_count`. Backfill interleaves seqs, so
     /// check against whichever stored neighbors exist. Seq 0 (header) and
     /// its successor's zero origin are special-cased.
+    ///
+    /// Sums saturate: a malicious `first_sample_index` near `u64::MAX` must
+    /// produce a continuity flag, not a debug-build overflow panic (a
+    /// saturated expectation can never equal an honest successor index —
+    /// `sample_count` is nonzero for audio chunks).
     fn check_continuity(&self, chunk: &AudioChunk) -> Option<(u64, u64)> {
         if chunk.seq == 0 {
             return None;
@@ -195,13 +200,17 @@ impl StreamReceiver {
         if chunk.seq >= 2
             && let Some(prev) = self.meta.get(&(chunk.seq - 1))
         {
-            let expected = prev.first_sample_index + u64::from(prev.sample_count);
+            let expected = prev
+                .first_sample_index
+                .saturating_add(u64::from(prev.sample_count));
             if chunk.first_sample_index != expected {
                 return Some((expected, chunk.first_sample_index));
             }
         }
         if let Some(next) = self.meta.get(&(chunk.seq + 1)) {
-            let expected_next = chunk.first_sample_index + u64::from(chunk.sample_count);
+            let expected_next = chunk
+                .first_sample_index
+                .saturating_add(u64::from(chunk.sample_count));
             if next.first_sample_index != expected_next {
                 return Some((expected_next, next.first_sample_index));
             }
@@ -425,6 +434,26 @@ mod tests {
                 got: 200
             }
         ));
+    }
+
+    /// A hostile `first_sample_index` near u64::MAX must flag a continuity
+    /// violation — never overflow (debug builds would panic on `+`).
+    #[test]
+    fn adversarial_sample_index_flags_without_overflow() {
+        let mut r = StreamReceiver::new();
+        assert_eq!(r.ingest(&chunk(1, 0, 100)), Ingest::Stored);
+        let evil = chunk(2, u64::MAX - 3, u32::MAX);
+        assert!(matches!(
+            r.ingest(&evil),
+            Ingest::ContinuityViolation { expected: 100, .. }
+        ));
+        // The next-neighbor check saturates rather than wrapping.
+        let after = chunk(3, 200, 100);
+        assert!(matches!(
+            r.ingest(&after),
+            Ingest::ContinuityViolation { .. }
+        ));
+        assert!(r.holds(2) && r.holds(3), "flagged bytes are still kept");
     }
 
     #[test]

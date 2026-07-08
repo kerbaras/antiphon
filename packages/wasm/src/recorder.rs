@@ -58,7 +58,9 @@ impl RecorderEngine {
             codec_header: encoder.codec_header(),
         };
         let mut sender = StreamSender::new(stream, ring_budget_bytes as usize);
-        sender.arm(&header);
+        sender
+            .arm(&header)
+            .map_err(|e| JsError::new(&e.to_string()))?;
         Ok(Self {
             sender,
             encoder,
@@ -91,7 +93,9 @@ impl RecorderEngine {
             .map_err(|e| JsError::new(&e.to_string()))?;
         for c in chunks {
             let ts = self.capture_ts_for(c.first_sample_index);
-            self.sender.push_audio(c.sample_count, ts, c.payload);
+            self.sender
+                .push_audio(c.sample_count, ts, c.payload)
+                .map_err(|e| JsError::new(&e.to_string()))?;
         }
         Ok(())
     }
@@ -105,9 +109,13 @@ impl RecorderEngine {
             .map_err(|e| JsError::new(&e.to_string()))?;
         for c in chunks {
             let ts = self.capture_ts_for(c.first_sample_index);
-            self.sender.push_audio(c.sample_count, ts, c.payload);
+            self.sender
+                .push_audio(c.sample_count, ts, c.payload)
+                .map_err(|e| JsError::new(&e.to_string()))?;
         }
-        self.sender.finish();
+        self.sender
+            .finish()
+            .map_err(|e| JsError::new(&e.to_string()))?;
         Ok(())
     }
 
@@ -223,6 +231,11 @@ impl RecorderEngine {
     fn capture_ts_for(&self, first_sample_index: u64) -> u64 {
         // Capture clock and sample clock are the same thing on a recorder:
         // ts = epoch + samples/rate. Coarse hint only; truth is acoustic.
-        self.clock_epoch_us + first_sample_index * 1_000_000 / u64::from(self.sample_rate)
+        // u128 keeps the multiply exact for any sample index (u64 would
+        // overflow after ~12 years at 48 kHz — cheap to make impossible).
+        // sample_rate >= 1: EncoderConfig::validate rejected 0 in new().
+        let elapsed = u128::from(first_sample_index) * 1_000_000 / u128::from(self.sample_rate);
+        self.clock_epoch_us
+            .saturating_add(u64::try_from(elapsed).unwrap_or(u64::MAX))
     }
 }

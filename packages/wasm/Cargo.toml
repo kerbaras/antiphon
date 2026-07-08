@@ -15,3 +15,8 @@ antiphon-codec = { workspace = true }
 antiphon-dsp = { workspace = true }
 wasm-bindgen = { workspace = true }
 js-sys = { workspace = true }
+
+# Native-target tests only (the meter frame codec is plain Rust); does not
+# affect the shipped wasm binary.
+[dev-dependencies]
+proptest = { workspace = true }

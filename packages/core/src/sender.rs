@@ -46,6 +46,16 @@ pub enum TakeState {
     Closed,
 }
 
+/// Lifecycle misuse: the operation is not legal in the current take state.
+/// Returned instead of panicking — this engine runs inside the wasm recorder
+/// worker, where a panic would drop the take it exists to protect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("{op} is not legal in take state {state:?}")]
+pub struct TakeStateError {
+    pub op: &'static str,
+    pub state: TakeState,
+}
+
 #[derive(Debug)]
 struct SinkTx {
     connected: bool,
@@ -134,21 +144,33 @@ impl StreamSender {
 
     /// `take-start` received: produce the seq-0 stream header. Capture starts
     /// NOW regardless of any sink's connectivity (§7.1).
-    pub fn arm(&mut self, header: &StreamHeaderV1) {
-        assert_eq!(self.state, TakeState::Idle, "arm() from {:?}", self.state);
+    pub fn arm(&mut self, header: &StreamHeaderV1) -> Result<(), TakeStateError> {
+        if self.state != TakeState::Idle {
+            return Err(TakeStateError {
+                op: "arm()",
+                state: self.state,
+            });
+        }
         self.state = TakeState::Armed;
         let chunk = header_chunk(self.stream, header);
         self.produce(chunk);
         self.state = TakeState::Streaming;
+        Ok(())
     }
 
     /// Append one encoded audio chunk. Returns its seq.
-    pub fn push_audio(&mut self, sample_count: u32, capture_ts_us: u64, payload: Vec<u8>) -> u32 {
-        assert!(
-            matches!(self.state, TakeState::Streaming),
-            "push_audio() in {:?}",
-            self.state
-        );
+    pub fn push_audio(
+        &mut self,
+        sample_count: u32,
+        capture_ts_us: u64,
+        payload: Vec<u8>,
+    ) -> Result<u32, TakeStateError> {
+        if self.state != TakeState::Streaming {
+            return Err(TakeStateError {
+                op: "push_audio()",
+                state: self.state,
+            });
+        }
         let seq = self.next_seq;
         let chunk = audio_chunk(
             self.stream,
@@ -160,20 +182,24 @@ impl StreamSender {
         );
         self.next_first_sample_index += u64::from(sample_count);
         self.produce(chunk);
-        seq
+        Ok(seq)
     }
 
     /// `take-stop` received and the final chunk has been pushed.
-    pub fn finish(&mut self) {
-        assert!(
-            matches!(self.state, TakeState::Streaming),
-            "finish() in {:?}",
-            self.state
-        );
-        assert!(self.next_seq > 0, "finish() before arm()");
+    pub fn finish(&mut self) -> Result<(), TakeStateError> {
+        if self.state != TakeState::Streaming {
+            return Err(TakeStateError {
+                op: "finish()",
+                state: self.state,
+            });
+        }
+        // Streaming is only reachable through arm(), which produced seq 0,
+        // so at least one chunk exists and `next_seq - 1` cannot underflow.
+        debug_assert!(self.next_seq > 0, "Streaming implies arm() produced seq 0");
         self.final_seq = Some(self.next_seq - 1);
         self.state = TakeState::Draining;
         self.try_close();
+        Ok(())
     }
 
     fn produce(&mut self, chunk: AudioChunk) {
@@ -281,8 +307,13 @@ impl StreamSender {
         self.ring.mark_acked(&tx.proven_held.clone());
 
         // Outstanding = produced − proven − declared gaps: requeue whatever
-        // the ring still holds and isn't already queued.
-        let tx = self.sinks.get_mut(&sink).expect("sink exists");
+        // the ring still holds and isn't already queued. Re-borrow after the
+        // ring call above released `tx`; the key was checked at entry and
+        // `mark_acked` cannot remove sinks, so the lookup cannot fail.
+        let tx = self
+            .sinks
+            .get_mut(&sink)
+            .expect("checked at entry; ring.mark_acked never removes sinks");
         let outstanding = self
             .produced
             .subtract(&tx.proven_held)
@@ -466,7 +497,7 @@ mod tests {
         let mut s = StreamSender::new(stream(), 1 << 20);
         s.add_sink(1);
         s.set_connected(1, true);
-        s.arm(&header());
+        s.arm(&header()).unwrap();
         s
     }
 
@@ -489,8 +520,8 @@ mod tests {
     #[test]
     fn live_flows_in_order() {
         let mut s = sender_with_sink();
-        s.push_audio(100, 0, vec![0; 10]);
-        s.push_audio(100, 1, vec![1; 10]);
+        s.push_audio(100, 0, vec![0; 10]).unwrap();
+        s.push_audio(100, 1, vec![1; 10]).unwrap();
         assert_eq!(pop_seq(&mut s, 1), Some(0));
         assert_eq!(pop_seq(&mut s, 1), Some(1));
         assert_eq!(pop_seq(&mut s, 1), Some(2));
@@ -501,7 +532,7 @@ mod tests {
     fn ack_holes_requeue() {
         let mut s = sender_with_sink();
         for i in 0..5 {
-            s.push_audio(100, i, vec![i as u8; 10]);
+            s.push_audio(100, i, vec![i as u8; 10]).unwrap();
         }
         while s.pop_frame(1).is_some() {}
         // Sink reports it is missing 2..=3.
@@ -518,7 +549,7 @@ mod tests {
     fn snapshot_semantics_resend_after_crash_regression() {
         let mut s = sender_with_sink();
         for i in 0..4 {
-            s.push_audio(100, i, vec![0; 10]);
+            s.push_audio(100, i, vec![0; 10]).unwrap();
         }
         while s.pop_frame(1).is_some() {}
         s.handle_frame(1, &ack(4, &[]));
@@ -536,10 +567,10 @@ mod tests {
     fn fresh_live_outranks_reconnect_backlog() {
         let mut s = sender_with_sink();
         for i in 0..3 {
-            s.push_audio(100, i, vec![0; 10]);
+            s.push_audio(100, i, vec![0; 10]).unwrap();
         }
         s.set_connected(1, false); // live queue (0..=3) demoted to backfill
-        s.push_audio(100, 3, vec![0; 10]); // produced offline → live queue
+        s.push_audio(100, 3, vec![0; 10]).unwrap(); // produced offline → live queue
         s.set_connected(1, true);
         assert_eq!(pop_seq(&mut s, 1), Some(4), "freshest chunk first");
         let rest: Vec<u32> = std::iter::from_fn(|| pop_seq(&mut s, 1)).collect();
@@ -549,8 +580,8 @@ mod tests {
     #[test]
     fn drain_lifecycle() {
         let mut s = sender_with_sink();
-        s.push_audio(100, 0, vec![0; 10]);
-        s.finish();
+        s.push_audio(100, 0, vec![0; 10]).unwrap();
+        s.finish().unwrap();
         assert_eq!(s.state(), TakeState::Draining);
         assert_eq!(s.final_seq(), Some(1));
         assert!(!s.drained_any());
@@ -566,11 +597,11 @@ mod tests {
         let mut s = StreamSender::new(stream(), 2 * (68 + 100));
         s.add_sink(1);
         s.set_connected(1, true);
-        s.arm(&header());
+        s.arm(&header()).unwrap();
         for i in 0..5 {
-            s.push_audio(100, i, vec![0; 100]);
+            s.push_audio(100, i, vec![0; 100]).unwrap();
         }
-        s.finish();
+        s.finish().unwrap();
         assert!(
             !s.gaps().is_empty(),
             "eviction under pressure declares gaps"
@@ -608,5 +639,30 @@ mod tests {
             }),
         );
         assert!(s.drained_all());
+    }
+
+    /// Lifecycle misuse returns errors instead of panicking: a panic in the
+    /// wasm recorder worker would drop the take.
+    #[test]
+    fn lifecycle_misuse_errors_never_panics() {
+        let mut s = StreamSender::new(stream(), 1 << 20);
+        assert_eq!(
+            s.push_audio(100, 0, vec![0; 4]),
+            Err(TakeStateError {
+                op: "push_audio()",
+                state: TakeState::Idle
+            })
+        );
+        assert!(s.finish().is_err(), "finish before arm");
+        s.arm(&header()).unwrap();
+        assert!(s.arm(&header()).is_err(), "double arm");
+        s.push_audio(100, 0, vec![0; 4]).unwrap();
+        s.finish().unwrap();
+        assert!(s.finish().is_err(), "double finish");
+        assert!(s.push_audio(100, 0, vec![0; 4]).is_err(), "push after stop");
+        // The failed calls changed nothing observable.
+        assert_eq!(s.state(), TakeState::Draining);
+        assert_eq!(s.final_seq(), Some(1));
+        assert_eq!(s.next_seq(), 2);
     }
 }

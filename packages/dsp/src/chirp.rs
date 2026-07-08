@@ -6,11 +6,21 @@
 //! produces both the playback buffer and the correlation reference — one
 //! source of truth for the waveform.
 
+/// Longest sweep this generator will produce: 60 s at 192 kHz. The spec'd
+/// calibration chirp is 1 s (§10); anything beyond this bound is a caller
+/// bug or hostile input, answered with an empty buffer instead of a
+/// multi-gigabyte allocation (this function is exported verbatim to JS).
+pub const MAX_ESS_SAMPLES: usize = 192_000 * 60;
+
 /// Generate one exponential sine sweep.
 ///
 /// `start_hz` → `end_hz` over `duration_ms`, peak amplitude `gain_dbfs`
 /// (≤ 0), with 5 ms raised-cosine fades at both ends to keep speakers and
 /// correlators happy.
+///
+/// Total for arbitrary input: degenerate specs (non-finite or non-positive
+/// frequencies/duration, non-finite or positive gain, zero rate, oversize
+/// sweep) yield an empty buffer — never a panic, never a non-finite sample.
 pub fn generate_ess(
     sample_rate: u32,
     start_hz: f32,
@@ -18,8 +28,16 @@ pub fn generate_ess(
     duration_ms: f32,
     gain_dbfs: f32,
 ) -> Vec<f32> {
+    if !start_hz.is_finite()
+        || !end_hz.is_finite()
+        || !duration_ms.is_finite()
+        || !gain_dbfs.is_finite()
+        || gain_dbfs > 0.0
+    {
+        return Vec::new();
+    }
     let n = ((f64::from(sample_rate) * f64::from(duration_ms)) / 1_000.0).round() as usize;
-    if n == 0 || start_hz <= 0.0 || end_hz <= 0.0 {
+    if n == 0 || n > MAX_ESS_SAMPLES || start_hz <= 0.0 || end_hz <= 0.0 {
         return Vec::new();
     }
     let amplitude = 10f64.powf(f64::from(gain_dbfs) / 20.0);
@@ -32,8 +50,14 @@ pub fn generate_ess(
     (0..n)
         .map(|i| {
             let t = i as f64 / f64::from(sample_rate);
-            let phase = 2.0 * std::f64::consts::PI * f1 * duration_s / k
-                * ((t * k / duration_s).exp() - 1.0);
+            // k == 0 (start == end) makes the ESS formula 0/0; its limit is
+            // a pure tone at f1 — emit that instead of NaN samples.
+            let phase = if k == 0.0 {
+                2.0 * std::f64::consts::PI * f1 * t
+            } else {
+                2.0 * std::f64::consts::PI * f1 * duration_s / k
+                    * ((t * k / duration_s).exp() - 1.0)
+            };
             // Raised-cosine fade in/out.
             let window = if i < fade {
                 0.5 * (1.0 - (std::f64::consts::PI * (i as f64 / fade as f64)).cos())

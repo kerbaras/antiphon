@@ -340,7 +340,9 @@ fn measure_window(
                 (0usize, 0.0f32),
                 |acc, (i, v)| if v > acc.1 { (i, v) } else { acc },
             );
-    if best_val <= f32::EPSILON {
+    // Non-finite means f32 energy overflow (absurd amplitudes): drop the
+    // window rather than let a NaN reach the line fit.
+    if !best_val.is_finite() || best_val <= f32::EPSILON {
         return None;
     }
     let local: f32 = reference_segment[best..best + w]
@@ -352,7 +354,9 @@ fn measure_window(
         return None;
     }
     let peak = best_val / denom;
-    if peak < config.min_peak {
+    // A NaN peak (energy overflow) must be rejected explicitly: NaN
+    // comparisons are false, so `< min_peak` alone would let it through.
+    if peak.is_nan() || peak < config.min_peak {
         return None;
     }
     // Peak-to-sidelobe outside ±1 ms: sustained periodic content produces

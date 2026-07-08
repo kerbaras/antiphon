@@ -130,7 +130,10 @@ impl ChunkRing {
             if self.used_bytes <= self.budget_bytes {
                 return;
             }
-            let chunk = self.chunks.remove(&seq).expect("victim exists");
+            let chunk = self
+                .chunks
+                .remove(&seq)
+                .expect("victim seq was collected from this map above; nothing removed since");
             self.used_bytes -= chunk_cost(&chunk);
             self.evicted_acked.insert(seq);
         }
@@ -149,7 +152,10 @@ impl ChunkRing {
             if self.used_bytes <= self.budget_bytes {
                 return;
             }
-            let chunk = self.chunks.remove(&seq).expect("victim exists");
+            let chunk = self
+                .chunks
+                .remove(&seq)
+                .expect("victim seq was collected from this map above; nothing removed since");
             self.used_bytes -= chunk_cost(&chunk);
             self.pending_gaps.insert(seq);
             self.evicted_unacked.insert(seq);

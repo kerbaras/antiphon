@@ -14,3 +14,8 @@ thiserror = { workspace = true }
 [dev-dependencies]
 claxon = { workspace = true }
 proptest = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "encode_bench"
+harness = false
