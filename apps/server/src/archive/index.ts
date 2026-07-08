@@ -342,7 +342,15 @@ export class Archive {
     return { sessionId, takes };
   }
 
-  async takeSummary(takeId: string) {
+  /** Per-stream status for a take, scoped to its owning session: a takeId
+   * under the wrong (or an unknown) session resolves to null, never to
+   * another session's data. */
+  async takeSummary(sessionId: string, takeId: string) {
+    const [take] = await this.db
+      .select({ sessionId: schema.takes.sessionId })
+      .from(schema.takes)
+      .where(eq(schema.takes.id, takeId));
+    if (!take || take.sessionId !== sessionId) return null;
     const streams = await this.db
       .select()
       .from(schema.streams)

@@ -10,7 +10,10 @@ let controller: CaptureController | null = null;
 let latest: CaptureSnapshot | null = null;
 let session: RecorderSession | null = null;
 let sessionState: RecorderSessionState | null = null;
-let lastReportedFinal: number | null = null;
+/** Last stream-final reported, keyed `takeId:streamId:finalSeq` — a bare
+ * seq number would swallow the final of an equal-length follow-up take.
+ * A2: stream-final is idempotent (max wins), so err on re-sending. */
+let lastReportedFinal: string | null = null;
 
 export function getCaptureController(): CaptureController {
   if (!controller) {
@@ -18,9 +21,14 @@ export function getCaptureController(): CaptureController {
     controller.subscribe((snap) => {
       latest = snap;
       // The worker reported a final seq: tell the sinks via control plane.
-      if (snap.finalSeq !== null && snap.finalSeq !== lastReportedFinal) {
-        lastReportedFinal = snap.finalSeq;
-        session?.notifyFinal(snap.finalSeq);
+      if (snap.finalSeq !== null) {
+        const key = snap.stats
+          ? `${snap.stats.takeId}:${snap.stats.streamId}:${snap.finalSeq}`
+          : null;
+        if (key === null || key !== lastReportedFinal) {
+          lastReportedFinal = key;
+          session?.notifyFinal(snap.finalSeq);
+        }
       }
     });
     (globalThis as Record<string, unknown>).__antiphon = {

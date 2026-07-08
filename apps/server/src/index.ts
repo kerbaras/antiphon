@@ -122,10 +122,11 @@ export async function createServer(config: ServerConfig = loadConfig()) {
 
   // ---- archive status / retrieval -----------------------------------------
   app.get("/api/sessions/:sessionId/takes/:takeId", async (c) => {
-    return c.json({
-      takeId: c.req.param("takeId"),
-      streams: await archive.takeSummary(c.req.param("takeId")),
-    });
+    const takeId = c.req.param("takeId");
+    // Route params are never decorative: a take outside this session 404s.
+    const streams = await archive.takeSummary(c.req.param("sessionId"), takeId);
+    if (streams === null) return c.json({ error: "unknown take" }, 404);
+    return c.json({ takeId, streams });
   });
 
   app.get("/api/sessions/:sessionId/ingest", async (c) => {
@@ -133,6 +134,11 @@ export async function createServer(config: ServerConfig = loadConfig()) {
     return c.body(status, 200, { "content-type": "application/json" });
   });
 
+  // Deliberately un-nested: streamId is a bearer capability (122-bit UUID,
+  // RFC §12), and with no session param in the path there is nothing
+  // decorative to enforce. Session-scoping this would mean threading
+  // sessionId through every desk/e2e download path for zero access-control
+  // gain; revisit if v2 adds real authentication.
   app.get("/api/streams/:streamId/flac", async (c) => {
     const allowPartial = c.req.query("partial") === "1";
     const streamId = c.req.param("streamId");

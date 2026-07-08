@@ -41,6 +41,11 @@ export default defineConfig({
         PORT: "8787",
         BLOB_DRIVER: "fs",
         BLOB_FS_ROOT: "./data/e2e-blobs",
+        // Every join in the suite comes from 127.0.0.1: production per-IP
+        // join limits (30/min) would starve late-scheduled tests. The
+        // limiter has its own coverage in hardening.integration.test.ts.
+        JOIN_RATE_PER_MIN: "6000",
+        JOIN_RATE_BURST: "1000",
       },
     },
   ],

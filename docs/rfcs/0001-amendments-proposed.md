@@ -172,3 +172,39 @@ snapshot (the existing convergence mechanism). An empty/whitespace
 `label` clears the nickname; displays fall back to a device-derived
 name. Initial labels ride `hello.deviceInfo.label`; `peer-update` is
 only the live-rename path.
+
+## A14. Desk re-asserts its rolling take over an empty snapshot — clarification of §3/§7
+
+Room state (including `activeTake`) is in-memory; a server that crashes
+mid-take welcomes the reconnecting desk with `activeTake: null` while
+every recorder keeps rolling (§7.1 — capture never gates on the
+network). A desk that adopts that null loses control of a take that is
+still happening: Stop is dead, the operator cannot end it.
+
+Amendment: on `welcome`, a desk that knows a locally-active take and
+receives `activeTake: null` MUST NOT adopt the null; it re-asserts by
+re-sending the original `take-start` (same `takeId`, same
+`wallClockHint`, same `disarmedPeerIds`). §3 makes the desk the control
+authority — its own knowledge of the take it started outranks the empty
+snapshot of a reborn room. Safety analysis:
+
+- Re-assertion is idempotent everywhere: recorders treat a `take-start`
+  for their CURRENT take as a no-op, the server's take row is
+  insert-or-ignore (the archived `wallClockHint` never changes), and the
+  A10 disarm list is carried verbatim so sat-out lanes stay sat out.
+- A snapshot carrying a DIFFERENT active take wins over local state
+  (the room genuinely moved on); a desk with no local take (fresh load
+  or reload) adopts the snapshot as before. Only the (local take,
+  empty snapshot) cell re-asserts.
+- Known bound: with a single control authority, an empty snapshot while
+  the desk holds a rolling take can only mean the room died. If v2 adds
+  multiple desks, "another desk stopped it while we were away" becomes
+  possible and re-assertion could resurrect a stopped take; the fix
+  then is a server-side room epoch, not desk-side guessing.
+
+Chosen over persisting `activeTake` in the database: a DB-rebuilt
+active take has no authority behind it — if the desk never returns, the
+room claims a rolling take forever (blocking session expiry), and a
+stale un-stopped row from an earlier crash would resurrect as active on
+every boot. The desk re-asserting only what it knows is rolling is
+simpler and strictly safer under never-lose-audio.

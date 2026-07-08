@@ -9,6 +9,7 @@ import {
   SERVER_PEER_ID,
   type SessionState,
   type SignalingMessage,
+  type TakeStartMessage,
 } from "@antiphon/protocol";
 import type { DeskStreamStatus, FromSinkWorker, ToSinkWorker } from "../audio/sink-worker-protocol";
 import { offerChannel, RTC_CONFIG, wireIce } from "./rtc";
@@ -90,6 +91,11 @@ export class DeskSession {
   private nextRequestId = 1;
   private audioContext: AudioContext | null = null;
   private readonly deletedListeners = new Set<(streamIds: string[]) => void>();
+  /** The active take exactly as started, kept for re-assertion (A14): a
+   * reconnect welcome from a rebooted server carries activeTake=null while
+   * recorders keep rolling — the desk (control authority, §3) re-sends
+   * this take-start rather than adopt the empty snapshot. */
+  private activeTakeStart: Omit<TakeStartMessage, "v" | "type"> | null = null;
 
   constructor(readonly sessionId: string) {
     this.signaling = new SignalingClient("desk", sessionId);
@@ -233,14 +239,52 @@ export class DeskSession {
   private onSignal(msg: SignalingMessage): void {
     switch (msg.type) {
       case "welcome": {
-        this.patch({ activeTakeId: msg.session.activeTake?.takeId ?? null });
+        const active = msg.session.activeTake;
+        if (active) {
+          // Snapshot carries a take: adopt it. A different id than ours
+          // means the room genuinely moved on — stale local state loses.
+          if (active.takeId !== this.state.activeTakeId) {
+            this.activeTakeStart = {
+              takeId: active.takeId,
+              wallClockHint: active.startedAt,
+              ...(active.disarmedPeerIds?.length
+                ? { disarmedPeerIds: active.disarmedPeerIds }
+                : {}),
+            };
+            this.patch({
+              activeTakeId: active.takeId,
+              takeStartedAt: Date.parse(active.startedAt),
+            });
+          }
+        } else if (this.activeTakeStart) {
+          // Empty snapshot while OUR take is rolling: the server rebooted
+          // mid-take (room state is in-memory) and recorders kept capturing
+          // (§7.1). The desk is the control authority (§3) — re-assert the
+          // take to the reborn room instead of adopting the null (A14).
+          // Idempotent: recorders already rolling this take ignore it, and
+          // the archive keeps the original wallClockHint.
+          this.signaling.send({ v: 1, type: "take-start", ...this.activeTakeStart });
+        } else {
+          this.patch({ activeTakeId: null });
+        }
         this.ensureServerSync();
         break;
       }
       case "take-start":
-        this.patch({ activeTakeId: msg.takeId, takeStartedAt: Date.now() });
+        // Remembered verbatim so a post-restart re-assertion (A14) replays
+        // the exact original message.
+        this.activeTakeStart = {
+          takeId: msg.takeId,
+          wallClockHint: msg.wallClockHint,
+          ...(msg.disarmedPeerIds?.length ? { disarmedPeerIds: msg.disarmedPeerIds } : {}),
+        };
+        // A re-asserted take-start echoes back: don't restart the clock.
+        if (msg.takeId !== this.state.activeTakeId) {
+          this.patch({ activeTakeId: msg.takeId, takeStartedAt: Date.now() });
+        }
         break;
       case "take-stop":
+        if (msg.takeId === this.activeTakeStart?.takeId) this.activeTakeStart = null;
         this.patch({ activeTakeId: null });
         // §6.4: ack immediately on take close + reconcile with the server.
         this.broadcastAcks();

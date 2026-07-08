@@ -75,6 +75,22 @@ export async function startTestServer(
   });
 }
 
+/* NOTE — deliberately NO `nodeDataChannel.cleanup()` in these suites.
+ *
+ * node-datachannel 0.32.3's DataChannelWrapper destructor (the GC path)
+ * never erases itself from the static `instances` set — only doCleanup()
+ * does, and that only runs when the rtc onClosed callback is delivered.
+ * A wrapper collected before its onClosed lands leaves a dangling pointer,
+ * and the next cleanup() walks `instances` and calls close() on freed
+ * memory: SIGSEGV in afterAll, killing the vitest fork after every test
+ * passed ("Worker exited unexpectedly", GC-pressure dependent — hence the
+ * ~1/3 flake under parallel turbo runs and 15/15 green when idle; crash
+ * report: rtc::DataChannel::close ← DataChannelWrapper::doClose ←
+ * CloseAll ← RtcWrapper::cleanup). Closing every PC/DC (server.stop(),
+ * FakeRecorder.close()) already releases the loop refs; the fork then
+ * exits via process.exit, which reclaims libdatachannel's threads safely.
+ */
+
 export function sine(seconds: number, rate = 48_000): Float32Array {
   const out = new Float32Array(Math.round(seconds * rate));
   for (let i = 0; i < out.length; i++) {
@@ -462,6 +478,7 @@ export async function takeSummary(
   takeId: string,
 ): Promise<StreamSummary[]> {
   const res = await fetch(`${baseUrl}/api/sessions/${sessionId}/takes/${takeId}`);
+  if (res.status === 404) return []; // unknown-or-foreign take (session-scoped route)
   const body = (await res.json()) as { streams: StreamSummary[] };
   return body.streams;
 }

@@ -45,6 +45,13 @@ export interface SinkPort {
   budget(): number;
 }
 
+export interface ArmOptions {
+  takeId: Uint8Array;
+  streamId: Uint8Array;
+  deviceDesc?: string;
+  retainLocal?: boolean;
+}
+
 export class CaptureController {
   private context: AudioContext | null = null;
   private stream: MediaStream | null = null;
@@ -66,6 +73,8 @@ export class CaptureController {
     error: null,
   };
   private exportWaiters: Array<(flac: ArrayBuffer | null) => void> = [];
+  /** Arm intent queued while the encoder worker boots (see arm()). */
+  private pendingArm: ArmOptions | null = null;
 
   subscribe(listener: Listener): () => void {
     this.listeners.add(listener);
@@ -142,14 +151,15 @@ export class CaptureController {
     }
   }
 
-  /** Arm a take: sample index 0 is the next captured sample. */
-  arm(options: {
-    takeId: Uint8Array;
-    streamId: Uint8Array;
-    deviceDesc?: string;
-    retainLocal?: boolean;
-  }): void {
-    if (!this.workerReady) throw new Error("capture pipeline not ready");
+  /** Arm a take: sample index 0 is the next captured sample. Arming never
+   * gates on the network (§7.1) but DOES gate on the pipeline: a welcome or
+   * take-start reliably beats the encoder worker's wasm boot, so the intent
+   * is remembered and fires the moment the worker reports ready. */
+  arm(options: ArmOptions): void {
+    if (!this.workerReady) {
+      this.pendingArm = options;
+      return;
+    }
     this.post({
       type: "arm",
       takeId: options.takeId,
@@ -163,6 +173,11 @@ export class CaptureController {
   }
 
   stopTake(): void {
+    if (this.pendingArm) {
+      // Stopped before the pipeline ever armed: nothing was captured.
+      this.pendingArm = null;
+      return;
+    }
     this.post({ type: "stop" });
   }
 
@@ -216,6 +231,7 @@ export class CaptureController {
     this.worker?.terminate();
     this.worker = null;
     this.workerReady = false;
+    this.pendingArm = null;
     await this.context?.close();
     this.context = null;
     await this.wakeLock?.release();
@@ -224,9 +240,13 @@ export class CaptureController {
 
   private onWorker(msg: FromEncoderWorker) {
     switch (msg.type) {
-      case "ready":
+      case "ready": {
         this.workerReady = true;
+        const queued = this.pendingArm;
+        this.pendingArm = null;
+        if (queued) this.arm(queued);
         break;
+      }
       case "armed":
         this.publish({ finalSeq: null });
         break;

@@ -6,7 +6,6 @@
 import { existsSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import nodeDataChannel from "node-datachannel";
 import postgres from "postgres";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
@@ -54,7 +53,8 @@ suite("server ingest end-to-end", () => {
 
   afterAll(async () => {
     await server?.stop();
-    nodeDataChannel.cleanup();
+    // No nodeDataChannel.cleanup(): see the note in helpers.ts (native
+    // use-after-free in cleanup() flaked the fork ~1/3 of loaded runs).
   });
 
   it("happy path: recorder streams a take, server archive converges", async () => {
@@ -108,6 +108,13 @@ suite("server ingest end-to-end", () => {
     const flac = new Uint8Array(await flacRes.arrayBuffer());
     expect(String.fromCharCode(...flac.subarray(0, 4))).toBe("fLaC");
     expect(flac[42]).toBe(0xff);
+
+    // Route params are not decorative: the same take under a foreign
+    // session id is a 404, not another session's data.
+    const foreign = await fetch(
+      `${server.baseUrl}/api/sessions/${crypto.randomUUID()}/takes/${takeId}`,
+    );
+    expect(foreign.status).toBe(404);
 
     await recorder.close();
     desk.close();
@@ -252,8 +259,10 @@ suite("server ingest end-to-end", () => {
     expect(confirm.streams).toEqual([{ takeId, streamId }]);
     expect(confirm.deletedTakeIds).toEqual([takeId]);
 
-    // Rows gone (summary empty), blobs gone, take gone from the session.
-    expect(await takeSummary(server.baseUrl, sessionId, takeId)).toEqual([]);
+    // Rows gone (the take lost its last stream so its row went too — the
+    // session-scoped summary 404s), blobs gone, take gone from the session.
+    const gone = await fetch(`${server.baseUrl}/api/sessions/${sessionId}/takes/${takeId}`);
+    expect(gone.status).toBe(404);
     expect(existsSync(blobPath)).toBe(false);
     const session = (await (await fetch(`${server.baseUrl}/api/sessions/${sessionId}`)).json()) as {
       takes: Array<{ id: string }>;

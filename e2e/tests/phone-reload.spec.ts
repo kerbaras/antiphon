@@ -23,29 +23,53 @@ import {
 test.describe("phone reload mid-take", () => {
   test.skip(({ browserName }) => browserName !== "chromium", "fake mic is Chromium-only");
 
-  // BUG found while writing this journey (the passing test below works
-  // around it by holding the welcome back until the pipeline is up).
-  //
-  // The A6 rejoin path races the capture pipeline boot and loses: on a
-  // mid-take rejoin, RecorderSession's "welcome" handler calls
-  // armForTake → CaptureController.arm, which THROWS "capture pipeline
-  // not ready" when the encoder worker hasn't reported ready yet
-  // (apps/web/src/audio/capture-controller.ts ~line 152). joinSession()
-  // is called the moment getUserMedia resolves (join/index.tsx enableMic),
-  // so the welcome — one WS round-trip away — reliably beats the worker's
-  // wasm boot. Nothing retries: the exception escapes onSignal, the
-  // recorder stays in "ready"/idle with the capture ring overflowing
-  // (droppedSamples climbs), and it never arms for the active take.
-  // Repro: desk starts a take, phone records ~2 s, phone reloads,
-  // phone re-enables the mic → phone shows "ready", never "recording";
-  // pageerror "Error: capture pipeline not ready".
-  // Expected per A6: "rejoining mid-take arms a fresh stream_id" — arming
-  // must wait for (or retry after) worker readiness instead of throwing.
-  test.fixme("rejoin arms even when the welcome beats the encoder worker boot", async () => {
-    // Same journey as below, WITHOUT the WS gating: reload, re-enable
-    // the mic, and expect the phone to reach "recording" again:
-    //   await expect(phone.getByText("recording", { exact: true }))
-    //     .toBeVisible({ timeout: 15_000 });
+  // Regression: on a mid-take rejoin the welcome (one WS round-trip)
+  // reliably beats the encoder worker's wasm boot, and CaptureController.arm
+  // used to THROW "capture pipeline not ready" with nothing retrying — the
+  // phone stayed "ready" forever while the capture ring overflowed. Arming
+  // now gates on pipeline readiness (the intent is queued and fires on the
+  // worker's ready), so the same journey works with NO signaling gate.
+  test("rejoin arms even when the welcome beats the encoder worker boot", async ({ browser }) => {
+    test.setTimeout(120_000);
+    const sessionId = crypto.randomUUID();
+
+    const desk = await (await browser.newContext()).newPage();
+    await desk.goto(`/session/${sessionId}`);
+    await expect(desk.getByText("ANTIPHON", { exact: true })).toBeVisible();
+
+    const phone = await (await browser.newContext()).newPage();
+    await joinAsRecorder(phone, sessionId);
+    await expect(desk.getByText("1 phone connected")).toBeVisible({ timeout: 15_000 });
+
+    const takeId = await startTake(desk);
+    await expect(phone.getByText("recording", { exact: true })).toBeVisible({ timeout: 15_000 });
+    const oldStreamId = (await recorderState(phone))?.streamId as string;
+    await desk.waitForTimeout(2_000);
+
+    // Reload mid-take and re-enable the mic immediately — the welcome
+    // races (and beats) the worker boot, exactly the path that used to
+    // throw and leave the recorder idle.
+    const pageErrors: string[] = [];
+    phone.on("pageerror", (e) => pageErrors.push(String(e)));
+    await phone.reload();
+    await phone.getByRole("button", { name: /enable microphone/i }).click();
+    await expect(phone.getByText("recording", { exact: true })).toBeVisible({ timeout: 15_000 });
+    expect(pageErrors.filter((e) => e.includes("capture pipeline not ready"))).toEqual([]);
+
+    // A6: same take, FRESH stream — and the queued arm really captures:
+    // the new stream converges once the take stops.
+    const state = await recorderState(phone);
+    expect(state?.activeTakeId).toBe(takeId);
+    const newStreamId = state?.streamId as string;
+    expect(newStreamId).toBeTruthy();
+    expect(newStreamId).not.toBe(oldStreamId);
+
+    await desk.waitForTimeout(1_500);
+    await stopTake(desk);
+    await expectTakeConverged(desk, sessionId, takeId, 1, { onlyStreamIds: [newStreamId] });
+
+    await phone.close();
+    await desk.close();
   });
 
   test("re-join arms a new stream; the truncated stream is preserved and flagged incomplete", async ({
@@ -62,8 +86,8 @@ test.describe("phone reload mid-take", () => {
 
     // Gate for server→phone signaling: while held, welcome/fanout messages
     // queue instead of delivering — indistinguishable from control-plane
-    // latency. This sidesteps the arm-vs-worker-boot race documented in
-    // the fixme above so the A6 semantics themselves can be verified.
+    // latency. This pins the OTHER ordering (pipeline up before the welcome
+    // lands); the welcome-first race has its own test above.
     let held = false;
     const gates: Array<() => void> = [];
     await phone.routeWebSocket(/\/join\/[^/]+\/ws$/, (ws) => {
@@ -103,7 +127,7 @@ test.describe("phone reload mid-take", () => {
 
     // --- reload the phone mid-take and re-join ------------------------------
     // Hold server→phone signaling until the capture pipeline reports
-    // ready, then release the queued welcome (see fixme above).
+    // ready, then release the queued welcome.
     held = true;
     await phone.reload();
     await phone.getByRole("button", { name: /enable microphone/i }).click();

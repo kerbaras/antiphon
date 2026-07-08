@@ -10,13 +10,13 @@
 import { expect, type Page, test } from "@playwright/test";
 import { countBlobFiles, findTakeBlobDir } from "./helpers/blobs";
 import {
+  type DeskStreamStatus,
   deskState,
   deskStatus,
   expectTakeConverged,
   expectValidFlac,
   joinAsRecorder,
   serverSessionTakeIds,
-  serverTakeStreams,
   startTake,
   stopTake,
 } from "./helpers/session";
@@ -39,36 +39,45 @@ async function deleteStreams(
   }, refs);
 }
 
-/** Per-take record durations. DELIBERATELY distinct so consecutive takes
- * produce different final seqs — see the fixme below. */
+/** Per-take record durations for the 3-take journey; the equal-length
+ * regression case gets its own test below. */
 const TAKE_DURATIONS_MS = [2_000, 3_500, 5_000] as const;
 
 test.describe("multi-take session", () => {
   test.skip(({ browserName }) => browserName !== "chromium", "fake mic is Chromium-only");
 
-  // BUG found while writing this journey (the passing test below dodges it
-  // by giving every take a different duration).
-  //
-  // When two consecutive takes on the same recorder page produce the SAME
-  // final seq (equal-length takes — the completely ordinary "record 3
-  // verses of the same song" case), the second take's stream-final is
-  // never sent: apps/web/src/routes/join/use-capture.ts dedupes on the
-  // bare number (`lastReportedFinal`), not per (takeId, streamId), so
-  // `snap.finalSeq !== lastReportedFinal` is false for take 2 and
-  // session.notifyFinal() is skipped. Completeness is undecidable sink-side
-  // without the final seq (amendment A2): both sinks hold every chunk
-  // (chwm = final, zero holes) but report finalSeq=null/complete=false
-  // forever — the desk clip badge sticks at "syncing", the Sinks tab never
-  // shows "⇥ converged", and the .flac endpoint refuses with "final seq
-  // unknown". Repro: desk + one phone, record two takes of identical
-  // length (e.g. exactly 2.5 s each), stop each; take 2 never converges.
-  // Expected per A2: stream-final is sent when the final chunk of EVERY
-  // take is produced (idempotent per stream) — the dedup must be keyed by
-  // stream, not by the previous take's number.
-  test.fixme("equal-length consecutive takes both converge", async () => {
-    // Same journey as below with TAKE_DURATIONS_MS = [2_500, 2_500, 2_500]:
-    // expectTakeConverged(desk, sessionId, takeIds[1], 2) times out with
-    // "desk incomplete: … chwm=6 final=null" on every stream of take 2.
+  // Regression: two consecutive takes with the SAME final seq (equal-length
+  // takes — the ordinary "record 3 verses of the same song" case) used to
+  // leave take 2 forever syncing: use-capture.ts deduped stream-final on a
+  // bare seq number, so take 2's final (equal to take 1's) was never sent
+  // and completeness stayed undecidable sink-side (A2). The dedup is now
+  // keyed per (takeId, streamId, finalSeq).
+  test("equal-length consecutive takes both converge", async ({ browser }) => {
+    test.setTimeout(120_000);
+    const sessionId = crypto.randomUUID();
+
+    const desk = await (await browser.newContext()).newPage();
+    await desk.goto(`/session/${sessionId}`);
+    await expect(desk.getByText("ANTIPHON", { exact: true })).toBeVisible();
+
+    const phone = await (await browser.newContext()).newPage();
+    await joinAsRecorder(phone, sessionId);
+    await expect(desk.getByText("1 phone connected")).toBeVisible({ timeout: 15_000 });
+
+    for (let i = 0; i < 2; i++) {
+      const takeId = await startTake(desk);
+      await expect(phone.getByText("recording", { exact: true })).toBeVisible({
+        timeout: 15_000,
+      });
+      // IDENTICAL durations on purpose: identical final seqs.
+      await desk.waitForTimeout(2_500);
+      await stopTake(desk);
+      const { deskStreams } = await expectTakeConverged(desk, sessionId, takeId, 1);
+      await expectValidFlac(desk, (deskStreams[0] as DeskStreamStatus).streamId);
+    }
+
+    await phone.close();
+    await desk.close();
   });
 
   test("three takes converge; deleting take 2 removes rows and blobs, sparing takes 1 and 3", async ({
@@ -171,8 +180,10 @@ test.describe("multi-take session", () => {
     expect(announces.filter((s) => s.takeId === take2)).toEqual([]);
 
     // Server rows gone: the take lost its last stream, so the take row is
-    // deleted too and the streams no longer reconstruct.
-    expect(await serverTakeStreams(desk, sessionId, take2)).toEqual([]);
+    // deleted too (the session-scoped summary 404s) and the streams no
+    // longer reconstruct.
+    const gone = await desk.request.get(`/api/sessions/${sessionId}/takes/${take2}`);
+    expect(gone.status()).toBe(404);
     await expect
       .poll(async () => await serverSessionTakeIds(desk, sessionId), { timeout: 10_000 })
       .not.toContain(take2);

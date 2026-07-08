@@ -8,7 +8,6 @@ import { existsSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parseSignalingMessage, type SignalingMessage } from "@antiphon/protocol";
-import nodeDataChannel from "node-datachannel";
 import postgres from "postgres";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
@@ -129,7 +128,8 @@ suite("server hardening", () => {
 
   afterAll(async () => {
     await server?.stop();
-    nodeDataChannel.cleanup();
+    // No nodeDataChannel.cleanup(): see the note in helpers.ts (native
+    // use-after-free in cleanup() flaked the fork ~1/3 of loaded runs).
   });
 
   it("/health verifies db + blob store; /ready reports readiness", async () => {

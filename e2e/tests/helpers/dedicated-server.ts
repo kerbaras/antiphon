@@ -58,6 +58,10 @@ export async function startDedicatedServer(opts: {
       PORT: String(opts.port),
       BLOB_DRIVER: "fs",
       BLOB_FS_ROOT: opts.blobRoot,
+      // Single-IP test traffic + post-kill reconnect storms: production
+      // per-IP join limits would starve the clients (see playwright.config).
+      JOIN_RATE_PER_MIN: "6000",
+      JOIN_RATE_BURST: "1000",
     },
     stdio: ["ignore", "pipe", "pipe"],
   });

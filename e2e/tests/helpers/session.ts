@@ -145,6 +145,7 @@ export async function serverTakeStreams(
   origin = "",
 ): Promise<ServerStreamStatus[]> {
   const res = await page.request.get(`${origin}/api/sessions/${sessionId}/takes/${takeId}`);
+  if (res.status() === 404) return []; // unknown-or-foreign take (session-scoped route)
   expect(res.ok()).toBe(true);
   const body = (await res.json()) as { streams: ServerStreamStatus[] };
   return body.streams;
