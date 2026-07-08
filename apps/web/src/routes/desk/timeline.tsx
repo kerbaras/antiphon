@@ -272,9 +272,19 @@ export function TimelineSection({
   );
 }
 
-/** Ruler flag for one marker: a hairline with the song name tagged at the
- * ruler's foot. Accent at low alpha so the solid-accent playhead stays the
- * loudest line; click seeks to the song start. */
+/** Ruler flag for one marker: a full-height hairline with the song name
+ * chipped at the ruler's head — comment ticks own the foot (W2-F). Accent
+ * at low alpha so the solid-accent playhead stays the loudest line; click
+ * seeks to the song start.
+ *
+ * Hit target (F11): ONLY a 7px strip over the hairline plus the label chip.
+ * The button must not blanket the ruler — a full-height column the width of
+ * the label steals background seeks (an invisible 2–4 s dead-zone at 100%
+ * zoom) and click-shadows the z-[1] comment ticks exactly where comments
+ * cluster (song starts). The strip also stops above the ticks' 10px foot
+ * lane so a tick AT the song start stays clickable; a click on that last
+ * sliver of hairline falls through to the ruler seek, which lands within
+ * half a pixel of the marker anyway. */
 function MarkerFlag({ marker, x, onSeek }: { marker: Marker; x: number; onSeek: () => void }) {
   return (
     <button
@@ -287,11 +297,14 @@ function MarkerFlag({ marker, x, onSeek }: { marker: Marker; x: number; onSeek: 
         onSeek();
       }}
       onDoubleClick={(e) => e.stopPropagation()}
-      className="group/marker absolute inset-y-0 z-[2] flex items-end pb-[3px]"
-      style={{ left: x }}
+      className="group/marker absolute top-0 bottom-[10px] z-[2] w-[7px]"
+      style={{ left: x - 3 }}
     >
-      <span className="absolute inset-y-0 left-0 w-px bg-accent/50 group-hover/marker:bg-accent" />
-      <span className="ml-[3px] max-w-[96px] truncate rounded-[3px] border border-edge-btn bg-raised/95 px-[5px] py-px font-mono text-[8px] font-semibold tracking-[0.4px] text-text-mute group-hover/marker:border-accent/60 group-hover/marker:text-accent">
+      <span
+        className="pointer-events-none absolute top-0 left-[3px] w-px bg-accent/50 group-hover/marker:bg-accent"
+        style={{ height: RULER_H }}
+      />
+      <span className="absolute top-[4px] left-[6px] max-w-[96px] truncate rounded-[3px] border border-edge-btn bg-raised/95 px-[5px] py-px font-mono text-[8px] font-semibold tracking-[0.4px] text-text-mute group-hover/marker:border-accent/60 group-hover/marker:text-accent">
         {marker.name}
       </span>
     </button>

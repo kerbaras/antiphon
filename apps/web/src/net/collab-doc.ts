@@ -15,9 +15,22 @@
 //
 // List semantics (markers/comments): element identity is the model uuid;
 // edit/resolve replaces the array element with the same id (delete+insert).
-// Concurrent edits of the SAME element can briefly duplicate it — accepted
-// at this scale and documented; adds/removes/edits of different elements
-// converge cleanly. Y.Map keys (mix/arrange) are last-write-wins per key.
+// Concurrent edits of the SAME element can duplicate it IN THE STORED ARRAY
+// (both replacements survive the merge) — the accepted convergence bound;
+// adds/removes/edits of different elements converge cleanly. Two layers keep
+// that bound invisible and short-lived (F16):
+//   (a) read path: readTakeList/displayTakeList collapse same-id entries to
+//       one deterministic winner (last in array order — Yjs converges every
+//       replica to the SAME order, so every desk picks the SAME winner);
+//       the UI can never render duplicate rows or duplicate React keys.
+//   (b) heal: displayTakeList opportunistically transacts a delete-only
+//       collapse to that winner (healTakeListDuplicates) when it sees
+//       duplicates, so the stored array shrinks back without waiting for
+//       the next user edit. Delete-only + idempotent ⇒ no heal ping-pong:
+//       concurrent heals delete the same losers, and the final-order winner
+//       is by construction the last occurrence in EVERY replica that holds
+//       it, so no heal ever deletes it.
+// Y.Map keys (mix/arrange) are last-write-wins per key.
 
 import * as Y from "yjs";
 
@@ -125,15 +138,65 @@ function listMap<T extends ListItem>(doc: Y.Doc, kind: ListKind): Y.Map<Y.Array<
   return doc.getMap<Y.Array<T>>(kind);
 }
 
+/** id → index of its LAST occurrence: the shared winner rule (see below). */
+function lastIndexById<T extends ListItem>(items: readonly T[]): Map<string, number> {
+  const last = new Map<string, number>();
+  for (const [i, item] of items.entries()) last.set(item.id, i);
+  return last;
+}
+
+/** Pure same-id collapse: keep each id's LAST occurrence, drop the rest.
+ * "Last in array order" is the one winner rule every layer shares — Yjs
+ * converges all replicas to the same array order, so all desks agree.
+ * Returns the input untouched (new array) when ids are already unique. */
+export function dedupeById<T extends ListItem>(items: readonly T[]): T[] {
+  const last = lastIndexById(items);
+  return items.filter((item, i) => last.get(item.id) === i);
+}
+
 /** True when the doc carries an entry for this take (even an empty one) —
  * the switch between doc-authoritative and localStorage-fallback display. */
 export function hasTakeList(doc: Y.Doc, kind: ListKind, takeId: string): boolean {
   return listMap(doc, kind).has(takeId);
 }
 
+/** Materialize a take's list for the UI. Same-id duplicates (the F16
+ * concurrent-replace bound) collapse to the deterministic winner — the read
+ * path NEVER hands the UI duplicate ids. */
 export function readTakeList<T extends ListItem>(doc: Y.Doc, kind: ListKind, takeId: string): T[] {
   const arr = listMap<T>(doc, kind).get(takeId);
-  return arr ? arr.toArray() : [];
+  return arr ? dedupeById(arr.toArray()) : [];
+}
+
+/** Opportunistic F16 heal: when the stored array holds same-id duplicates,
+ * transact a DELETE-ONLY collapse to the read path's winner (each id's last
+ * occurrence). Returns true when something was deleted.
+ *
+ * Loop safety, proven in tests: idempotent (a healed array never re-heals),
+ * insert-free (the doc can only shrink), and winner-stable — Yjs orders any
+ * two elements identically on every replica, so the element that is last in
+ * the fully-merged order is also last in every partial view that contains
+ * it; no replica's heal ever deletes it, and concurrent heals just issue
+ * redundant deletes of the same losers, which merge as no-ops. */
+export function healTakeListDuplicates(
+  doc: Y.Doc,
+  kind: ListKind,
+  takeId: string,
+  origin: unknown,
+): boolean {
+  const arr = listMap(doc, kind).get(takeId);
+  if (!arr) return false;
+  const items = arr.toArray();
+  const last = lastIndexById(items);
+  if (last.size === items.length) return false;
+  doc.transact(() => {
+    // Walk backwards so deletions never shift a yet-unvisited index.
+    for (let i = items.length - 1; i >= 0; i--) {
+      const item = items[i];
+      if (item && last.get(item.id) !== i) arr.delete(i, 1);
+    }
+  }, origin);
+  return true;
 }
 
 /** Reconcile the take's Y.Array to `next` by uuid identity: remove ids that
@@ -192,21 +255,36 @@ export function seedTakeListOnce<T extends ListItem>(
   if (seeded.get(flag) || hasTakeList(doc, kind, takeId)) return false;
   doc.transact(() => {
     const arr = new Y.Array<T>();
-    arr.push([...items]);
+    // Dedupe defensively: a pre-heal-era localStorage shadow may still
+    // carry F16 duplicates — never let a seed re-plant them in the doc.
+    arr.push(dedupeById(items));
     listMap<T>(doc, kind).set(takeId, arr);
     seeded.set(flag, true);
   }, origin);
   return true;
 }
 
+/** Transaction origin for F16 heals. Not the remote marker, so a heal
+ * relays to the wire like any local edit; distinguishable in devtools. */
+export const HEAL_ORIGIN = "collab-doc:heal";
+
 /** Offline-fallback display rule: the doc rules once it carries an entry
  * for the take; until then the localStorage snapshot shows (single-desk
- * cold start renders instantly, no sync round-trip in the way). */
+ * cold start renders instantly, no sync round-trip in the way).
+ *
+ * This is the UI materialization point (use-desk.ts refresh calls it on
+ * every observed doc change), so it doubles as the F16 heal trigger: seeing
+ * same-id duplicates here means a concurrent-replace merge just landed, and
+ * the stored array is collapsed to the winner the read path returns anyway.
+ * Yjs runs transactions opened inside observer callbacks after the current
+ * one settles, so healing from the refresh observer is safe. */
 export function displayTakeList<T extends ListItem>(
   doc: Y.Doc,
   kind: ListKind,
   takeId: string,
   localFallback: readonly T[],
 ): T[] {
-  return hasTakeList(doc, kind, takeId) ? readTakeList<T>(doc, kind, takeId) : [...localFallback];
+  if (!hasTakeList(doc, kind, takeId)) return dedupeById(localFallback);
+  healTakeListDuplicates(doc, kind, takeId, HEAL_ORIGIN);
+  return readTakeList<T>(doc, kind, takeId);
 }

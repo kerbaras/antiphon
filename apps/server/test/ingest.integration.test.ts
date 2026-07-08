@@ -102,9 +102,14 @@ suite("server ingest end-to-end", () => {
     expect(summary[0]?.gaps).toEqual([]);
     expect(summary[0]?.flagged).toBe(false);
 
-    // The reconstructed FLAC is served and structurally valid.
+    // The reconstructed FLAC is served and structurally valid. This
+    // recorder never set a nickname, so the download keeps the full-uuid
+    // name (the pre-F14 contract).
     const flacRes = await fetch(`${server.baseUrl}/api/streams/${streamId}/flac`);
     expect(flacRes.status).toBe(200);
+    expect(flacRes.headers.get("content-disposition")).toBe(
+      `attachment; filename="${streamId}.flac"`,
+    );
     const flac = new Uint8Array(await flacRes.arrayBuffer());
     expect(String.fromCharCode(...flac.subarray(0, 4))).toBe("fLaC");
     expect(flac[42]).toBe(0xff);
@@ -117,6 +122,77 @@ suite("server ingest end-to-end", () => {
     expect(foreign.status).toBe(404);
 
     await recorder.close();
+    desk.close();
+  }, 60_000);
+
+  it("FLAC downloads carry the peer nickname in Content-Disposition (F14)", async () => {
+    const { sessionId } = (await (
+      await fetch(`${server.baseUrl}/api/sessions`, { method: "POST" })
+    ).json()) as { sessionId: string };
+    const desk = new FakeDesk(server.baseUrl, sessionId);
+    await desk.join();
+    // Labels chosen to exercise both sanitization branches: punctuation
+    // collapses to "-" (ASCII path) and a non-ASCII letter + emoji forces
+    // the RFC 6266/5987 filename* path.
+    const alto = new FakeRecorder(server.baseUrl, sessionId, { label: "Alto Sax!" });
+    const zoe = new FakeRecorder(server.baseUrl, sessionId, { label: "Zoë 🎤" });
+    await alto.join();
+    await zoe.join();
+    await alto.connectDataChannel();
+    await zoe.connectDataChannel();
+
+    const takeId = crypto.randomUUID();
+    const altoStreamId = crypto.randomUUID();
+    const zoeStreamId = crypto.randomUUID();
+    const started = Promise.all([
+      new Promise<void>((resolve) => {
+        alto.onTakeStart(() => {
+          alto.arm(takeId, altoStreamId);
+          resolve();
+        });
+      }),
+      new Promise<void>((resolve) => {
+        zoe.onTakeStart(() => {
+          zoe.arm(takeId, zoeStreamId);
+          resolve();
+        });
+      }),
+    ]);
+    desk.takeStart(takeId);
+    await started;
+
+    alto.pushAudio(sine(1.2));
+    zoe.pushAudio(sine(1.2));
+    alto.finish(takeId, altoStreamId);
+    zoe.finish(takeId, zoeStreamId);
+    desk.takeStop(takeId);
+    await alto.waitDrained();
+    await zoe.waitDrained();
+    await pollUntil(
+      () => takeSummary(server.baseUrl, sessionId, takeId),
+      (s) => s.length === 2 && s.every((stream) => stream.complete),
+      "both streams archived complete",
+    );
+
+    // The desk names lane exports `fileSafe(name)-<streamId8>` (W1-D); the
+    // server's Content-Disposition wins in Chromium, so it must agree.
+    const altoRes = await fetch(`${server.baseUrl}/api/streams/${altoStreamId}/flac`);
+    expect(altoRes.status).toBe(200);
+    expect(altoRes.headers.get("content-disposition")).toBe(
+      `attachment; filename="Alto-Sax-${altoStreamId.slice(0, 8)}.flac"`,
+    );
+
+    // Non-ASCII label: RFC 5987 filename* carries the real name (UTF-8
+    // percent-encoded); the plain filename is the ASCII-stripped fallback.
+    // The emoji is not \p{L}/\p{N}, so fileSafe drops it (web parity).
+    const zoeRes = await fetch(`${server.baseUrl}/api/streams/${zoeStreamId}/flac`);
+    expect(zoeRes.status).toBe(200);
+    expect(zoeRes.headers.get("content-disposition")).toBe(
+      `attachment; filename="Zo-${zoeStreamId.slice(0, 8)}.flac"; filename*=UTF-8''Zo%C3%AB-${zoeStreamId.slice(0, 8)}.flac`,
+    );
+
+    await alto.close();
+    await zoe.close();
     desk.close();
   }, 60_000);
 
@@ -276,9 +352,12 @@ suite("server ingest end-to-end", () => {
     ).json()) as Array<{ streamId: string }>;
     expect(ingest.map((s) => s.streamId)).not.toContain(streamId);
 
-    // FLAC reconstruction refuses an unknown stream.
+    // A hard-deleted stream is gone forever: 404, not the 409 reserved for
+    // known-but-incomplete streams. Never-existed ids read the same way.
     const flacRes = await fetch(`${server.baseUrl}/api/streams/${streamId}/flac`);
-    expect(flacRes.status).toBe(409);
+    expect(flacRes.status).toBe(404);
+    const neverExisted = await fetch(`${server.baseUrl}/api/streams/${crypto.randomUUID()}/flac`);
+    expect(neverExisted.status).toBe(404);
 
     await recorder.close();
     desk.close();

@@ -13,10 +13,19 @@ import { getDeviceId } from "./device-identity";
 type MessageListener = (msg: SignalingMessage) => void;
 type StateListener = (state: SignalingClientState) => void;
 
+/** A terminal control-plane error (§11 `fatal:true`), e.g. an A12 device
+ * supersede. The client halts — no reconnect — until an explicit reopen(). */
+export interface FatalSignalingError {
+  code: string;
+  message: string;
+}
+
 export interface SignalingClientState {
   connected: boolean;
   peerId: string | null;
   session: SessionState | null;
+  /** Non-null = this client is terminally halted (F3). */
+  fatal: FatalSignalingError | null;
 }
 
 const RECONNECT_BASE_MS = 1_000;
@@ -36,7 +45,7 @@ export class SignalingClient {
   private attempts = 0;
   private readonly messageListeners = new Set<MessageListener>();
   private readonly stateListeners = new Set<StateListener>();
-  state: SignalingClientState = { connected: false, peerId: null, session: null };
+  state: SignalingClientState = { connected: false, peerId: null, session: null, fatal: null };
 
   constructor(
     role: PeerRole,
@@ -51,7 +60,10 @@ export class SignalingClient {
   }
 
   connect(): void {
-    if (this.closed) return;
+    // A fatal halt gates reconnection too: a timer armed before the fatal
+    // landed must not resurrect the socket (that's the supersede ping-pong
+    // war). Only reopen() clears the halt.
+    if (this.closed || this.state.fatal) return;
     const path = this.role === "desk" ? "session" : "join";
     const proto = location.protocol === "https:" ? "wss" : "ws";
     const ws = new WebSocket(`${proto}://${location.host}/${path}/${this.sessionId}/ws`);
@@ -83,8 +95,19 @@ export class SignalingClient {
         return;
       }
       if (!msg) return;
-      if (msg.type === "welcome") {
-        this.setState({ connected: true, peerId: msg.peerId, session: msg.session });
+      if (msg.type === "error" && msg.fatal) {
+        // Terminal by contract (F3): the server is closing this socket and
+        // means it — superseded devices, deleted sessions, caps. Halt the
+        // reconnect loop and surface a distinct terminal state; recovery is
+        // a deliberate reopen(), never an automatic retry.
+        this.setState({
+          ...this.state,
+          connected: false,
+          fatal: { code: msg.code, message: msg.message },
+        });
+        ws.close(); // the server is closing it anyway; don't linger half-open
+      } else if (msg.type === "welcome") {
+        this.setState({ connected: true, peerId: msg.peerId, session: msg.session, fatal: null });
       } else if (msg.type === "peer-status") {
         this.setState({ ...this.state, session: msg.session });
       } else if (msg.type === "peer-update" && this.state.session) {
@@ -105,12 +128,22 @@ export class SignalingClient {
     });
     ws.addEventListener("close", () => {
       this.setState({ ...this.state, connected: false, peerId: null });
-      if (!this.closed) {
+      if (!this.closed && !this.state.fatal) {
         const delay = Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * 2 ** this.attempts++);
         setTimeout(() => this.connect(), delay);
       }
     });
     ws.addEventListener("error", () => ws.close());
+  }
+
+  /** Deliberate rejoin after a fatal halt (the "take over in this tab"
+   * affordance): clears the terminal state and reconnects — knowingly
+   * superseding whichever connection owns this device identity now. */
+  reopen(): void {
+    if (this.closed || !this.state.fatal) return;
+    this.attempts = 0;
+    this.setState({ ...this.state, fatal: null });
+    this.connect();
   }
 
   send(msg: SignalingMessage): void {

@@ -239,7 +239,9 @@ export class CaptureController {
     });
   }
 
-  /** Release the mic and tear the pipeline down (leaving a session). */
+  /** Release the mic and tear the pipeline down (leaving a session, or a
+   * fatal control halt). Publishes the reset so the UI never renders a
+   * stale "capturing" state over a released mic. */
   async teardown(): Promise<void> {
     this.node?.disconnect();
     this.node = null;
@@ -253,6 +255,16 @@ export class CaptureController {
     this.context = null;
     await this.wakeLock?.release();
     this.wakeLock = null;
+    this.publish({
+      contextSampleRate: null,
+      contextState: null,
+      flags: null,
+      stats: null,
+      ring: null,
+      peak: 0,
+      localChunks: 0,
+      finalSeq: null,
+    });
   }
 
   private onWorker(msg: FromEncoderWorker) {

@@ -46,7 +46,11 @@ export interface DeskStateSnapshot {
   rebuiltChunks: number;
   errors: string[];
   session: {
-    peers: Array<{ peerId: string; role: "desk" | "recorder" }>;
+    peers: Array<{
+      peerId: string;
+      role: "desk" | "recorder";
+      deviceInfo: { userAgent: string; label?: string };
+    }>;
   } | null;
 }
 
@@ -58,6 +62,8 @@ export interface RecorderStateSnapshot {
   deskLink: "connected" | "connecting" | "down" | "absent";
   activeTakeId: string | null;
   streamId: string | null;
+  /** Terminal control-plane halt (F3): superseded / session-deleted / caps. */
+  fatal: { code: string; message: string } | null;
 }
 
 // ---- page hook readers -------------------------------------------------------
@@ -134,6 +140,30 @@ export async function startTake(desk: Page): Promise<string> {
 
 export async function stopTake(desk: Page): Promise<void> {
   await desk.getByRole("button", { name: "Stop take" }).click();
+}
+
+/** Rename a peer from the desk (A13: the desk is the session authority)
+ * and wait for the roster echo to land back in the desk snapshot. */
+export async function renamePeerFromDesk(desk: Page, peerId: string, label: string): Promise<void> {
+  await desk.evaluate(
+    (args) => {
+      const hook = (
+        globalThis as unknown as {
+          __antiphonDesk?: { session: { renamePeer(peerId: string, label: string): void } };
+        }
+      ).__antiphonDesk;
+      hook?.session.renamePeer(args.peerId, args.label);
+    },
+    { peerId, label },
+  );
+  await expect
+    .poll(
+      async () =>
+        ((await deskState(desk))?.session?.peers ?? []).find((p) => p.peerId === peerId)?.deviceInfo
+          .label ?? null,
+      { timeout: 15_000 },
+    )
+    .toBe(label);
 }
 
 // ---- server archive readers ----------------------------------------------------

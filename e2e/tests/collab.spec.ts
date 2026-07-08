@@ -18,6 +18,7 @@ import {
   deskStatus,
   expectTakeConverged,
   joinAsRecorder,
+  renamePeerFromDesk,
   startTake,
   stopTake,
 } from "./helpers/session";
@@ -62,6 +63,28 @@ async function channelGainDb(desk: Page, key: string): Promise<number | null> {
     const strip = hook?.playerSnapshot()?.channels.find((c) => c.key === channelKey);
     return strip ? strip.gainDb : null;
   }, key);
+}
+
+/** The loaded track for a stream: which mixer lane it plays through and
+ * the gain that lane actually applies to it — the honest end of the
+ * peerId-keyed mixer-sync wire (F1's previously-phantom path). */
+async function trackLane(
+  desk: Page,
+  streamId: string,
+): Promise<{ channelKey: string; gainDb: number } | null> {
+  return await desk.evaluate((id) => {
+    const hook = (
+      globalThis as unknown as {
+        __antiphonDesk?: {
+          playerSnapshot(): {
+            tracks: Array<{ streamId: string; channelKey: string; gainDb: number }>;
+          } | null;
+        };
+      }
+    ).__antiphonDesk;
+    const track = hook?.playerSnapshot()?.tracks.find((t) => t.streamId === id);
+    return track ? { channelKey: track.channelKey, gainDb: track.gainDb } : null;
+  }, streamId);
 }
 
 /** Wait until the take is decoded into the player (shared-state UI unlocks). */
@@ -236,7 +259,62 @@ test.describe("multi-desk collaboration (W3-A)", () => {
     // Presence survives the reload too.
     await expect(deskA.locator('[title="Bea (Desk)"]')).toBeVisible({ timeout: 15_000 });
 
+    // --- a COLD desk C joins after the fact (F1, the W3-A promise) -----------
+    // C never saw a stream-announce: everything must rebuild from the
+    // archive attribution — named lane, stream attached to the performer's
+    // peerId-keyed mixer lane (not a phantom streamId strip), and per-lane
+    // mixer sync live in both directions.
+    await renamePeerFromDesk(deskA, laneKey, "Maria");
+    const deskC = await (await browser.newContext()).newPage();
+    await deskC.goto(`/session/${sessionId}`);
+    await expect(deskC.getByText("ANTIPHON", { exact: true })).toBeVisible();
+    await expect
+      .poll(
+        async () =>
+          (await deskStatus(deskC)).find((s) => s.streamId === streamId)?.complete ?? false,
+        { timeout: 60_000, intervals: [1_000] },
+      )
+      .toBe(true);
+    await expectTakeLoaded(deskC, takeId, 1);
+
+    // The historical stream lands on the performer lane, which already
+    // carries the doc's mixer state (A's -6 dB fader) — not a fresh
+    // phantom strip at 0 dB.
+    await expect
+      .poll(async () => (await trackLane(deskC, streamId))?.channelKey ?? "none", {
+        timeout: 15_000,
+      })
+      .toBe(laneKey);
+    await expect
+      .poll(async () => (await trackLane(deskC, streamId))?.gainDb ?? null, { timeout: 15_000 })
+      .toBe(-6);
+    // ...and the lane is NAMED from the persisted peer, not "Stream N".
+    await expect(deskC.getByText("Maria").first()).toBeVisible({ timeout: 15_000 });
+    await expect(deskC.getByText(/^Stream \d+$/)).toHaveCount(0);
+
+    // Fader move on A lands on C's matching lane (the previously-inert
+    // per-lane path); C's move lands back on A.
+    await deskA.evaluate((key) => {
+      (
+        globalThis as unknown as {
+          __antiphonDesk: { player: { setChannelDb(k: string, db: number): void } };
+        }
+      ).__antiphonDesk.player.setChannelDb(key, -9);
+    }, laneKey);
+    await expect
+      .poll(async () => (await trackLane(deskC, streamId))?.gainDb ?? null, { timeout: 15_000 })
+      .toBe(-9);
+    await deskC.evaluate((key) => {
+      (
+        globalThis as unknown as {
+          __antiphonDesk: { player: { setChannelDb(k: string, db: number): void } };
+        }
+      ).__antiphonDesk.player.setChannelDb(key, -3);
+    }, laneKey);
+    await expect.poll(async () => channelGainDb(deskA, laneKey), { timeout: 15_000 }).toBe(-3);
+
     await phone.close();
+    await deskC.close();
     await deskB.close();
     await deskA.close();
   });

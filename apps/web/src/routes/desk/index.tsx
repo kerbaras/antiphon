@@ -14,10 +14,12 @@
 import { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useParams } from "react-router";
 import { recordRecentSession } from "../home/recent-sessions";
+import { orderTakeIds } from "./attribution";
 import { loadAuthorPref, saveAuthorPref } from "./comments";
 import { type CommentLane, CommentsPanel } from "./comments-panel";
 import type { ClipModel } from "./daw";
 import { RULER_H, TRACK_HEADER_W, TRACK_ROW_H } from "./daw";
+import { DeleteConfirm, type DeleteSummaryTake } from "./delete-confirm";
 import type { ExportJob, ExportMenuProps } from "./export-menu";
 import { type Song, songFileName, songsOf } from "./markers";
 import { noteSpansOf } from "./midi";
@@ -58,11 +60,12 @@ import {
   getDeskCollab,
   getDeskSession,
   getPlayer,
-  loadTakeIntoPlayer,
   publishUiMirror,
+  requestTakeLoad,
   useDeskState,
   usePlayer,
   useServerStatus,
+  useSessionAttribution,
   useTakeComments,
   useTakeMarkers,
   waveformCacheSize,
@@ -86,8 +89,21 @@ function Desk({ sessionId }: { sessionId: string }) {
   useEffect(() => {
     recordRecentSession(sessionId);
   }, [sessionId]);
-  const takeIds = useMemo(() => [...new Set(state.streams.map((s) => s.takeId))], [state.streams]);
-  const serverStatus = useServerStatus(sessionId, takeIds);
+  // Every take this desk can see, live announces first (arrival order),
+  // then the OPFS-rebuilt history, then the active take. Drives the
+  // archive-attribution fetch AND the server-status polling set — rebuilt
+  // takes poll exactly like announced ones (F1/F6).
+  const observedTakeIds = useMemo(() => {
+    const ids: string[] = [];
+    for (const s of state.streams) if (!ids.includes(s.takeId)) ids.push(s.takeId);
+    for (const s of state.deskStatus) if (!ids.includes(s.takeId)) ids.push(s.takeId);
+    if (state.activeTakeId && !ids.includes(state.activeTakeId)) ids.push(state.activeTakeId);
+    return ids;
+  }, [state.streams, state.deskStatus, state.activeTakeId]);
+  // Cold-desk attribution (F1): the archive's stream→peer mapping, take
+  // chronology, and peer identities — what live announces would have held.
+  const attribution = useSessionAttribution(sessionId, observedTakeIds);
+  const serverStatus = useServerStatus(sessionId, observedTakeIds);
   const receiving = useReceiving(state.deskStatus);
   const [zoom, setZoom] = useState(1);
   const [tab, setTab] = useState<RailTab>("performers");
@@ -102,14 +118,19 @@ function Desk({ sessionId }: { sessionId: string }) {
   // Desk MIDI capture (W3-C) — desk-local data lane, never on the wire.
   const deskMidi = useDeskMidi(sessionId);
   const phones = recorders.filter((p) => p.peerId !== deskInput.peerId);
+  // Stream → performer: archive attribution first (covers takes whose
+  // announces this desk never saw — reloads, second desks), live announces
+  // layered over (fresher for the rolling take).
   const peerByStream = useMemo(() => {
-    const map = new Map<string, string>();
+    const map = new Map(attribution.peerByStream);
     for (const s of state.streams) if (s.peerId) map.set(s.streamId, s.peerId);
     return map;
-  }, [state.streams]);
+  }, [attribution, state.streams]);
 
   // Rows: one per performer (falling back to per-stream for rebuilt takes
-  // whose announce we never saw).
+  // the archive couldn't attribute either). Identity resolves from the
+  // live roster first, then the archived peer (F1) — so lanes keep their
+  // nickname/device name after a phone disconnects or a desk reload.
   const rows = useMemo(() => {
     const byKey = new Map<string, TrackRow>();
     const order: string[] = [];
@@ -120,27 +141,30 @@ function Desk({ sessionId }: { sessionId: string }) {
       if (!row) {
         const index = order.length;
         const peer = recorders.find((p) => p.peerId === peerId);
+        const archived = peerId ? attribution.peers.get(peerId) : undefined;
         // Nickname first (A13); fall back to the device-derived name.
-        const nickname = peer?.deviceInfo.label?.trim();
+        const nickname = peer?.deviceInfo.label?.trim() || archived?.label?.trim();
+        const userAgent = peer?.deviceInfo.userAgent ?? archived?.userAgent;
         row = {
           key,
           index,
-          peerId: peer?.peerId ?? null,
+          peerId: peer?.peerId ?? archived?.peerId ?? null,
           name:
             nickname ||
-            (peer
-              ? `${deviceName(peer.deviceInfo.userAgent)} ${index + 1}`
+            (userAgent !== undefined
+              ? `${deviceName(userAgent)} ${index + 1}`
               : `Stream ${index + 1}`),
           color: TRACK_COLORS[index % TRACK_COLORS.length] as string,
           peerInitials:
             initialsOf(nickname) ?? (peerId ?? stream.streamId).slice(0, 2).toUpperCase(),
           // The chip keeps the device provenance even when a nickname rules
           // the lane title ("Maria" · chip "iPhone"; the desk input · "Desk").
-          peerLabel: peer
-            ? peer.peerId === deskInput.peerId
+          peerLabel:
+            peerId && peerId === deskInput.peerId
               ? "Desk"
-              : deviceName(peer.deviceInfo.userAgent)
-            : null,
+              : userAgent !== undefined
+                ? deviceName(userAgent)
+                : null,
           streams: [],
           receiving: false,
           armed: false,
@@ -153,24 +177,35 @@ function Desk({ sessionId }: { sessionId: string }) {
       if (stream.takeId === state.activeTakeId) row.armed = true;
     }
     return order.map((k) => byKey.get(k) as TrackRow);
-  }, [state.deskStatus, peerByStream, recorders, receiving, state.activeTakeId, deskInput.peerId]);
+  }, [
+    state.deskStatus,
+    peerByStream,
+    recorders,
+    attribution,
+    receiving,
+    state.activeTakeId,
+    deskInput.peerId,
+  ]);
 
-  // Takes in CHRONOLOGICAL order with sequential timeline offsets. Stream
-  // announces arrive live (in take order); deskStatus alone is sorted by
-  // take-id bytes, which would shuffle take numbers/placement per session.
-  // Rebuilt-after-reload takes (no announce seen) append in status order.
+  // Takes in CHRONOLOGICAL order with sequential timeline offsets, ordered
+  // by the archive's startedAt (F1): stable across reloads and identical
+  // on every desk — no more "new take draws as Take 1" scrambles. Takes
+  // the archive doesn't know yet (just started, or history while the
+  // server is unreachable) keep observed order after the dated ones —
+  // announces arrive in take order, so the newest stays last.
   const takes = useMemo(() => {
-    const seen: string[] = [];
+    const observed: string[] = [];
     for (const s of state.streams) {
-      if (!seen.includes(s.takeId)) seen.push(s.takeId);
+      if (!observed.includes(s.takeId)) observed.push(s.takeId);
     }
     for (const s of state.deskStatus) {
-      if (!seen.includes(s.takeId)) seen.push(s.takeId);
+      if (!observed.includes(s.takeId)) observed.push(s.takeId);
     }
     const present = new Set(state.deskStatus.map((s) => s.takeId));
-    for (let i = seen.length - 1; i >= 0; i--) {
-      if (!present.has(seen[i] as string)) seen.splice(i, 1);
-    }
+    const seen = orderTakeIds(
+      observed.filter((takeId) => present.has(takeId)),
+      attribution.takeStartedAt,
+    );
     const slots = new Map<string, TakeSlot>();
     let offset = 1; // leading second of lane
     for (const takeId of seen) {
@@ -183,7 +218,7 @@ function Desk({ sessionId }: { sessionId: string }) {
       offset += durationSec + TAKE_GAP_SECONDS;
     }
     return slots;
-  }, [state.streams, state.deskStatus, state.activeTakeId, state.takeStartedAt]);
+  }, [state.streams, state.deskStatus, state.activeTakeId, state.takeStartedAt, attribution]);
 
   const timelineSeconds = Math.max(
     60,
@@ -230,19 +265,39 @@ function Desk({ sessionId }: { sessionId: string }) {
   );
 
   // Load (and, when a chirp was emitted this session, auto-align) the
-  // selected take as soon as it is complete at the desk. Streams map to
-  // mixer lanes by performer (read through a ref: mapping identity churns
-  // every poll and must not re-fire this effect — see selectedStreamKey).
+  // selected take as soon as it is complete at the desk. Loads run through
+  // the latest-wins queue (F5): a pick landing mid-decode is never dropped
+  // — the player converges on the newest selection. Streams map to mixer
+  // lanes by performer (read through a ref: mapping identity churns every
+  // poll and must not re-fire this effect — see selectedStreamKey). Gated
+  // on the attribution fetch settling so a cold desk's first load already
+  // lands on performer lanes instead of streamId-keyed fallback strips.
   const chirped = state.lastChirpAt !== null;
   const peerByStreamRef = useRef(peerByStream);
   peerByStreamRef.current = peerByStream;
   useEffect(() => {
-    if (!selectedTakeId || selectedStreamIds.length === 0 || recording) return;
-    const channelOf = (streamId: string) => peerByStreamRef.current.get(streamId) ?? streamId;
-    void loadTakeIntoPlayer(sessionId, selectedTakeId, selectedStreamIds, channelOf).then((ok) => {
-      if (ok && chirped) void getPlayer().align();
+    if (!selectedTakeId || selectedStreamIds.length === 0 || recording || !attribution.ready) {
+      return;
+    }
+    requestTakeLoad({
+      sessionId,
+      takeId: selectedTakeId,
+      streamIds: selectedStreamIds,
+      channelOf: (streamId) => peerByStreamRef.current.get(streamId) ?? streamId,
+      align: chirped,
     });
-  }, [sessionId, selectedTakeId, selectedStreamIds, recording, chirped]);
+  }, [sessionId, selectedTakeId, selectedStreamIds, recording, chirped, attribution.ready]);
+
+  // Late attribution (F1): if the stream→peer mapping lands AFTER a take
+  // was loaded, re-key its tracks onto the performer lanes so saved strips
+  // and collab mixer sync attach — parameter-only, playback never cuts.
+  const channelMapKey = selectedStreamIds
+    .map((streamId) => peerByStream.get(streamId) ?? streamId)
+    .join(",");
+  // biome-ignore lint/correctness/useExhaustiveDependencies: channelMapKey re-keys loaded tracks when the mapping changes
+  useEffect(() => {
+    getPlayer().remapChannels((streamId) => peerByStreamRef.current.get(streamId) ?? streamId);
+  }, [channelMapKey]);
 
   // Background-decode every completed stream so clips always draw the true
   // waveform, regardless of which take is selected/loaded.
@@ -331,6 +386,13 @@ function Desk({ sessionId }: { sessionId: string }) {
 
   // ---- timeline editing: selection, marquee, clip drag ---------------------
   const [selection, setSelection] = useState<string[]>([]);
+  // Deletion staged behind the confirm dialog (F2): Delete/Backspace only
+  // STAGES refs here; the durable streams-delete fires from the dialog's
+  // explicit confirm. Escape/cancel drops the stage, selection preserved.
+  const [pendingDelete, setPendingDelete] = useState<Array<{
+    takeId: string;
+    streamId: string;
+  }> | null>(null);
   // Clip arrangement lives in the shared doc (W3-A): local drags write
   // through, remote desks' drags land here live. Same updater shape as the
   // useState it replaced.
@@ -385,8 +447,11 @@ function Desk({ sessionId }: { sessionId: string }) {
           ...(slot.live
             ? {}
             : {
-                onPointerDown: (e: React.PointerEvent) =>
-                  onClipPointerDown(e, stream.streamId, stream.takeId),
+                onPointerDown: (e: React.PointerEvent) => onClipPointerDown(e, stream.streamId),
+                // Loading a take is an EXPLICIT action (QA E3): selection
+                // (click/marquee) must not switch what the player has
+                // loaded — double-click does.
+                onDoubleClick: () => setPickedTakeId(stream.takeId),
               }),
         },
       ];
@@ -443,13 +508,14 @@ function Desk({ sessionId }: { sessionId: string }) {
   }, [selectedTakeId, playerLoaded, clipStartOverrides, state.deskStatus, takes, selectedBaseSec]);
 
   /** Clip drag: pressing an unselected clip selects it; dragging moves every
-   * selected clip together. A press without movement is just selection. */
-  function onClipPointerDown(e: React.PointerEvent, streamId: string, takeId: string) {
+   * selected clip together. A press without movement is just selection —
+   * it deliberately does NOT switch the loaded take (QA E3); double-click
+   * is the explicit load action. */
+  function onClipPointerDown(e: React.PointerEvent, streamId: string) {
     if (e.button !== 0) return;
     e.stopPropagation();
     const dragIds = selection.includes(streamId) ? selection : [streamId];
     if (!selection.includes(streamId)) setSelection([streamId]);
-    setPickedTakeId(takeId);
     const originX = e.clientX;
     const startPositions = new Map(
       dragIds.map((id) => {
@@ -505,12 +571,13 @@ function Desk({ sessionId }: { sessionId: string }) {
         return;
       }
       // Marquee select: every non-live clip whose rect intersects.
+      // Selection only — the loaded take never switches as a side effect
+      // (QA E3): double-click a clip to load its take.
       const x1 = ev.clientX - rect.left;
       const y1 = ev.clientY - rect.top;
       const [left, right] = [Math.min(x0, x1), Math.max(x0, x1)];
       const [top, bottom] = [Math.min(y0, y1), Math.max(y0, y1)];
       const hit: string[] = [];
-      let hitTake: string | null = null;
       rowClips.forEach((clips, rowIndex) => {
         const rowTop = RULER_H + rowIndex * TRACK_ROW_H + 4;
         const rowBottom = RULER_H + (rowIndex + 1) * TRACK_ROW_H - 4;
@@ -520,12 +587,10 @@ function Desk({ sessionId }: { sessionId: string }) {
           const clipRight = clipLeft + Math.max(clip.width, 26);
           if (clipLeft < right && clipRight > left && rowTop < bottom && rowBottom > top) {
             hit.push(clip.id);
-            hitTake ??= clip.takeId;
           }
         }
       });
       setSelection(hit);
-      if (hitTake) setPickedTakeId(hitTake);
       setMarquee(null);
     };
     window.addEventListener("pointermove", move);
@@ -533,14 +598,16 @@ function Desk({ sessionId }: { sessionId: string }) {
   }
 
   // Space bar: stop the ongoing recording, otherwise toggle playback.
-  // Delete/Backspace: remove the selected takes' clips (server-authoritative;
-  // every sink drops its copy on the confirm).
+  // Delete/Backspace: STAGE the selected takes' clips for deletion — the
+  // confirm dialog (F2) owns the actual server-authoritative delete.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement;
       if (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable) {
         return;
       }
+      // The confirm dialog owns the keyboard while open (Enter/Escape/trap).
+      if (pendingDelete) return;
       if (e.code === "Space") {
         e.preventDefault();
         if (recording) getDeskSession(sessionId).stopTake();
@@ -567,13 +634,7 @@ function Desk({ sessionId }: { sessionId: string }) {
           .filter((s) => selection.includes(s.streamId) && s.takeId !== state.activeTakeId)
           .map((s) => ({ takeId: s.takeId, streamId: s.streamId }));
         if (refs.length === 0) return;
-        getDeskSession(sessionId).deleteStreams(refs);
-        setSelection([]);
-        setClipStartOverrides((prev) => {
-          const next = { ...prev };
-          for (const ref of refs) delete next[ref.streamId];
-          return next;
-        });
+        setPendingDelete(refs);
       }
     };
     window.addEventListener("keydown", onKey);
@@ -583,11 +644,43 @@ function Desk({ sessionId }: { sessionId: string }) {
     playerLoaded,
     sessionId,
     selection,
+    pendingDelete,
     state.deskStatus,
     state.activeTakeId,
     takeMarkers.addAt,
-    setClipStartOverrides,
   ]);
+
+  /** Confirmed deletion (F2): the existing server-authoritative protocol
+   * path, unchanged — local copies drop only on the streams-deleted
+   * confirm fanout. */
+  function confirmDelete() {
+    if (!pendingDelete) return;
+    getDeskSession(sessionId).deleteStreams(pendingDelete);
+    setSelection([]);
+    setClipStartOverrides((prev) => {
+      const next = { ...prev };
+      for (const ref of pendingDelete) delete next[ref.streamId];
+      return next;
+    });
+    setPendingDelete(null);
+  }
+
+  /** What the staged deletion would destroy, spelled out for the dialog:
+   * clip counts per take, in timeline take order. */
+  const deleteSummary = useMemo((): DeleteSummaryTake[] => {
+    if (!pendingDelete) return [];
+    const order = [...takes.keys()];
+    const counts = new Map<string, number>();
+    for (const ref of pendingDelete) {
+      counts.set(ref.takeId, (counts.get(ref.takeId) ?? 0) + 1);
+    }
+    return [...counts.entries()]
+      .sort(([a], [b]) => order.indexOf(a) - order.indexOf(b))
+      .map(([takeId, clipCount]) => ({
+        name: `Take ${order.indexOf(takeId) + 1}`,
+        clipCount,
+      }));
+  }, [pendingDelete, takes]);
 
   function seekTimeline(sec: number) {
     if (!playerLoaded) return;
@@ -922,6 +1015,15 @@ function Desk({ sessionId }: { sessionId: string }) {
         levelFor={levelFor}
         remoteEditing={remoteEditing}
       />
+
+      {pendingDelete && (
+        <DeleteConfirm
+          takes={deleteSummary}
+          clipCount={pendingDelete.length}
+          onConfirm={confirmDelete}
+          onCancel={() => setPendingDelete(null)}
+        />
+      )}
     </main>
   );
 }

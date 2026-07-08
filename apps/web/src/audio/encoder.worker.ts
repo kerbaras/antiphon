@@ -12,7 +12,8 @@ import {
   RecorderEngine,
   SinkEngine,
 } from "@antiphon/core-wasm";
-import { CaptureRingReader } from "./sab-ring";
+import { withTotalSamples } from "./flac-streaminfo";
+import { CaptureRingReader, decayedPeak } from "./sab-ring";
 import {
   type FromEncoderWorker,
   LOCAL_SINK_ID,
@@ -33,6 +34,9 @@ let localSink: SinkEngine | null = null;
 /** seq → payload bytes, for local .flac export. */
 const localPayloads = new Map<number, Uint8Array>();
 let localCodecHeader: Uint8Array | null = null;
+/** Take sample total, accumulated per retained chunk — patches the export's
+ * STREAMINFO total-samples field at finalize (QA #27). */
+let localTotalSamples = 0;
 let peak = 0;
 /** Take/stream identity retained for METER telemetry frames. */
 let meterIds: { takeId: Uint8Array; streamId: Uint8Array } | null = null;
@@ -65,21 +69,26 @@ function pump() {
     pendingArm = null;
     doArm(queued);
   }
-  if (!ring || !engine) return;
-  // Cap one pump at 2s of audio to bound slab size after long stalls.
+  if (!ring) return;
+  // The ring drains EVERY pump, armed or not (F4). Cap one pump at 2s of
+  // audio to bound slab size after long stalls.
   const slab = ring.read(sampleRate * 2);
   if (slab.length > 0) {
-    let localPeak = 0;
-    for (let i = 0; i < slab.length; i++) {
-      const v = Math.abs(slab[i] as number);
-      if (v > localPeak) localPeak = v;
-    }
-    peak = Math.max(peak * 0.6, localPeak);
-    try {
-      engine.push_samples(slab);
-    } catch (e) {
-      post({ type: "error", message: `encode failed: ${String(e)}` });
-      return;
+    peak = decayedPeak(peak, slab);
+    // Samples reach an encoder only while a take is live (§6.2: the take's
+    // sample domain starts at arm). Un-armed — and between takes, while a
+    // finished engine is still draining its backfill obligations — the read
+    // above IS the idle drain: the ring stays near-empty (so the worklet
+    // never overflows and idle "dropped samples" stays 0), the peak keeps
+    // the VU live for soundcheck, and the samples are DISCARDED — pre-arm
+    // room audio never lands in any take (F4, privacy).
+    if (engine?.state() === "streaming") {
+      try {
+        engine.push_samples(slab);
+      } catch (e) {
+        post({ type: "error", message: `encode failed: ${String(e)}` });
+        return;
+      }
     }
   }
   drainLocal();
@@ -96,11 +105,12 @@ function drainLocal() {
     localSink.ingest(frame, nowUs());
     try {
       const payload = extract_chunk_payload(frame);
-      const meta = JSON.parse(chunk_meta_json(frame)) as { seq: number };
+      const meta = JSON.parse(chunk_meta_json(frame)) as { seq: number; sampleCount: number };
       if (meta.seq === 0) {
         localCodecHeader = extract_codec_header(payload);
-      } else {
+      } else if (!localPayloads.has(meta.seq)) {
         localPayloads.set(meta.seq, payload);
+        localTotalSamples += meta.sampleCount;
       }
     } catch {
       // Non-chunk frames (gap reports) still went into the sink engine.
@@ -149,13 +159,18 @@ function doArm(msg: Extract<ToEncoderWorker, { type: "arm" }>): void {
     engine.free();
     engine = null;
   }
+  // Sample index 0 of the take = the first sample captured AFTER this arm:
+  // discard the (already idle-drained, near-empty) ring remainder and zero
+  // the overflow ledger so per-take diagnostics start clean (F4).
   ring.snapToWrite();
+  ring.resetDropped();
   const epochUs = nowUs();
   retainLocal = msg.retainLocal;
   localSink = retainLocal ? new SinkEngine() : null;
   meterIds = { takeId: msg.takeId.slice(), streamId: msg.streamId.slice() };
   localPayloads.clear();
   localCodecHeader = null;
+  localTotalSamples = 0;
   engine = new RecorderEngine(
     msg.takeId,
     msg.streamId,
@@ -278,12 +293,15 @@ async function handle(msg: ToEncoderWorker) {
         post({ type: "export-result", flac: null });
         return;
       }
+      // Finalize the export's STREAMINFO: the streamed bootstrap says
+      // total-samples unknown; the local file knows better (QA #27).
+      const header = withTotalSamples(localCodecHeader, localTotalSamples);
       const seqs = [...localPayloads.keys()].sort((a, b) => a - b);
-      let total = localCodecHeader.byteLength;
+      let total = header.byteLength;
       for (const s of seqs) total += (localPayloads.get(s) as Uint8Array).byteLength;
       const out = new Uint8Array(total);
-      out.set(localCodecHeader, 0);
-      let off = localCodecHeader.byteLength;
+      out.set(header, 0);
+      let off = header.byteLength;
       for (const s of seqs) {
         const p = localPayloads.get(s) as Uint8Array;
         out.set(p, off);

@@ -57,10 +57,15 @@ export function DeskTopBar({
   }
 
   return (
-    <header className="relative flex items-center justify-between gap-4 border-b border-divider bg-panel px-3.5">
-      <div className="flex min-w-0 items-center gap-3.5">
+    // Left and right groups are equal flex shares (flex-1 basis-0), so at
+    // full width the transport cluster sits dead-center exactly like the
+    // prototype's absolute centering — but when the viewport narrows the
+    // cluster claims its space first (shrink-0) and the session-title block
+    // truncates into its own share instead of running underneath (F15).
+    <header className="flex items-center gap-4 border-b border-divider bg-panel px-3.5">
+      <div className="flex min-w-0 flex-1 items-center gap-3.5">
         <Wordmark />
-        <div className="h-5 w-px bg-edge-btn" />
+        <div className="h-5 w-px shrink-0 bg-edge-btn" />
         <div className="flex min-w-0 flex-col leading-[1.25]">
           <span className="truncate text-[12px] font-semibold text-text-strong">
             Session {sessionId.slice(0, 8)}
@@ -75,7 +80,7 @@ export function DeskTopBar({
       </div>
 
       {/* Centered transport cluster, as in the prototype */}
-      <div className="absolute left-1/2 flex -translate-x-1/2 items-center gap-2.5">
+      <div className="flex shrink-0 items-center gap-2.5">
         {/* Screen readers hear take/transport changes; visually the
             record button + timecode already carry this. */}
         <span aria-live="polite" className="sr-only">
@@ -124,14 +129,16 @@ export function DeskTopBar({
           </TransportButton>
         </TransportGroup>
         <Timecode seconds={recording ? elapsed : playerLoaded ? playerSnap.positionSec : 0} />
-        <div className="flex gap-1.5">
+        {/* Stat chips are the lowest-priority tier: they collapse first so
+            the session title keeps a legible width at narrow widths. */}
+        <div className="hidden gap-1.5 min-[1200px]:flex">
           <InfoChip value="48.0" unit="kHz" />
           <InfoChip value={takeCount} unit={takeCount === 1 ? "take" : "takes"} />
           <InfoChip value={streamCount} unit="str" />
         </div>
       </div>
 
-      <div className="flex items-center gap-3">
+      <div className="flex flex-1 items-center justify-end gap-3">
         <AvatarStack
           people={[
             { id: "you", initials: "DK", color: "#c8c9cb", title: "You (Desk)" },

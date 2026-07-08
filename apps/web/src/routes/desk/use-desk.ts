@@ -14,6 +14,13 @@ import {
 import { DeskSession, type DeskSessionState } from "../../net/desk-session";
 import { ALS_SAMPLES_DIR, type AlsStem, buildAls } from "./als";
 import {
+  archivedStreamMetas,
+  buildAttribution,
+  emptyAttribution,
+  type SessionAttribution,
+  type SessionSummaryPayload,
+} from "./attribution";
+import {
   addComment,
   editCommentText,
   loadComments,
@@ -26,6 +33,7 @@ import {
   type TakeComment,
   unresolveComment,
 } from "./comments";
+import { LoadQueue } from "./load-queue";
 import { logicImportGuide } from "./logic-guide";
 import {
   addMarker,
@@ -157,6 +165,43 @@ export async function loadTakeIntoPlayer(
     if (track.waveform.length > 0) waveformCache.set(track.streamId, track.waveform);
   }
   return ok;
+}
+
+// ---- serialized take loads (F5) ------------------------------------------------
+// The player decodes one take at a time; a pick landing while another load
+// is in flight must not be dropped (it used to strand the transport on the
+// stale take). Loads run through a latest-wins queue: the newest selection
+// always loads eventually, intermediate picks collapse away, and alignment
+// is skipped for a load that is already superseded.
+
+export interface TakeLoadRequest {
+  sessionId: string;
+  takeId: string;
+  streamIds: string[];
+  /** Stream → mixer-lane mapping, resolved at load time (attribution may
+   * land after the request is queued). */
+  channelOf: (streamId: string) => string;
+  /** Auto-align after a successful load (a chirp was emitted). */
+  align: boolean;
+}
+
+const takeLoadQueue = new LoadQueue<TakeLoadRequest>(
+  async (req, superseded) => {
+    const ok = await loadTakeIntoPlayer(req.sessionId, req.takeId, req.streamIds, req.channelOf);
+    if (ok && req.align && !superseded()) await getPlayer().align();
+  },
+  (error, req) => {
+    // Load/align failures surface on the transport error strip — a stuck
+    // selection must never be silent (F5).
+    getPlayer().reportError(
+      `take ${req.takeId.slice(0, 8)} load failed: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  },
+);
+
+/** Load the selected take through the latest-wins queue (F5). */
+export function requestTakeLoad(req: TakeLoadRequest): void {
+  takeLoadQueue.request(req);
 }
 
 // ---- export (W2-A) -----------------------------------------------------------
@@ -497,6 +542,74 @@ export function useDeskState(sessionId: string): DeskSessionState {
   return useSyncExternalStore(subscribe, () => latest ?? getDeskSession(sessionId).snapshot());
 }
 
+// ---- cold-desk attribution (F1) --------------------------------------------------
+// Live stream-announces exist only in the memory of desks present when a
+// take rolled. The server persists the same facts (streams.peerId,
+// takes.startedAt, peers.label/deviceId); this hook fetches them in one
+// round-trip so a reloaded or second desk rebuilds lanes, take ordering,
+// and its polling set. Re-fetches only while a take the archive doesn't
+// know is on screen (a take that just started, or history while the server
+// was unreachable) — one request per new take, then quiet.
+
+export interface AttributionState extends SessionAttribution {
+  /** First fetch attempt finished (either way): safe to load takes — the
+   * best available stream→lane mapping is in hand. */
+  ready: boolean;
+}
+
+const ATTRIBUTION_RETRY_MS = 5_000;
+
+export function useSessionAttribution(
+  sessionId: string,
+  observedTakeIds: readonly string[],
+): AttributionState {
+  const [attribution, setAttribution] = useState<AttributionState>(() => ({
+    ...emptyAttribution(),
+    ready: false,
+  }));
+  const fetchedFor = useRef<string | null>(null);
+  const unknownKey = observedTakeIds
+    .filter((takeId) => !attribution.takeStartedAt.has(takeId))
+    .join(",");
+
+  useEffect(() => {
+    if (fetchedFor.current === sessionId && unknownKey === "") return;
+    let cancelled = false;
+    const fetchAttribution = async () => {
+      try {
+        const res = await fetch(`/api/sessions/${sessionId}`);
+        if (cancelled) return;
+        if (res.ok) {
+          const payload = (await res.json()) as SessionSummaryPayload;
+          if (cancelled) return;
+          fetchedFor.current = sessionId;
+          // Seed the sink with the archive's streams this desk never saw
+          // announced: the worker's HAVE exchange then covers them and the
+          // server backfills our local copy (a cold second desk otherwise
+          // has nothing to reconcile against).
+          getDeskSession(sessionId).seedArchivedStreams(archivedStreamMetas(payload));
+          setAttribution({ ...buildAttribution(payload), ready: true });
+          return;
+        }
+      } catch {
+        // fall through: server away — same handling as a non-OK response
+      }
+      // Server away/erroring: mark ready (loads proceed on the live
+      // fallback) and let the interval retry while unattributed takes
+      // remain on screen.
+      if (!cancelled) setAttribution((prev) => (prev.ready ? prev : { ...prev, ready: true }));
+    };
+    void fetchAttribution();
+    const timer = window.setInterval(fetchAttribution, ATTRIBUTION_RETRY_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [sessionId, unknownKey]);
+
+  return attribution;
+}
+
 // ---- shared take-list plumbing (W3-A) ------------------------------------------
 // Markers and comments read/write through the shared doc (per their W2-B/
 // W2-F persistence boundaries: ONLY load/save is replaced — pure models
@@ -693,7 +806,12 @@ export interface ServerStreamStatus {
   digest: string;
 }
 
-/** Poll the server archive for every take we know about. */
+/** Poll the server archive for every take we know about — but only while
+ * a take is UNSETTLED (F6). A take whose streams all report complete is
+ * terminal server-side (rows are immutable once complete): its statuses
+ * latch and it leaves the polling set, so a long session stops costing
+ * ~1k requests/take/hour. Rebuilt/attributed takes join the set exactly
+ * like announced ones and poll until they settle. */
 export function useServerStatus(
   sessionId: string,
   takeIds: string[],
@@ -701,26 +819,41 @@ export function useServerStatus(
   const [statuses, setStatuses] = useState<Map<string, ServerStreamStatus>>(new Map());
   const takeIdsRef = useRef(takeIds);
   takeIdsRef.current = takeIds;
+  const settledRef = useRef(new Set<string>());
   const takeIdsKey = takeIds.join(",");
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: takeIdsKey re-arms polling when the take set changes
   useEffect(() => {
     let cancelled = false;
     const tick = async () => {
-      const next = new Map<string, ServerStreamStatus>();
-      for (const takeId of takeIdsRef.current) {
+      const pending = takeIdsRef.current.filter((takeId) => !settledRef.current.has(takeId));
+      if (pending.length === 0) return;
+      const updates = new Map<string, ServerStreamStatus>();
+      const settledNow: string[] = [];
+      for (const takeId of pending) {
         try {
           const res = await fetch(`/api/sessions/${sessionId}/takes/${takeId}`);
-          if (!res.ok) continue;
+          if (!res.ok) continue; // not archived yet (or gone): retry next tick
           const body = (await res.json()) as { streams: ServerStreamStatus[] };
-          for (const s of body.streams) next.set(s.streamId, s);
+          for (const s of body.streams) updates.set(s.streamId, s);
+          if (body.streams.length > 0 && body.streams.every((s) => s.complete)) {
+            settledNow.push(takeId);
+          }
         } catch {
           // Silent by design: this poll fires every 2 s — an unreachable
           // server would spam; the UI already shows archive/sync state.
           return; // keep the last view
         }
       }
-      if (!cancelled) setStatuses(next);
+      if (cancelled) return;
+      for (const takeId of settledNow) settledRef.current.add(takeId);
+      if (updates.size > 0) {
+        setStatuses((prev) => {
+          const next = new Map(prev);
+          for (const [streamId, status] of updates) next.set(streamId, status);
+          return next;
+        });
+      }
     };
     void tick();
     const timer = window.setInterval(tick, 2_000);

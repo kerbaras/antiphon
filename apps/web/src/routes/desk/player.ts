@@ -332,6 +332,36 @@ export class TakePlayer {
     }
   }
 
+  /** Surface an out-of-band load failure on the transport error strip
+   * (F5): queue-level errors must not die in a console. Cleared by the
+   * next load attempt like every other player error. */
+  reportError(message: string): void {
+    this.error = message;
+    this.notify();
+  }
+
+  /** Re-key loaded tracks onto (possibly new) mixer lanes (F1): a cold
+   * desk may load a take before the archive attribution lands, mounting
+   * tracks on streamId-keyed fallback strips. Once the stream→peer mapping
+   * arrives this re-points them at their performer lanes WITHOUT a
+   * re-decode or re-schedule — strip state re-applies through node params
+   * (gain/pan/EQ), so playback never cuts. */
+  remapChannels(channelOf: (streamId: string) => string): void {
+    let changed = false;
+    for (const track of this.tracks.values()) {
+      const key = channelOf(track.streamId);
+      if (key === track.channelKey) continue;
+      track.channelKey = key;
+      const strip = this.channel(key);
+      if (this.ctx) updateEqChain(track.eq, strip.eq, this.ctx.currentTime);
+      this.routeTrackEq(track);
+      changed = true;
+    }
+    if (!changed) return;
+    this.applyGains();
+    this.notify();
+  }
+
   /** Chirp correlation per track (RFC §10): the chirp position in each
    * stream maps its sample domain onto the shared room clock. Idempotent
    * unless `force`: auto-align triggers ride on status polls, and both the
@@ -637,7 +667,13 @@ export class TakePlayer {
 
   position(): number {
     if (!this.playing || !this.ctx) return this.startPos;
-    return Math.min(this.duration(), this.startPos + this.ctx.currentTime - this.startCtxTime);
+    // schedule() starts sources 0.06 s in the future; until that pre-roll
+    // elapses no audio has been consumed, so the playhead HOLDS at startPos
+    // instead of regressing below it — pause() would otherwise capture the
+    // regressed value and rapid play/pause cycles walked the position back
+    // up to 60 ms per cycle (QA-2 B2).
+    const elapsed = Math.max(0, this.ctx.currentTime - this.startCtxTime);
+    return Math.min(this.duration(), this.startPos + elapsed);
   }
 
   play(fromSec?: number): void {
@@ -825,8 +861,17 @@ export class TakePlayer {
         this.masterLevel = peak;
       }
       if (this.position() >= this.duration() - 0.02) {
+        // End of take: EXACTLY a user pause on the last frame. startPos
+        // parks at the end (position() clamps to duration) and pause()'s
+        // notify hands the UI the same parked position the engine reports —
+        // Play from here returns to the start through play()'s own
+        // >= duration guard, the transport's one rule for "play from the
+        // end". (A silent startPos = 0 here desynced timecode vs engine —
+        // QA F12.) Return WITHOUT re-arming: pause() stopped the meter
+        // loop, and re-arming would strand a stale raf id that gates the
+        // next startMeterLoop, freezing playhead/meters on the next play.
         this.pause();
-        this.startPos = 0;
+        return;
       }
       // Meters/playhead re-render at ~25 fps — a 60 Hz notify makes the
       // whole desk re-render every frame for no visual gain.

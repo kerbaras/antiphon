@@ -13,10 +13,13 @@
 // the load/save layer changed: the pure model above this line is
 // untouched. Resolve/unresolve/edit replace the array element with the
 // same uuid — simple and convergent at this scale (concurrent edits of the
-// SAME comment can briefly duplicate; adds/removes/edits of different
-// comments merge cleanly). loadComments/saveComments remain as the doc's
-// localStorage SHADOW — seed source, offline display fallback, and cheap
-// insurance on every change.
+// SAME comment can briefly duplicate the stored element; the doc read path
+// dedupes and opportunistically heals — F16, see collab-doc.ts; adds/
+// removes/edits of different comments merge cleanly). loadComments/
+// saveComments remain as the doc's localStorage SHADOW — seed source,
+// offline display fallback, and cheap insurance on every change.
+
+import { dedupeById } from "../../net/collab-doc";
 
 export interface TakeComment {
   /** Stable identity — resolve/edit/delete target, survives re-sorting. */
@@ -165,8 +168,11 @@ export function loadComments(
         (c.resolvedAtMs === null ||
           (typeof c.resolvedAtMs === "number" && Number.isFinite(c.resolvedAtMs))),
     );
+    // Same-id entries (an F16-era shadow snapshot) collapse to the last
+    // occurrence — the same winner rule as the doc read path, and this
+    // list may seed the doc.
     return sortComments(
-      valid.map((c) => ({
+      dedupeById(valid).map((c) => ({
         id: c.id,
         atSec: c.atSec,
         streamId: c.streamId,

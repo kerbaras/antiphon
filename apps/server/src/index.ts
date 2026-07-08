@@ -14,6 +14,7 @@ import { FsBlobStore, S3BlobStore } from "./blob/index.ts";
 import { CollabHub } from "./collab/index.ts";
 import { loadConfig, type ServerConfig } from "./config.ts";
 import { createDb, migrateDb } from "./db/index.ts";
+import { flacContentDisposition } from "./download-name.ts";
 import { createLogger, setLogLevel } from "./logger.ts";
 import { KeyedRateLimiter } from "./ratelimit.ts";
 import type { ConnState } from "./signaling/index.ts";
@@ -157,10 +158,18 @@ export async function createServer(config: ServerConfig = loadConfig()) {
     const allowPartial = c.req.query("partial") === "1";
     const streamId = c.req.param("streamId");
     const result = await archive.reconstructFlac(streamId, allowPartial);
-    if (!result.ok) return c.json({ error: result.reason }, 409);
+    if (!result.ok) {
+      // Honest status split: a stream the archive has never heard of (or
+      // hard-deleted — gone forever) is a 404; a known stream that cannot
+      // honestly be served *yet* (missing header/final/chunks) stays 409.
+      return c.json({ error: result.reason }, result.code === "not-found" ? 404 : 409);
+    }
+    // F14: the disposition header beats the desk's `a.download` in Chromium,
+    // so it must carry the same nickname naming as every other export.
+    const label = await archive.streamLabel(streamId);
     return c.body(result.bytes.buffer as ArrayBuffer, 200, {
       "content-type": "audio/flac",
-      "content-disposition": `attachment; filename="${streamId}.flac"`,
+      "content-disposition": flacContentDisposition(streamId, label),
     });
   });
 

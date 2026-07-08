@@ -338,13 +338,51 @@ export class Archive {
 
   // ---- read side (REST) ---------------------------------------------------
 
+  /** Session snapshot with full attribution (F1): takes in chronological
+   * order each carrying its streams' stream→peer mapping, plus every peer
+   * ever seen (label/deviceId/role) — everything a cold desk needs to
+   * rebuild lanes, take ordering, and its status-polling set in ONE
+   * round-trip. `takes[].id` stays for existing consumers. */
   async sessionSummary(sessionId: string) {
     const takes = await this.db
       .select()
       .from(schema.takes)
       .where(eq(schema.takes.sessionId, sessionId))
-      .orderBy(asc(schema.takes.startedAt));
-    return { sessionId, takes };
+      .orderBy(asc(schema.takes.startedAt), asc(schema.takes.id));
+    const takeIds = takes.map((t) => t.id);
+    const streams = takeIds.length
+      ? await this.db
+          .select({
+            streamId: schema.streams.id,
+            takeId: schema.streams.takeId,
+            peerId: schema.streams.peerId,
+            finalSeq: schema.streams.finalSeq,
+          })
+          .from(schema.streams)
+          .where(inArray(schema.streams.takeId, takeIds))
+      : [];
+    const streamsByTake = new Map<
+      string,
+      Array<{ streamId: string; peerId: string | null; finalSeq: number | null }>
+    >();
+    for (const s of streams) {
+      const list = streamsByTake.get(s.takeId) ?? [];
+      list.push({ streamId: s.streamId, peerId: s.peerId, finalSeq: s.finalSeq });
+      streamsByTake.set(s.takeId, list);
+    }
+    const peers = await this.loadPeers(sessionId);
+    return {
+      sessionId,
+      takes: takes.map((t) => ({ ...t, streams: streamsByTake.get(t.id) ?? [] })),
+      peers: peers.map((p) => ({
+        peerId: p.id,
+        role: p.role,
+        userAgent: p.userAgent,
+        label: p.label,
+        deviceId: p.deviceId,
+        joinedAt: p.joinedAt,
+      })),
+    };
   }
 
   /** Per-stream status for a take, scoped to its owning session: a takeId
@@ -399,30 +437,50 @@ export class Archive {
     return result;
   }
 
+  /** Peer nickname behind a stream (streams.peerId → peers.label) for
+   * human-readable download filenames (F14). Null when the stream has no
+   * peer attribution or the peer never set a label. */
+  async streamLabel(streamId: string): Promise<string | null> {
+    const [row] = await this.db
+      .select({ label: schema.peers.label })
+      .from(schema.streams)
+      .innerJoin(schema.peers, eq(schema.streams.peerId, schema.peers.id))
+      .where(eq(schema.streams.id, streamId));
+    return row?.label ?? null;
+  }
+
   /** Reassemble a playable .flac: seq0 codec header ++ payloads 1..=final.
-   * Refuses when incomplete unless `allowPartial` (never lie about audio). */
+   * Refuses when incomplete unless `allowPartial` (never lie about audio).
+   * Failures are discriminated: "not-found" means the stream row does not
+   * exist (never did, or was hard-deleted — gone forever), "incomplete"
+   * means the stream is known but cannot honestly be served yet. */
   async reconstructFlac(
     streamId: string,
     allowPartial = false,
-  ): Promise<{ ok: true; bytes: Uint8Array } | { ok: false; reason: string }> {
+  ): Promise<
+    | { ok: true; bytes: Uint8Array }
+    | { ok: false; code: "not-found" | "incomplete"; reason: string }
+  > {
     const [stream] = await this.db
       .select()
       .from(schema.streams)
       .where(eq(schema.streams.id, streamId));
-    if (!stream) return { ok: false, reason: "unknown stream" };
+    if (!stream) return { ok: false, code: "not-found", reason: "unknown stream" };
     const rows = await this.db
       .select()
       .from(schema.chunks)
       .where(eq(schema.chunks.streamId, streamId))
       .orderBy(asc(schema.chunks.seq));
     if (rows.length === 0 || rows[0]?.seq !== 0) {
-      return { ok: false, reason: "stream header (seq 0) not held" };
+      return { ok: false, code: "incomplete", reason: "stream header (seq 0) not held" };
     }
     if (!allowPartial) {
-      if (stream.finalSeq === null) return { ok: false, reason: "final seq unknown" };
+      if (stream.finalSeq === null) {
+        return { ok: false, code: "incomplete", reason: "final seq unknown" };
+      }
       const expected = stream.finalSeq + 1;
       if (rows.length !== expected) {
-        return { ok: false, reason: `holds ${rows.length}/${expected} chunks` };
+        return { ok: false, code: "incomplete", reason: `holds ${rows.length}/${expected} chunks` };
       }
     }
     const parts: Uint8Array[] = [];

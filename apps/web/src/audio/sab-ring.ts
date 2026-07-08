@@ -52,6 +52,16 @@ export class CaptureRingReader {
     Atomics.store(this.header, READ_IDX, write);
   }
 
+  /**
+   * Zero the worklet's overflow counter (called on arm: each take starts
+   * with a clean fault ledger, F4). The worklet only `Atomics.add`s this
+   * slot while the ring is FULL — which the idle drain prevents — so a
+   * plain store cannot race away a meaningful count.
+   */
+  resetDropped(): void {
+    Atomics.store(this.header, DROPPED, 0);
+  }
+
   /** Copy up to `max` available samples into a fresh array. */
   read(max: number): Float32Array {
     const n = Math.min(this.available(), max);
@@ -75,4 +85,18 @@ export class CaptureRingReader {
       quantaWritten: Atomics.load(this.header, QUANTA) >>> 0,
     };
   }
+}
+
+/**
+ * VU ballistics shared by the armed and idle drain paths (F4: the meter is
+ * live whenever the mic is, not only while a take rolls): fast attack to
+ * the slab's absolute peak, exponential release at 0.6/pump.
+ */
+export function decayedPeak(previous: number, slab: Float32Array): number {
+  let slabPeak = 0;
+  for (let i = 0; i < slab.length; i++) {
+    const v = Math.abs(slab[i] as number);
+    if (v > slabPeak) slabPeak = v;
+  }
+  return Math.max(previous * 0.6, slabPeak);
 }

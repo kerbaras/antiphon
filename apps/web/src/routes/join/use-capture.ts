@@ -10,6 +10,16 @@ let controller: CaptureController | null = null;
 let latest: CaptureSnapshot | null = null;
 let session: RecorderSession | null = null;
 let sessionState: RecorderSessionState | null = null;
+/** React subscribers to the session store. Registered unconditionally (even
+ * while `session` is null) so a session created AFTER a component mounted
+ * still notifies it — the F10 bug was a memoized no-op unsubscribe that
+ * never re-subscribed once joinSession created the session, leaving
+ * dropout/outage UI frozen. */
+const sessionListeners = new Set<() => void>();
+
+function notifySessionListeners(): void {
+  for (const l of sessionListeners) l();
+}
 /** Last stream-final reported, keyed `takeId:streamId:finalSeq` — a bare
  * seq number would swallow the final of an equal-length follow-up take.
  * A2: stream-final is idempotent (max wins), so err on re-sending. */
@@ -48,10 +58,18 @@ export function joinSession(sessionId: string): RecorderSession {
     session = new RecorderSession(sessionId, getCaptureController());
     session.subscribe((s) => {
       sessionState = s;
+      notifySessionListeners();
     });
     session.start();
   }
   return session;
+}
+
+/** Deliberate re-join after a fatal supersede (F3): the caller restarts the
+ * capture pipeline (user gesture), then this reopens signaling — which
+ * supersedes the tab that superseded us. Honest, explicit semantics. */
+export function takeOverSession(): void {
+  session?.takeOver();
 }
 
 /** Set the performer nickname: persisted locally always; announced to the
@@ -81,9 +99,13 @@ export function useCaptureSnapshot(): CaptureSnapshot {
 }
 
 export function useRecorderSessionState(): RecorderSessionState | null {
+  // Subscribe to the module-level listener set, NOT to the session object:
+  // the set outlives (and predates) the session, so a session created after
+  // mount — joinSession runs from the "enable microphone" click — reaches
+  // every already-mounted component (F10).
   const subscribe = useCallback((onChange: () => void) => {
-    if (!session) return () => {};
-    return session.subscribe(() => onChange());
+    sessionListeners.add(onChange);
+    return () => sessionListeners.delete(onChange);
   }, []);
   return useSyncExternalStore(subscribe, () => sessionState);
 }

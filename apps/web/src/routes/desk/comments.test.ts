@@ -163,6 +163,25 @@ describe("persistence", () => {
     expect(loadComments("s", "t", store)).toEqual([c("good", 5)]);
   });
 
+  it("collapses same-id duplicates (F16-era shadow) to the last occurrence", () => {
+    const store = memStore();
+    store.map.set(
+      commentsKey("s", "t"),
+      JSON.stringify({
+        v: 1,
+        comments: [
+          c("dup", 5, { text: "old text" }),
+          c("solo", 10),
+          c("dup", 5, { text: "new text" }),
+        ],
+      }),
+    );
+    expect(loadComments("s", "t", store)).toEqual([
+      c("dup", 5, { text: "new text" }),
+      c("solo", 10),
+    ]);
+  });
+
   it("survives a throwing store (private mode) by degrading to empty", () => {
     const throwing: Pick<Storage, "getItem" | "setItem"> = {
       getItem: () => {

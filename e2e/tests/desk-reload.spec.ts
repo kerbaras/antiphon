@@ -6,6 +6,13 @@
 // and streams listed, clips visible, take loaded into the player. A NEW
 // take recorded after the reload (through the re-established links) must
 // converge end-to-end exactly like the first.
+//
+// F1 regression coverage (the A1/A2/A3 cold-desk amnesia repro): after the
+// reload the historical take must show a CONVERGED badge (status polling
+// rebuilt from the archive, not stuck "syncing"), sit on a NAMED lane
+// (nickname from persisted peers, not "Stream N"), keep chronological take
+// numbering once a new take lands, leave FLAC downloads enabled — and the
+// lane name must survive the phone disconnecting entirely.
 
 import { expect, test } from "@playwright/test";
 import {
@@ -15,6 +22,7 @@ import {
   expectValidFlac,
   joinAsRecorder,
   recorderState,
+  renamePeerFromDesk,
   serverSessionTakeIds,
   startTake,
   stopTake,
@@ -36,6 +44,13 @@ test.describe("desk reload", () => {
     const phone = await (await browser.newContext()).newPage();
     await joinAsRecorder(phone, sessionId);
     await expect(desk.getByText("1 phone connected")).toBeVisible({ timeout: 15_000 });
+
+    // Nickname the phone (A13): the reloaded desk must rebuild this from
+    // the archive's peers, not from live announces (F1).
+    const phonePeerId = ((await deskState(desk))?.session?.peers ?? []).find(
+      (p) => p.role === "recorder",
+    )?.peerId as string;
+    await renamePeerFromDesk(desk, phonePeerId, "Maria");
 
     // --- take 1: record to convergence -------------------------------------
     const take1 = await startTake(desk);
@@ -78,6 +93,25 @@ test.describe("desk reload", () => {
     await expect(desk.getByRole("button", { name: "Select Take 1" })).toBeVisible({
       timeout: 15_000,
     });
+
+    // F1 (A1): status polling rebuilt from the archive — the historical
+    // clip reaches its CONVERGED badge instead of sticking at "syncing".
+    await expect(
+      desk.locator(`[data-clip="${take1Stream.streamId}"]`).getByText("converged"),
+    ).toBeVisible({ timeout: 20_000 });
+
+    // F1 (A3): the lane carries the persisted nickname, not "Stream N".
+    await expect(desk.getByText("Maria").first()).toBeVisible({ timeout: 15_000 });
+    await expect(desk.getByText(/^Stream \d+$/)).toHaveCount(0);
+
+    // F1 (A1): FLAC downloads are enabled again (convergence known).
+    const exportButton = desk.getByRole("button", { name: "Export ▾" });
+    await expect(exportButton).toBeEnabled({ timeout: 20_000 });
+    await exportButton.click();
+    await expect(desk.getByRole("menuitem", { name: /source streams/i })).toBeEnabled();
+    await desk
+      .getByRole("button", { name: "Close export menu" })
+      .click({ position: { x: 5, y: 5 } });
     await expect
       .poll(
         async () =>
@@ -123,13 +157,37 @@ test.describe("desk reload", () => {
       await expectValidFlac(desk, stream.streamId);
     }
 
+    // F1 (A2): chronological, stable numbering — the NEW take draws as
+    // "Take 2" after the rebuilt "Take 1", never the other way around.
+    await expect(desk.locator(`[data-clip="${take1Stream.streamId}"]`)).toHaveAttribute(
+      "aria-label",
+      "Select Take 1",
+      { timeout: 15_000 },
+    );
+    await expect(
+      desk.locator(`[data-clip="${(converged2.deskStreams[0] as DeskStreamStatus).streamId}"]`),
+    ).toHaveAttribute("aria-label", "Select Take 2");
+
     // Take 1 was untouched by the whole excursion.
     const finalTake1 = await expectTakeConverged(desk, sessionId, take1, 1, {
       timeoutMs: 15_000,
     });
     expect((finalTake1.deskStreams[0] as DeskStreamStatus).digest).toBe(take1Stream.digest);
 
+    // F1 (A3, disconnect flavor): the phone leaving must not cost the lane
+    // its name — identity persists in the archive's peers.
     await phone.close();
+    await expect
+      .poll(
+        async () =>
+          ((await deskState(desk))?.session?.peers ?? []).filter((p) => p.role === "recorder")
+            .length,
+        { timeout: 20_000 },
+      )
+      .toBe(0);
+    await expect(desk.getByText("Maria").first()).toBeVisible();
+    await expect(desk.getByText(/^Stream \d+$/)).toHaveCount(0);
+
     await desk.close();
   });
 });

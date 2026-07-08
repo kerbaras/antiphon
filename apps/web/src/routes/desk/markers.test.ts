@@ -161,6 +161,21 @@ describe("persistence", () => {
     expect(loadMarkers("s", "t", store)).toEqual([{ id: "good", name: "good", atSec: 5 }]);
   });
 
+  it("collapses same-id duplicates (F16-era shadow) to the last occurrence", () => {
+    const store = memStore();
+    store.map.set(
+      markersKey("s", "t"),
+      JSON.stringify({
+        v: 1,
+        markers: [m("dup", 5, "old name"), m("solo", 10), m("dup", 5, "new name")],
+      }),
+    );
+    expect(loadMarkers("s", "t", store)).toEqual([
+      { id: "dup", name: "new name", atSec: 5 },
+      { id: "solo", name: "solo", atSec: 10 },
+    ]);
+  });
+
   it("survives a throwing store (private mode) by degrading to empty", () => {
     const throwing: Pick<Storage, "getItem" | "setItem"> = {
       getItem: () => {

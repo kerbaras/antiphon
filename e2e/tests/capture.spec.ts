@@ -19,10 +19,11 @@ interface HookSnapshot {
     samplesIn: number;
     gaps: Array<[number, number]>;
   } | null;
-  ring: { droppedSamples: number; capacity: number } | null;
+  ring: { depth: number; droppedSamples: number; capacity: number } | null;
   peak: number;
   localChunks: number;
   finalSeq: number | null;
+  error: string | null;
 }
 
 declare global {
@@ -33,6 +34,21 @@ declare global {
 
 function snapshot(page: import("@playwright/test").Page): Promise<HookSnapshot | null> {
   return page.evaluate(() => window.__antiphon?.snapshot() ?? null);
+}
+
+/** Independent STREAMINFO reader (spec, not implementation): fLaC(4) +
+ * metadata block header(4) + 34-byte STREAMINFO body. */
+function parseStreamInfo(bytes: number[]): { sampleRate: number; totalSamples: number } {
+  expect(String.fromCharCode(...bytes.slice(0, 4))).toBe("fLaC");
+  const body = (i: number) => bytes[8 + i] as number;
+  const sampleRate = (body(10) << 12) | (body(11) << 4) | (body(12) >> 4);
+  const totalSamples =
+    (body(13) & 0x0f) * 2 ** 32 +
+    body(14) * 2 ** 24 +
+    body(15) * 2 ** 16 +
+    body(16) * 2 ** 8 +
+    body(17);
+  return { sampleRate, totalSamples };
 }
 
 test.describe("capture path", () => {
@@ -90,6 +106,71 @@ test.describe("capture path", () => {
     expect(bytes[42]).toBe(0xff); // first FLAC frame sync byte
     expect((bytes[43] as number) & 0xfc).toBe(0xf8);
     expect(total).toBeGreaterThan(1_000);
+  });
+
+  // F4 regression: the capture ring drains (and meters) while UN-armed too.
+  // Pre-fix, an idle pipeline filled the ring (100%, "dropped samples"
+  // climbing at 48k/s) with the VU dead until arm — and pre-arm room audio
+  // risked landing in the take head (privacy). The take's sample domain
+  // must start at the arm point, byte-verifiable in the exported FLAC.
+  test("idle pipeline: VU live, zero drops, and no pre-arm audio in the take", async ({ page }) => {
+    test.setTimeout(90_000);
+    await page.goto("/rehearse");
+    await page.getByRole("button", { name: /enable microphone/i }).click();
+    await expect(page.getByRole("button", { name: /record/i })).toBeVisible();
+
+    // 5s+ idle soundcheck window before anything arms.
+    await page.waitForTimeout(5_000);
+    const idle = await snapshot(page);
+    const rate = idle?.contextSampleRate ?? 48_000;
+    expect(idle?.stats, "nothing armed while idle").toBeNull();
+    expect(idle?.ring?.droppedSamples, "idle drops stay 0").toBe(0);
+    expect(idle?.ring?.depth, "ring stays near-empty").toBeLessThan(rate);
+    // The VU is live pre-arm (soundcheck): the fake mic sings.
+    await expect
+      .poll(async () => (await snapshot(page))?.peak ?? 0, { timeout: 10_000 })
+      .toBeGreaterThan(0.01);
+
+    // Record ~2s, stop.
+    await page.getByRole("button", { name: /record/i }).click();
+    await expect.poll(async () => (await snapshot(page))?.stats?.state).toBe("streaming");
+    await page.waitForTimeout(2_000);
+    await page.getByRole("button", { name: /stop/i }).click();
+    await expect.poll(async () => (await snapshot(page))?.stats?.state).toBe("closed");
+
+    // The take contains ONLY post-arm audio: ~2s, not 2s + the idle backlog.
+    const after = await snapshot(page);
+    expect(after?.stats?.samplesIn).toBeGreaterThan(rate * 1.5);
+    expect(after?.stats?.samplesIn).toBeLessThan(rate * 3.5);
+    expect(after?.ring?.droppedSamples, "per-take drop ledger clean").toBe(0);
+
+    // The exported FLAC agrees end-to-end. STREAMINFO total-samples is
+    // finalized on export (QA #27), so the duration is byte-verifiable.
+    const head = await page.evaluate(async () => {
+      const hook = (
+        window as unknown as {
+          __antiphon: { controller: { exportLocalFlac(): Promise<ArrayBuffer | null> } };
+        }
+      ).__antiphon;
+      const buf = await hook.controller.exportLocalFlac();
+      return buf ? Array.from(new Uint8Array(buf.slice(0, 42))) : null;
+    });
+    expect(head).not.toBeNull();
+    const streamInfo = parseStreamInfo(head as number[]);
+    expect(streamInfo.sampleRate).toBe(rate);
+    expect(streamInfo.totalSamples).toBe(after?.stats?.samplesIn);
+    expect(streamInfo.totalSamples / streamInfo.sampleRate).toBeGreaterThan(1.5);
+    expect(streamInfo.totalSamples / streamInfo.sampleRate).toBeLessThan(3.5);
+
+    // Post-take idle: the drain resumes — no drops, no "finished encoder"
+    // error spam, VU still alive between takes.
+    await page.waitForTimeout(3_000);
+    const idleAgain = await snapshot(page);
+    expect(idleAgain?.ring?.droppedSamples).toBe(0);
+    expect(idleAgain?.error ?? null).toBeNull();
+    await expect
+      .poll(async () => (await snapshot(page))?.peak ?? 0, { timeout: 10_000 })
+      .toBeGreaterThan(0.01);
   });
 
   test("take state machine survives a second take on the same page", async ({ page }) => {

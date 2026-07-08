@@ -15,6 +15,8 @@
 // (offline single-desk parity), and cheap offline insurance on every
 // change.
 
+import { dedupeById } from "../../net/collab-doc";
+
 export interface Marker {
   /** Stable identity — rename/delete target, survives re-sorting. */
   id: string;
@@ -154,7 +156,10 @@ export function loadMarkers(
         Number.isFinite(m.atSec) &&
         m.atSec >= 0,
     );
-    return sortMarkers(valid.map((m) => ({ id: m.id, name: m.name, atSec: m.atSec })));
+    // Same-id entries (an F16-era shadow snapshot) collapse to the last
+    // occurrence — the same winner rule as the doc read path, and this
+    // list may seed the doc.
+    return sortMarkers(dedupeById(valid).map((m) => ({ id: m.id, name: m.name, atSec: m.atSec })));
   } catch {
     return [];
   }

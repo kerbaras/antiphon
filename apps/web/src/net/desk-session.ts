@@ -13,13 +13,15 @@ import {
 } from "@antiphon/protocol";
 import type { DeskStreamStatus, FromSinkWorker, ToSinkWorker } from "../audio/sink-worker-protocol";
 import { offerChannel, RTC_CONFIG, wireIce } from "./rtc";
-import { SignalingClient } from "./signaling-client";
+import { type FatalSignalingError, SignalingClient } from "./signaling-client";
 
 const ACK_INTERVAL_MS = 2_000;
 const HAVE_INTERVAL_MS = 5_000;
 const STATUS_INTERVAL_MS = 1_000;
 const RECONNECT_DELAY_MS = 2_000;
 const HIGH_WATERMARK = 1 << 20;
+/** Error-strip hygiene (F3): non-fatal errors self-expire. */
+const ERROR_TTL_MS = 30_000;
 
 export interface StreamMeta {
   takeId: string;
@@ -39,7 +41,12 @@ export interface DeskSessionState {
   deskStatus: DeskStreamStatus[];
   rebuiltChunks: number;
   lastChirpAt: number | null;
+  /** Transient, non-fatal errors: each dismissible and self-expiring (F3). */
   errors: string[];
+  /** Terminal control-plane halt (F3), e.g. this desk's device identity
+   * reconnected in another tab (A12 supersede). Signaling reconnect is
+   * stopped for good; the UI should render a terminal state, not a banner. */
+  fatal: FatalSignalingError | null;
   /** Live capture peaks per stream (METER telemetry): value + received-at. */
   liveLevels: Record<string, { peak: number; at: number }>;
   /** Lanes (peer ids) the desk disarmed: they sit out the next take. */
@@ -74,6 +81,7 @@ export class DeskSession {
     rebuiltChunks: 0,
     lastChirpAt: null,
     errors: [],
+    fatal: null,
     liveLevels: {},
     disarmedPeers: [],
   };
@@ -116,6 +124,9 @@ export class DeskSession {
         signalingConnected: this.signaling.state.connected,
         peerId: this.signaling.state.peerId,
         session: this.signaling.state.session,
+        // Fatal halt (F3): the SignalingClient stopped reconnecting; the
+        // desk surfaces the terminal state instead of a permanent banner.
+        fatal: this.signaling.state.fatal,
       });
       if (this.signaling.state.connected) this.ensureServerSync();
     });
@@ -211,18 +222,80 @@ export class DeskSession {
   deleteStreams(refs: Array<{ takeId: string; streamId: string }>): void {
     if (refs.length === 0) return;
     if (!this.signaling.state.connected) {
-      this.patch({
-        errors: [...this.state.errors.slice(-4), "delete failed: signaling offline"],
-      });
+      this.pushError("delete failed: signaling offline");
       return;
     }
     this.signaling.send({ v: 1, type: "streams-delete", streams: refs });
+  }
+
+  /** Push a transient error to the strip: capped, self-expiring (F3). */
+  private pushError(message: string): void {
+    this.patch({ errors: [...this.state.errors.slice(-4), message] });
+    window.setTimeout(() => {
+      const index = this.state.errors.indexOf(message);
+      if (index !== -1) this.dismissError(index);
+    }, ERROR_TTL_MS);
+  }
+
+  /** Dismiss affordance for the error strip (F3): drop one entry now. */
+  dismissError(index: number): void {
+    this.patch({ errors: this.state.errors.filter((_, i) => i !== index) });
   }
 
   /** Fires with the stream ids removed after a server-confirmed deletion. */
   onStreamsDeleted(listener: (streamIds: string[]) => void): () => void {
     this.deletedListeners.add(listener);
     return () => this.deletedListeners.delete(listener);
+  }
+
+  /** Seed streams the ARCHIVE knows but this desk never saw announced
+   * (F1 — cold desk/reload): registers each with the sink worker
+   * (set-final), so the HAVE exchange covers it and the server backfills
+   * our copy, and records the announce-equivalent metadata so attribution
+   * and take ordering see it. Idempotent per stream; live announces for
+   * the same stream win (they arrive first by construction). */
+  seedArchivedStreams(
+    metas: Array<{
+      takeId: string;
+      streamId: string;
+      peerId: string | null;
+      finalSeq: number | null;
+    }>,
+  ): void {
+    const added: StreamMeta[] = [];
+    let finalized = false;
+    for (const meta of metas) {
+      const known = this.state.streams.find((s) => s.streamId === meta.streamId);
+      if (known && known.finalSeq !== null) continue; // fully known already
+      if (meta.finalSeq !== null) {
+        this.post({
+          type: "set-final",
+          takeId: meta.takeId,
+          streamId: meta.streamId,
+          finalSeq: meta.finalSeq,
+        });
+        if (known) finalized = true;
+      }
+      if (!known) added.push({ ...meta });
+    }
+    if (added.length > 0 || finalized) {
+      const seededFinal = new Map(
+        metas.filter((m) => m.finalSeq !== null).map((m) => [m.streamId, m.finalSeq]),
+      );
+      this.patch({
+        streams: [
+          ...this.state.streams.map((s) =>
+            s.finalSeq === null && seededFinal.has(s.streamId)
+              ? { ...s, finalSeq: seededFinal.get(s.streamId) as number }
+              : s,
+          ),
+          ...added,
+        ],
+      });
+      // Reconcile immediately: announce our HAVEs (now covering the seeded
+      // streams) so the server can start pushing the missing chunks.
+      this.exchangeHaves();
+    }
   }
 
   /** Reassemble a stream's playable FLAC from the desk's own OPFS store. */
@@ -336,7 +409,10 @@ export class DeskSession {
         break;
       }
       case "error":
-        this.patch({ errors: [...this.state.errors.slice(-4), `${msg.code}: ${msg.message}`] });
+        // Fatal errors are terminal state (state.fatal via onState), not
+        // strip noise — the old permanent "superseded" banner (F3).
+        if (msg.fatal) break;
+        this.pushError(`${msg.code}: ${msg.message}`);
         break;
       default:
         break;
@@ -563,7 +639,7 @@ export class DeskSession {
         this.patch({ deskStatus: msg.streams });
         break;
       case "error":
-        this.patch({ errors: [...this.state.errors.slice(-4), msg.message] });
+        this.pushError(msg.message);
         break;
     }
   }

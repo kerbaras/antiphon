@@ -8,7 +8,7 @@ import type { CaptureController, SinkPort } from "../audio/capture-controller";
 import { uuidToBytes } from "../audio/capture-controller";
 import { getNickname, setNickname } from "./device-identity";
 import { offerChannel } from "./rtc";
-import { SignalingClient } from "./signaling-client";
+import { type FatalSignalingError, SignalingClient } from "./signaling-client";
 
 export const SINK_SERVER = 0;
 export const SINK_DESK = 1;
@@ -51,6 +51,10 @@ export interface RecorderSessionState {
   outageUntil: number | null;
   /** A take is rolling but the desk disarmed this lane — we sit it out. */
   sittingOut: boolean;
+  /** Terminal control-plane halt (F3): superseded / session-deleted / caps.
+   * Capture is stopped and every transport is down; the only exit is a
+   * deliberate takeOver() (or leaving the page). */
+  fatal: FatalSignalingError | null;
 }
 
 type Listener = (state: RecorderSessionState) => void;
@@ -67,6 +71,8 @@ export class RecorderSession {
   private streamId: string | null = null;
   private sittingOutTakeId: string | null = null;
   private stoppedForFinal: { takeId: string; streamId: string } | null = null;
+  /** Latch so the fatal teardown runs once per halt (state fires often). */
+  private fatalHandled = false;
 
   constructor(sessionId: string, controller: CaptureController, identity?: RecorderIdentity) {
     this.controller = controller;
@@ -82,6 +88,10 @@ export class RecorderSession {
   start(): void {
     this.signaling.onMessage((msg) => this.onSignal(msg));
     this.signaling.onState(() => {
+      if (this.signaling.state.fatal && !this.fatalHandled) {
+        this.fatalHandled = true;
+        this.haltForFatal();
+      }
       if (this.signaling.state.connected) this.ensureLinks();
       this.publish();
     });
@@ -118,7 +128,37 @@ export class RecorderSession {
       streamId: this.streamId,
       outageUntil: this.outageUntil,
       sittingOut: this.sittingOutTakeId !== null,
+      fatal: this.signaling.state.fatal,
     };
+  }
+
+  /** Fatal control error (F3): this connection is terminally dead — most
+   * likely our own deviceId reconnected in another tab (A12 supersede).
+   * STOP everything: no reconnect (the SignalingClient already halted), no
+   * data-plane trickle from still-open channels, and no hot mic in a tab
+   * that can no longer deliver audio anywhere — release it (and the wake
+   * lock) so the successor tab can grab the hardware. */
+  private haltForFatal(): void {
+    this.activeTakeId = null;
+    this.streamId = null;
+    this.sittingOutTakeId = null;
+    this.stoppedForFinal = null;
+    for (const link of this.links.values()) this.teardownLink(link);
+    // Links are rebuilt (and their sinks re-attached to the fresh worker)
+    // from scratch on takeOver(); stale entries would skip attachSink.
+    this.links.clear();
+    void this.controller.teardown();
+  }
+
+  /** Deliberate re-join after a fatal supersede ("Take over in this tab"):
+   * reopens signaling under the same device identity, which supersedes the
+   * OTHER tab — exactly what the user asked for. The caller must restart
+   * the capture pipeline first (mic re-acquisition needs the user gesture). */
+  takeOver(): void {
+    if (!this.signaling.state.fatal) return;
+    this.fatalHandled = false;
+    this.signaling.reopen();
+    this.publish();
   }
 
   /** Rename ourselves (A13): persist locally, carry on future hellos, and

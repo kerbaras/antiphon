@@ -305,6 +305,9 @@ export interface ClipModel {
   selected?: boolean;
   /** Press = select; press-and-drag = move every selected clip. */
   onPointerDown?: (e: React.PointerEvent) => void;
+  /** Double-click = the EXPLICIT load-this-take action (selection alone
+   * never switches the loaded take — QA E3). */
+  onDoubleClick?: (e: React.MouseEvent) => void;
 }
 
 /** Peak-preserving resample of a waveform to `n` bars. */
@@ -341,6 +344,7 @@ export function ClipCard({ clip }: { clip: ClipModel }) {
       aria-label={`Select ${clip.name}`}
       data-clip={clip.id}
       onPointerDown={clip.onPointerDown}
+      onDoubleClick={clip.onDoubleClick}
       className={cx(
         "absolute inset-y-1 overflow-hidden rounded-[5px] border p-0 text-left",
         clip.onPointerDown ? "cursor-grab active:cursor-grabbing" : "cursor-default",
@@ -495,7 +499,8 @@ export function TrackMiniButton({
 // ---- mixer -----------------------------------------------------------------
 
 /** Pan knob: drag horizontally (or vertically) to place the mono source in
- * the stereo field; double-click recenters. The tick rotates ±135°. */
+ * the stereo field; arrows step 0.05 (Right/Up pan right — the drag axes),
+ * Home/End hit the rails, double-click recenters. The tick rotates ±135°. */
 export function PanKnob({
   pan = 0,
   onPan,
@@ -505,6 +510,7 @@ export function PanKnob({
   onPan?: (pan: number) => void;
   label?: string;
 }) {
+  const snap = (v: number) => Math.round(Math.max(-1, Math.min(1, v)) * 20) / 20;
   function startDrag(downEvent: React.PointerEvent<HTMLDivElement>) {
     if (!onPan) return;
     downEvent.preventDefault();
@@ -513,7 +519,7 @@ export function PanKnob({
     const startPan = pan;
     const move = (e: PointerEvent) => {
       const delta = (e.clientX - startX - (e.clientY - startY)) / 60;
-      onPan(Math.round(Math.max(-1, Math.min(1, startPan + delta)) * 20) / 20);
+      onPan(snap(startPan + delta));
     };
     const up = () => {
       window.removeEventListener("pointermove", move);
@@ -521,6 +527,22 @@ export function PanKnob({
     };
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", up);
+  }
+  function onKeyDown(e: React.KeyboardEvent<HTMLDivElement>) {
+    if (!onPan) return;
+    const next =
+      e.key === "ArrowUp" || e.key === "ArrowRight"
+        ? snap(pan + 0.05)
+        : e.key === "ArrowDown" || e.key === "ArrowLeft"
+          ? snap(pan - 0.05)
+          : e.key === "Home"
+            ? -1
+            : e.key === "End"
+              ? 1
+              : null;
+    if (next === null) return;
+    e.preventDefault();
+    onPan(next);
   }
   const readout =
     pan === 0 ? "C" : pan < 0 ? `L${Math.round(-pan * 100)}` : `R${Math.round(pan * 100)}`;
@@ -536,6 +558,7 @@ export function PanKnob({
       title={`Pan ${readout} — drag to move, double-click to center`}
       onPointerDown={startDrag}
       onDoubleClick={() => onPan?.(0)}
+      onKeyDown={onKeyDown}
       className="relative size-6 cursor-ew-resize touch-none rounded-full border border-edge-strong bg-edge"
     >
       <div className="absolute inset-0" style={{ transform: `rotate(${pan * 135}deg)` }}>
@@ -756,7 +779,17 @@ function faderPosToDb(pos: number): number {
   return FADER_MAX_DB - pos * (FADER_MAX_DB - FADER_MIN_DB);
 }
 
-/** Draggable gain fader. Without `onChange` it renders inert. */
+/** Fader readout: the bottom rail is −∞ (mirrored by the strip's visible
+ * dB text and the fader's aria-valuetext — aria-valuenow alone can't say
+ * "off"). */
+function formatFaderDb(db: number): string {
+  return db <= FADER_MIN_DB ? "−∞ dB" : `${db.toFixed(1)} dB`;
+}
+
+/** Draggable gain fader. Without `onChange` it renders inert. Pointer:
+ * click/drag jumps the cap to the pointer; double-click resets to 0 dB.
+ * Keyboard (the EQ knobs' conventions): arrows step 0.5 dB, Home/End hit
+ * the −∞/+6 rails. */
 export function Fader({
   db = 0,
   onChange,
@@ -769,6 +802,10 @@ export function Fader({
   const position = Math.max(0, Math.min(1, dbToFaderPos(db)));
   function startDrag(downEvent: React.PointerEvent<HTMLDivElement>) {
     if (!onChange) return;
+    // Second press of a double-click: don't jump-to-click — the dblclick
+    // handler is about to reset to 0 dB (pre-F13 the jump applied twice
+    // and a "reset" parked the fader wherever the pointer sat).
+    if (downEvent.detail > 1) return;
     const track = downEvent.currentTarget;
     const rect = track.getBoundingClientRect();
     const usable = rect.height - 11;
@@ -784,6 +821,23 @@ export function Fader({
     };
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", up);
+  }
+  function onKeyDown(e: React.KeyboardEvent<HTMLDivElement>) {
+    if (!onChange) return;
+    const clamp = (v: number) => Math.max(FADER_MIN_DB, Math.min(FADER_MAX_DB, v));
+    const next =
+      e.key === "ArrowUp" || e.key === "ArrowRight"
+        ? clamp(db + 0.5)
+        : e.key === "ArrowDown" || e.key === "ArrowLeft"
+          ? clamp(db - 0.5)
+          : e.key === "Home"
+            ? FADER_MIN_DB
+            : e.key === "End"
+              ? FADER_MAX_DB
+              : null;
+    if (next === null) return;
+    e.preventDefault();
+    onChange(next);
   }
   if (!onChange) {
     return (
@@ -804,12 +858,16 @@ export function Fader({
     <div
       className="relative w-[5px] cursor-ns-resize rounded-[3px] bg-well"
       onPointerDown={startDrag}
+      onDoubleClick={() => onChange(0)}
+      onKeyDown={onKeyDown}
       role="slider"
       aria-label={label}
-      aria-valuenow={Math.round(db)}
+      aria-valuenow={db}
       aria-valuemin={FADER_MIN_DB}
       aria-valuemax={FADER_MAX_DB}
+      aria-valuetext={formatFaderDb(db)}
       tabIndex={0}
+      title={`Gain ${formatFaderDb(db)} — drag to set, double-click for 0 dB`}
     >
       <div
         className="pointer-events-none absolute -left-2 h-[11px] w-[21px] rounded-[3px] border border-divider shadow-[0_1px_3px_rgba(0,0,0,.6)]"
@@ -869,8 +927,7 @@ export function MixerStrip({
   dbText,
   remoteEditor,
 }: MixerStripProps) {
-  const db =
-    dbText ?? (onGainDb ? (gainDb <= FADER_MIN_DB ? "−∞ dB" : `${gainDb.toFixed(1)} dB`) : "—");
+  const db = dbText ?? (onGainDb ? formatFaderDb(gainDb) : "—");
   return (
     <div
       className={cx(

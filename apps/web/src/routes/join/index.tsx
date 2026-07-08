@@ -19,10 +19,12 @@ import {
   VUMeter,
   Wordmark,
 } from "../../ui/kit";
+import { formatClock } from "./timecode";
 import {
   getCaptureController,
   joinSession,
   renameSelf,
+  takeOverSession,
   useCaptureSnapshot,
   useRecorderSessionState,
 } from "./use-capture";
@@ -74,6 +76,63 @@ export function JoinRoute() {
     URL.revokeObjectURL(url);
   }
 
+  async function takeOver() {
+    setBusy(true);
+    try {
+      // Deliberate supersede-back: re-acquire the mic (this click is the
+      // required user gesture), then reopen signaling under our identity —
+      // the other tab gets the fatal this tab just lived through.
+      await getCaptureController().start();
+      takeOverSession();
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  // Terminal state (F3): a fatal control error killed this connection for
+  // good. No reconnect loop is running, capture is stopped, the mic is
+  // released. Render the fact, not a transient error strip.
+  if (sessionState?.fatal) {
+    const fatal = sessionState.fatal;
+    const superseded = fatal.code === "superseded";
+    return (
+      <main className="mx-auto flex min-h-dvh max-w-md flex-col gap-3 p-4 pb-10">
+        <header className="flex items-center justify-between border-b border-divider pb-3">
+          <Wordmark />
+          <div className="flex flex-col items-end leading-tight">
+            <span className="text-[10px] text-text-dim">session</span>
+            <span className="font-mono text-[10px] text-text-mute">
+              {uuid ? `${uuid.slice(0, 8)}…` : "no session"}
+            </span>
+          </div>
+        </header>
+        <Panel className="p-4">
+          <div className="flex items-center justify-between">
+            <SectionLabel>Session</SectionLabel>
+            <StatusPill tone="warn">disconnected</StatusPill>
+          </div>
+          <p role="alert" className="mt-3 text-[13px] leading-relaxed text-text-body">
+            {superseded
+              ? "This device reconnected in another tab — this tab has been disconnected."
+              : fatal.message}
+          </p>
+          <MonoReadout className="mt-3" label="reason" value={fatal.code} />
+          <MonoReadout label="microphone" value="released" />
+          {superseded && (
+            <>
+              <Button variant="accent" className="mt-4 w-full" onClick={takeOver} disabled={busy}>
+                {busy ? "Taking over…" : "Take over in this tab"}
+              </Button>
+              <p className="mt-2 text-[10px] leading-relaxed text-text-faint">
+                Taking over re-joins the session from this tab — and disconnects the other one.
+              </p>
+            </>
+          )}
+        </Panel>
+      </main>
+    );
+  }
+
   return (
     <main className="mx-auto flex min-h-dvh max-w-md flex-col gap-3 p-4 pb-10">
       <header className="flex items-center justify-between border-b border-divider pb-3">
@@ -85,6 +144,9 @@ export function JoinRoute() {
           </span>
         </div>
       </header>
+
+      {/* Non-fatal errors: dismissible, self-expiring (F3 strip hygiene) */}
+      <TransientError message={snap.error} />
 
       {/* Performer identity: the name the desk sees on this lane */}
       <PerformerPanel deskLabel={sessionState?.label ?? null} />
@@ -150,7 +212,6 @@ export function JoinRoute() {
             <Button variant="accent" onClick={enableMic} disabled={busy}>
               {busy ? "Requesting microphone…" : "Enable microphone"}
             </Button>
-            {snap.error && <p className="font-mono text-[10px] text-rec">{snap.error}</p>}
           </div>
         ) : (
           <div className="mt-3 flex flex-col gap-2">
@@ -416,12 +477,39 @@ function FlagBadge({ label, value }: { label: string; value: boolean | string | 
   );
 }
 
-function formatClock(seconds: number): string {
-  const mm = Math.floor(seconds / 60);
-  const ss = Math.floor(seconds % 60);
-  const cs = Math.floor((seconds % 1) * 100);
-  const pad = (n: number) => String(n).padStart(2, "0");
-  return `${pad(mm)}:${pad(ss)}:${pad(cs)}`;
+/** Transient (non-fatal) error surface with strip hygiene (F3 fold): a
+ * dismiss affordance and a 30s auto-expiry. A new message resets both.
+ * Fatal conditions never render here — they get the terminal panel. */
+const ERROR_TTL_MS = 30_000;
+
+function TransientError({ message }: { message: string | null }) {
+  const [dismissed, setDismissed] = useState<string | null>(null);
+  const [expired, setExpired] = useState(false);
+
+  useEffect(() => {
+    setExpired(false);
+    if (message === null) return;
+    const timer = window.setTimeout(() => setExpired(true), ERROR_TTL_MS);
+    return () => window.clearTimeout(timer);
+  }, [message]);
+
+  if (message === null || expired || dismissed === message) return null;
+  return (
+    <div
+      role="status"
+      className="flex items-center justify-between gap-2 rounded-md border border-rec/40 bg-rec/10 px-3 py-2"
+    >
+      <span className="min-w-0 truncate font-mono text-[10px] text-rec">{message}</span>
+      <button
+        type="button"
+        aria-label="Dismiss error"
+        onClick={() => setDismissed(message)}
+        className="flex-none font-mono text-[12px] leading-none text-rec hover:brightness-125"
+      >
+        ×
+      </button>
+    </div>
+  );
 }
 
 function formatBytes(bytes: number): string {
