@@ -1,0 +1,36 @@
+#!/bin/sh
+# Antiphon pre-commit hook — FAST checks on staged files only.
+#
+# Activated by `pnpm install` (the root "prepare" script sets
+# `git config core.hooksPath .githooks`). Clones that never run
+# `pnpm install` never activate it — the hook is strictly opt-in.
+#
+# Scope is deliberately minimal so commits stay snappy:
+#   * biome check --staged   lint + format on staged TS/JS/JSON/CSS
+#   * cargo fmt --check      only when .rs files are staged
+# No tests, no clippy, no typecheck here — the full gate is `pnpm check`
+# (and CI enforces it on every PR).
+#
+# Skip in an emergency:  git commit --no-verify
+set -eu
+
+cd "$(git rev-parse --show-toplevel)"
+
+# Biome (biome.json has vcs integration enabled, so --staged resolves the
+# staged set through git). --no-errors-on-unmatched keeps commits that touch
+# no biome-supported files (e.g. Rust-only) from failing vacuously.
+biome="node_modules/.bin/biome"
+if [ -x "$biome" ]; then
+  "$biome" check --staged --no-errors-on-unmatched
+else
+  echo "pre-commit: biome not found (run pnpm install) — skipping biome check" >&2
+fi
+
+# rustfmt, only when the commit actually stages Rust code.
+if git diff --cached --name-only --diff-filter=ACMR | grep -q '\.rs$'; then
+  if command -v cargo >/dev/null 2>&1; then
+    cargo fmt --all --check
+  else
+    echo "pre-commit: cargo not found — skipping rustfmt check" >&2
+  fi
+fi

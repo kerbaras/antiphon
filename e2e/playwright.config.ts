@@ -6,7 +6,9 @@ export default defineConfig({
   fullyParallel: true,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 2 : 0,
-  reporter: process.env.CI ? "github" : "list",
+  // CI: inline github annotations plus an HTML report (self-contained, traces
+  // embedded) that the workflow uploads as an artifact when the job fails.
+  reporter: process.env.CI ? [["github"], ["html", { open: "never" }]] : "list",
   // Local cap: at the default worker count the suite flakes under machine
   // load — concurrent WebRTC DTLS handshakes starve and 1-5 rotating
   // "serverLink down" failures appear. 2 workers is reliably green. CI keeps
@@ -28,8 +30,16 @@ export default defineConfig({
         },
       },
     },
-    // Mobile Safari is the hostile baseline for the phone recorder.
-    { name: "mobile-safari", use: { ...devices["iPhone 15"] } },
+    // Mobile Safari is the hostile baseline for the phone recorder. Capture
+    // journeys self-skip off-chromium (fake mic is Chromium-only), so scope
+    // this project to the specs that genuinely exercise webkit — app boot /
+    // cross-origin isolation (smoke) and QR decode (qr) — instead of
+    // launching-and-skipping the other twelve.
+    {
+      name: "mobile-safari",
+      testMatch: /(smoke|qr)\.spec\.ts/,
+      use: { ...devices["iPhone 15"] },
+    },
   ],
   webServer: [
     {
