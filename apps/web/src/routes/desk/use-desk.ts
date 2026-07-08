@@ -3,6 +3,14 @@
 
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { DeskSession, type DeskSessionState } from "../../net/desk-session";
+import {
+  addMarker,
+  loadMarkers,
+  type Marker,
+  removeMarker,
+  renameMarker,
+  saveMarkers,
+} from "./markers";
 import { computeWaveform, type PlayerSnapshot, TakePlayer } from "./player";
 import { renderMaster, renderStems } from "./render";
 import type { RenderRange } from "./timeline-math";
@@ -23,6 +31,8 @@ export interface DeskUiMirror {
   liveMasterLevel: number;
   /** Streams whose TRUE decoded waveform is cached. */
   waveformsCached: number;
+  /** Song markers of the selected take (W2-B), timeline-sorted. */
+  markers: Marker[];
 }
 
 let uiMirror: DeskUiMirror | null = null;
@@ -136,6 +146,26 @@ export async function exportStemsZip(
   downloadBlob(fileName, new Blob([buildZip(entries)], { type: "application/zip" }));
 }
 
+/** Render one master-mix WAV per song (W2-B marker span) and bundle them
+ * into a STORE ZIP — the "All songs" export. Songs render sequentially:
+ * each is its own OfflineAudioContext pass and PCM buffers are big. */
+export async function exportSongsZip(
+  fileName: string,
+  songs: Array<{ fileName: string; range: RenderRange }>,
+): Promise<void> {
+  const model = getPlayer().renderModel();
+  if (!model) throw new Error("no take loaded");
+  const entries: Array<{ name: string; data: Uint8Array }> = [];
+  for (const song of songs) {
+    const buffer = await renderMaster(model, song.range);
+    entries.push({
+      name: song.fileName,
+      data: new Uint8Array(encodeWav(channelData(buffer), buffer.sampleRate)),
+    });
+  }
+  downloadBlob(fileName, new Blob([buildZip(entries)], { type: "application/zip" }));
+}
+
 function channelData(buffer: AudioBuffer): Float32Array[] {
   return Array.from({ length: buffer.numberOfChannels }, (_, ch) => buffer.getChannelData(ch));
 }
@@ -197,6 +227,56 @@ export function useDeskState(sessionId: string): DeskSessionState {
     [sessionId],
   );
   return useSyncExternalStore(subscribe, () => latest ?? getDeskSession(sessionId).snapshot());
+}
+
+// ---- song markers (W2-B) -----------------------------------------------------
+
+export interface TakeMarkersApi {
+  /** Timeline-sorted markers of the current take ([] when none selected). */
+  markers: Marker[];
+  /** Add at a take-timeline position; null when the spot is taken. */
+  addAt(atSec: number): Marker | null;
+  rename(id: string, name: string): void;
+  remove(id: string): void;
+}
+
+/** The selected take's song markers with write-through persistence
+ * (localStorage, interim until the W3-A Yjs project doc — see markers.ts).
+ * Mutation callbacks are identity-stable: safe in effect deps. */
+export function useTakeMarkers(sessionId: string, takeId: string | null): TakeMarkersApi {
+  const [markers, setMarkers] = useState<Marker[]>([]);
+  useEffect(() => {
+    setMarkers(takeId ? loadMarkers(sessionId, takeId) : []);
+  }, [sessionId, takeId]);
+
+  const ref = useRef({ sessionId, takeId, markers });
+  ref.current = { sessionId, takeId, markers };
+  const commit = useCallback((next: Marker[]) => {
+    const { sessionId: sid, takeId: tid } = ref.current;
+    if (!tid) return;
+    saveMarkers(sid, tid, next);
+    setMarkers(next);
+  }, []);
+
+  const addAt = useCallback(
+    (atSec: number): Marker | null => {
+      if (!ref.current.takeId) return null;
+      const { markers: next, added } = addMarker(ref.current.markers, atSec);
+      if (added) commit(next);
+      return added;
+    },
+    [commit],
+  );
+  const rename = useCallback(
+    (id: string, name: string) => commit(renameMarker(ref.current.markers, id, name)),
+    [commit],
+  );
+  const remove = useCallback(
+    (id: string) => commit(removeMarker(ref.current.markers, id)),
+    [commit],
+  );
+
+  return { markers, addAt, rename, remove };
 }
 
 export interface ServerStreamStatus {
