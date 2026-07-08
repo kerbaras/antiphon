@@ -1,11 +1,12 @@
 // Environment configuration. Fail fast on missing/invalid values.
 
+import type { S3BlobConfig } from "./blob/index.ts";
 import { type LogLevel, parseLogLevel } from "./logger.ts";
 
 export interface ServerConfig {
   port: number;
   databaseUrl: string;
-  blob: { driver: "fs"; root: string } | { driver: "s3"; endpoint: string; bucket: string };
+  blob: { driver: "fs"; root: string } | ({ driver: "s3" } & S3BlobConfig);
   logLevel: LogLevel;
   /** Allowed origins for /api/*; null = allow all (a startup warning is logged). */
   corsOrigins: string[] | null;
@@ -40,6 +41,10 @@ export function loadConfig(): ServerConfig {
           driver: "s3" as const,
           endpoint: required("S3_ENDPOINT"),
           bucket: required("S3_BUCKET"),
+          region: process.env.S3_REGION ?? "auto",
+          accessKeyId: required("S3_ACCESS_KEY_ID"),
+          secretAccessKey: required("S3_SECRET_ACCESS_KEY"),
+          forcePathStyle: envFlag("S3_FORCE_PATH_STYLE"),
         }
       : { driver: "fs" as const, root: process.env.BLOB_FS_ROOT ?? "./data/blobs" };
   return {
@@ -68,6 +73,12 @@ function required(name: string): string {
   const value = process.env[name];
   if (!value) throw new Error(`${name} is required when BLOB_DRIVER=s3`);
   return value;
+}
+
+/** Boolean env: "1"/"true" = on, anything else (or unset) = off. */
+function envFlag(name: string): boolean {
+  const raw = process.env[name];
+  return raw === "1" || raw === "true";
 }
 
 function envLogLevel(): LogLevel {

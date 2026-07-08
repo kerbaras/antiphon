@@ -26,10 +26,16 @@ export async function createServer(config: ServerConfig = loadConfig()) {
   const log = createLogger({ module: "server" });
   const db = createDb(config.databaseUrl);
   await migrateDb(db);
-  const blobs =
-    config.blob.driver === "s3"
-      ? new S3BlobStore(config.blob.endpoint, config.blob.bucket)
-      : new FsBlobStore(config.blob.root);
+  let blobs: FsBlobStore | S3BlobStore;
+  if (config.blob.driver === "s3") {
+    const s3 = new S3BlobStore(config.blob);
+    // Fail fast before /ready: unreachable endpoint aborts boot; a missing
+    // bucket is created (AccessDenied tolerated — see ensureBucket).
+    await s3.ensureBucket();
+    blobs = s3;
+  } else {
+    blobs = new FsBlobStore(config.blob.root);
+  }
   const archive = new Archive(db, blobs);
   const signaling = new Signaling(archive, config.limits);
   const collab = new CollabHub(db, {

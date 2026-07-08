@@ -45,6 +45,17 @@ jobs:
           --health-interval 5s
           --health-timeout 3s
           --health-retries 10
+      # bitnami/minio starts standalone with no command override (the
+      # official minio/minio image needs `server /data`, which services
+      # can't pass). Buckets are created by the server's ensureBucket();
+      # the S3 suite self-skips if :9100 is unreachable.
+      minio:
+        image: bitnami/minio:latest
+        env:
+          MINIO_ROOT_USER: antiphon
+          MINIO_ROOT_PASSWORD: antiphon-secret
+        ports:
+          - "9100:9000"
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2

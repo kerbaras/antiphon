@@ -46,6 +46,31 @@ pnpm check          # all of the above
 
 Real-iPhone testing needs HTTPS: `cloudflared tunnel --url http://localhost:5173`.
 
+### Optional: MinIO (local S3 blobs)
+
+Blobs default to the filesystem (`BLOB_DRIVER=fs`). To exercise the prod S3
+driver locally (Cloudflare R2 in prod), run MinIO and point the server at it:
+
+```sh
+docker compose up -d minio   # S3 API on :9100, console on :9101
+```
+
+Then in `apps/server/.env`:
+
+```
+BLOB_DRIVER=s3
+S3_ENDPOINT=http://localhost:9100
+S3_BUCKET=antiphon-dev
+S3_ACCESS_KEY_ID=antiphon
+S3_SECRET_ACCESS_KEY=antiphon-secret
+S3_FORCE_PATH_STYLE=1
+S3_REGION=us-east-1
+```
+
+The server creates the bucket at boot (`ensureBucket`) — no mc side-car
+needed. With MinIO up, `pnpm --filter @antiphon/server test` also runs the
+S3 driver integration suite (it skips itself when :9100 is unreachable).
+
 ## Key documents
 
 - [docs/rfcs/0001-protocol.md](docs/rfcs/0001-protocol.md) — the wire format (normative)

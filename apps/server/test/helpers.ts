@@ -29,6 +29,9 @@ export interface TestServer {
 export type TestConfigOverrides = {
   limits?: Partial<ServerConfig["limits"]>;
   retention?: Partial<ServerConfig["retention"]>;
+  /** Full blob config override (e.g. the s3 driver against local MinIO);
+   * defaults to the fs driver rooted at `blobRoot`. */
+  blob?: ServerConfig["blob"];
 };
 
 export async function startTestServer(
@@ -38,7 +41,7 @@ export async function startTestServer(
 ): Promise<TestServer> {
   const { app, injectWebSocket, close } = await createServer({
     databaseUrl: dbUrl,
-    blob: { driver: "fs", root: blobRoot },
+    blob: overrides.blob ?? { driver: "fs", root: blobRoot },
     port: 0,
     logLevel: "error",
     corsOrigins: null,

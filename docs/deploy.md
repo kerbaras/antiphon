@@ -141,6 +141,14 @@ Keys are `takeId/streamId/seq` wire frames; deletion is handled by the
 server's retention sweep and the hard-delete API — don't add an R2 lifecycle
 rule that races it (an "abort multipart uploads after 7 days" rule is fine).
 
+At boot the server checks the bucket (`ensureBucket`): it creates a missing
+bucket when the token allows, warns-and-continues on AccessDenied (typical
+for bucket-scoped R2 tokens — create the bucket in the dashboard first), and
+refuses to start if the endpoint is unreachable. Local development can
+exercise this exact driver against MinIO (`docker compose up -d minio` +
+`S3_FORCE_PATH_STYLE=1`, see the README) — prod stays on R2, where
+path-style stays off.
+
 ## 4 · Backups
 
 Postgres (nightly `pg_dump`, 14-day rotation) — on the VM:
