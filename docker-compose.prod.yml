@@ -1,0 +1,78 @@
+# Production stack for a single Linux VM with a public IP (Hetzner or
+# similar). See docs/deploy.md for the full runbook.
+#
+#   cp deploy/.env.prod.example .env.prod   # then fill in secrets
+#   docker compose --env-file .env.prod -f docker-compose.prod.yml up -d --build
+#
+# --env-file makes ${...} substitution below read .env.prod as well.
+#
+# Fly.io is NOT a supported target for this stack: libdatachannel cannot
+# bind the fly-global-services address Fly requires for UDP, so WebRTC
+# ingest never completes there (docs/deploy.md "Why not Fly.io").
+
+services:
+  server:
+    build:
+      context: .
+      dockerfile: apps/server/Dockerfile
+    image: antiphon-server:latest
+    # WebRTC needs the host network: libdatachannel binds ICE sockets on
+    # wildcard ephemeral UDP ports and advertises the addresses it sees.
+    # Docker's bridge + port publishing can neither forward "every ephemeral
+    # UDP port" nor keep the candidate addresses truthful, so the server
+    # shares the host stack. It listens on PORT (8787) for HTTP/WS — keep
+    # that port firewalled; Caddy is the only public HTTP entrance.
+    network_mode: host
+    env_file: .env.prod
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Schema migrations run automatically at boot (createServer -> migrateDb,
+    # apps/server/src/db/index.ts) before the server accepts traffic — there
+    # is no separate migration command to run. To re-run them manually:
+    #   docker compose --env-file .env.prod -f docker-compose.prod.yml \
+    #     run --rm server node apps/server/src/index.ts
+    # (it migrates, then serves; Ctrl-C once "listening" is logged)
+
+    # Only needed if BLOB_DRIVER=fs instead of R2/S3:
+    # volumes:
+    #   - blobdata:/data
+
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-antiphon}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env.prod}
+      POSTGRES_DB: ${POSTGRES_DB:-antiphon}
+    # Loopback only: the server reaches it via localhost:5432 (host network);
+    # never expose Postgres on the public interface.
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      # postgres:18+ images keep PGDATA in a subdirectory of this mount.
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-antiphon}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2
+    # Host network so it can reach the server on localhost:8787 and bind
+    # 80/443 directly (no `ports:` mapping is possible or needed with
+    # network_mode: host). TLS certs are fetched automatically.
+    network_mode: host
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  caddy_data:
+  caddy_config:
+  # blobdata:   # uncomment together with the server volume above

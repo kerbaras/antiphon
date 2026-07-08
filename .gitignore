@@ -11,6 +11,7 @@ packages/core-wasm/pkg/
 .env
 .env.*
 !.env.example
+!.env.prod.example
 
 # test artifacts
 playwright-report/

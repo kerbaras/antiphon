@@ -1,0 +1,40 @@
+# Build context = repo root (the server image needs the whole workspace:
+# pnpm lockfile validation requires every workspace package.json, and the
+# wasm build needs the Rust crates). Exclude artifacts and secrets only.
+
+.git
+
+# deps (reinstalled inside the image)
+node_modules
+**/node_modules
+
+# build outputs (rebuilt inside the image)
+target
+**/dist
+packages/core-wasm/pkg
+.turbo
+**/.turbo
+
+# local data / secrets — never bake into an image
+data
+**/data
+.env
+.env.*
+!.env.example
+!deploy/.env.prod.example
+
+# test artifacts
+test-results
+**/test-results
+playwright-report
+**/playwright-report
+coverage
+**/coverage
+screens
+proptest-regressions
+**/proptest-regressions
+*.log
+
+# editor / os
+.DS_Store
+.idea
