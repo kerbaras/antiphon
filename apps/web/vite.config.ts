@@ -18,7 +18,8 @@ const crossOriginIsolation = {
 const serverOrigin = process.env.ANTIPHON_SERVER_ORIGIN ?? "http://localhost:8787";
 const serverProxy = {
   "/api": { target: serverOrigin, changeOrigin: true },
-  "^/(session|join)/[^/]+/ws$": {
+  // Signaling (ws) + the W3-A shared-project-doc sync (collab).
+  "^/(session|join)/[^/]+/(ws|collab)$": {
     target: serverOrigin,
     ws: true,
     changeOrigin: true,

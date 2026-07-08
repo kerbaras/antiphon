@@ -15,6 +15,7 @@ export function DeskTopBar({
   sessionId,
   joinUrl,
   phones,
+  remoteDesks,
   deskInputLive,
   serverSync,
   rebuiltChunks,
@@ -31,6 +32,8 @@ export function DeskTopBar({
   sessionId: string;
   joinUrl: string;
   phones: PeerInfo[];
+  /** Other desks in the room (W3-A presence) — real people, real avatars. */
+  remoteDesks: Array<{ clientId: number; name: string; color: string }>;
   deskInputLive: boolean;
   serverSync: DeskSessionState["serverSync"];
   rebuiltChunks: number;
@@ -131,8 +134,16 @@ export function DeskTopBar({
       <div className="flex items-center gap-3">
         <AvatarStack
           people={[
-            { initials: "DK", color: "#c8c9cb", title: "You (Desk)" },
+            { id: "you", initials: "DK", color: "#c8c9cb", title: "You (Desk)" },
+            // Other desks co-editing this session (W3-A presence).
+            ...remoteDesks.slice(0, 3).map((d) => ({
+              id: `desk-${d.clientId}`,
+              initials: initialsOf(d.name) ?? "D",
+              color: d.color,
+              title: `${d.name} (Desk)`,
+            })),
             ...phones.slice(0, 3).map((p, i) => ({
+              id: `phone-${p.peerId}`,
               initials: initialsOf(p.deviceInfo.label) ?? p.peerId.slice(0, 2).toUpperCase(),
               color: TRACK_COLORS[i % TRACK_COLORS.length] as string,
               title: p.deviceInfo.label?.trim() || deviceName(p.deviceInfo.userAgent),

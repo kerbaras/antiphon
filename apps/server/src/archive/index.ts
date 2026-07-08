@@ -255,9 +255,9 @@ export class Archive {
   }
 
   /** Hard-delete a whole session: blobs FIRST, then rows (chunks, gaps,
-   * streams, takes, chirps, peers, session). A failed blob delete aborts
-   * with rows intact, so a retry re-attempts every blob — a hard delete
-   * must never leak recordings of identifiable people (RFC §12).
+   * streams, takes, chirps, collab doc, peers, session). A failed blob
+   * delete aborts with rows intact, so a retry re-attempts every blob — a
+   * hard delete must never leak recordings of identifiable people (RFC §12).
    * Idempotent: an unknown session deletes to nothing. */
   async deleteSession(sessionId: string): Promise<void> {
     const takes = await this.db
@@ -290,6 +290,11 @@ export class Archive {
       await this.db.delete(schema.takes).where(inArray(schema.takes.id, takeIds));
     }
     await this.db.delete(schema.chirps).where(eq(schema.chirps.sessionId, sessionId));
+    // W3-A shared project doc: session-scoped metadata, deleted with the
+    // session (the caller drops the live collab room first — see
+    // destroySession ordering in index.ts — so no debounced save resurrects
+    // the row; the sessions FK cascade backstops any race).
+    await this.db.delete(schema.collabDocs).where(eq(schema.collabDocs.sessionId, sessionId));
     await this.db.delete(schema.peers).where(eq(schema.peers.sessionId, sessionId));
     await this.db.delete(schema.sessions).where(eq(schema.sessions.id, sessionId));
   }

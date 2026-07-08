@@ -21,6 +21,8 @@
     "hono": "^4.12.27",
     "node-datachannel": "^0.32.3",
     "postgres": "^3.4.9",
+    "y-protocols": "1.0.7",
+    "yjs": "13.6.31",
     "zod": "catalog:"
   },
   "devDependencies": {

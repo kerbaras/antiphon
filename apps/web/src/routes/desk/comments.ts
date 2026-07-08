@@ -7,14 +7,16 @@
 // is a field update (`resolvedAtMs`), never a delete: the note and its
 // resolution history stay addressable.
 //
-// PERSISTENCE BOUNDARY (interim until W3-A): comments live in localStorage,
-// keyed per (session, take), as schema-versioned JSON. The pure model above
-// the load/save line is transport-agnostic; when the Yjs shared project doc
-// lands (W3-A), only loadComments/saveComments get replaced — a Y.Array of
-// plain TakeComment objects per takeId. The uuids are already stable
-// CRDT-friendly identities, and resolve/unresolve/edit are single-field
-// updates on the object with that id, so concurrent desks converge without
-// any shape change. Existing local comments seed the doc from these keys.
+// PERSISTENCE BOUNDARY (W3-A landed): the source of truth is the shared
+// project doc — a Y.Array of plain TakeComment objects per takeId
+// (net/collab-doc.ts, wired in use-desk.ts). Exactly as documented, ONLY
+// the load/save layer changed: the pure model above this line is
+// untouched. Resolve/unresolve/edit replace the array element with the
+// same uuid — simple and convergent at this scale (concurrent edits of the
+// SAME comment can briefly duplicate; adds/removes/edits of different
+// comments merge cleanly). loadComments/saveComments remain as the doc's
+// localStorage SHADOW — seed source, offline display fallback, and cheap
+// insurance on every change.
 
 export interface TakeComment {
   /** Stable identity — resolve/edit/delete target, survives re-sorting. */
@@ -104,7 +106,7 @@ export function openCommentCount(comments: readonly TakeComment[]): number {
   return comments.filter((c) => c.resolvedAtMs === null).length;
 }
 
-// ---- persistence (interim — see the W3-A boundary note up top) ---------------
+// ---- persistence (doc shadow — see the W3-A boundary note up top) -------------
 
 const SCHEMA_VERSION = 1;
 

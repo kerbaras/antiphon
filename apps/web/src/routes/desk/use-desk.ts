@@ -2,6 +2,15 @@
 // server-side archive polling for the sink-convergence table.
 
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { type CollabClient, getCollab } from "../../net/collab";
+import {
+  deleteArrangeKeys,
+  displayTakeList,
+  hasTakeList,
+  type ListKind,
+  seedTakeListOnce,
+  writeTakeList,
+} from "../../net/collab-doc";
 import { DeskSession, type DeskSessionState } from "../../net/desk-session";
 import {
   addComment,
@@ -12,6 +21,7 @@ import {
   removeComment,
   resolveComment,
   saveComments,
+  sortComments,
   type TakeComment,
   unresolveComment,
 } from "./comments";
@@ -22,10 +32,12 @@ import {
   removeMarker,
   renameMarker,
   saveMarkers,
+  sortMarkers,
 } from "./markers";
 import { computeWaveform, type PlayerSnapshot, TakePlayer } from "./player";
 import { renderMaster, renderStems } from "./render";
 import type { RenderRange } from "./timeline-math";
+import { bindMixToCollab } from "./use-collab";
 import { encodeWav } from "./wav";
 import { buildZip } from "./zip";
 
@@ -64,10 +76,13 @@ export function getDeskSession(sessionId: string): DeskSession {
       latest = s;
     });
     // Server-confirmed deletions: evict every local trace outside the
-    // sink store (the session already told the worker).
+    // sink store (the session already told the worker), including the
+    // shared doc's arrangement overrides for the removed clips.
     session.onStreamsDeleted((streamIds) => {
       for (const id of streamIds) waveformCache.delete(id);
       getPlayer().removeTracks(streamIds);
+      const collab = getDeskCollab(sessionId);
+      deleteArrangeKeys(collab.doc, streamIds, collab.origin);
     });
     session.start();
     (globalThis as Record<string, unknown>).__antiphonDesk = {
@@ -76,9 +91,26 @@ export function getDeskSession(sessionId: string): DeskSession {
       player: getPlayer(),
       playerSnapshot: () => playerSnap,
       ui: () => uiMirror,
+      collab: () => getDeskCollab(sessionId).snapshot(),
     };
   }
   return session;
+}
+
+// ---- shared project doc (W3-A) ------------------------------------------------
+// One CollabClient per page (net/collab.ts singleton) with the mixer
+// binding attached exactly once: the player stays the audio authority, the
+// doc is the state source (see use-collab.ts bindMixToCollab).
+
+const mixBound = new WeakSet<CollabClient>();
+
+export function getDeskCollab(sessionId: string): CollabClient {
+  const collab = getCollab(sessionId);
+  if (!mixBound.has(collab)) {
+    mixBound.add(collab);
+    bindMixToCollab(collab, getPlayer());
+  }
+  return collab;
 }
 
 export function getPlayer(): TakePlayer {
@@ -251,6 +283,72 @@ export function useDeskState(sessionId: string): DeskSessionState {
   return useSyncExternalStore(subscribe, () => latest ?? getDeskSession(sessionId).snapshot());
 }
 
+// ---- shared take-list plumbing (W3-A) ------------------------------------------
+// Markers and comments read/write through the shared doc (per their W2-B/
+// W2-F persistence boundaries: ONLY load/save is replaced — pure models
+// untouched). localStorage stays as SHADOW persistence: it seeds the doc
+// once per take, serves as the display fallback while the doc has no entry
+// (offline single-desk parity), and is rewritten on every change — remote
+// edits included — as cheap offline insurance.
+
+function useCollabTakeList<T extends { id: string }>(
+  sessionId: string,
+  takeId: string | null,
+  kind: ListKind,
+  loadLocal: (sessionId: string, takeId: string) => T[],
+  saveLocal: (sessionId: string, takeId: string, items: readonly T[]) => void,
+  sort: (items: readonly T[]) => T[],
+): { items: T[]; commit: (next: readonly T[]) => void } {
+  const [items, setItems] = useState<T[]>([]);
+  useEffect(() => {
+    if (!takeId) {
+      setItems([]);
+      return;
+    }
+    const collab = getDeskCollab(sessionId);
+    const refresh = () => {
+      const list = sort(displayTakeList<T>(collab.doc, kind, takeId, loadLocal(sessionId, takeId)));
+      setItems(list);
+      if (hasTakeList(collab.doc, kind, takeId)) saveLocal(sessionId, takeId, list);
+    };
+    refresh();
+    // Seed-once: after the first sync (immediately when already synced;
+    // never while offline — the fallback covers), migrate the local
+    // snapshot of a take the doc doesn't know. Guarded by the doc-level
+    // seeded flag, so a second desk with the same localStorage won't
+    // duplicate (see collab-doc.ts for the accepted concurrent-seed bound).
+    const unSynced = collab.onSynced(() => {
+      if (seedTakeListOnce(collab.doc, kind, takeId, loadLocal(sessionId, takeId), collab.origin)) {
+        refresh();
+      }
+    });
+    const map = collab.doc.getMap(kind);
+    const observer = () => refresh();
+    map.observeDeep(observer);
+    return () => {
+      unSynced();
+      map.unobserveDeep(observer);
+    };
+  }, [sessionId, takeId, kind, loadLocal, saveLocal, sort]);
+
+  const ref = useRef({ sessionId, takeId });
+  ref.current = { sessionId, takeId };
+  const commit = useCallback(
+    (next: readonly T[]) => {
+      const { sessionId: sid, takeId: tid } = ref.current;
+      if (!tid) return;
+      const collab = getDeskCollab(sid);
+      // First edit while the doc lacks the take migrates the whole
+      // fallback list (callers derive `next` from the displayed items).
+      writeTakeList(collab.doc, kind, tid, next, collab.origin);
+      saveLocal(sid, tid, next); // shadow write (observer also refreshes state)
+    },
+    [kind, saveLocal],
+  );
+
+  return { items, commit };
+}
+
 // ---- song markers (W2-B) -----------------------------------------------------
 
 export interface TakeMarkersApi {
@@ -262,23 +360,21 @@ export interface TakeMarkersApi {
   remove(id: string): void;
 }
 
-/** The selected take's song markers with write-through persistence
- * (localStorage, interim until the W3-A Yjs project doc — see markers.ts).
- * Mutation callbacks are identity-stable: safe in effect deps. */
+/** The selected take's song markers through the shared project doc (W3-A),
+ * localStorage as seed/fallback/shadow. Mutation callbacks are
+ * identity-stable: safe in effect deps. */
 export function useTakeMarkers(sessionId: string, takeId: string | null): TakeMarkersApi {
-  const [markers, setMarkers] = useState<Marker[]>([]);
-  useEffect(() => {
-    setMarkers(takeId ? loadMarkers(sessionId, takeId) : []);
-  }, [sessionId, takeId]);
+  const { items: markers, commit } = useCollabTakeList<Marker>(
+    sessionId,
+    takeId,
+    "markers",
+    loadMarkers,
+    saveMarkers,
+    sortMarkers,
+  );
 
-  const ref = useRef({ sessionId, takeId, markers });
-  ref.current = { sessionId, takeId, markers };
-  const commit = useCallback((next: Marker[]) => {
-    const { sessionId: sid, takeId: tid } = ref.current;
-    if (!tid) return;
-    saveMarkers(sid, tid, next);
-    setMarkers(next);
-  }, []);
+  const ref = useRef({ takeId, markers });
+  ref.current = { takeId, markers };
 
   const addAt = useCallback(
     (atSec: number): Marker | null => {
@@ -316,23 +412,21 @@ export interface TakeCommentsApi {
   remove(id: string): void;
 }
 
-/** The selected take's comments with write-through persistence
- * (localStorage, interim until the W3-A Yjs project doc — see comments.ts).
- * Mutation callbacks are identity-stable: safe in effect deps. */
+/** The selected take's comments through the shared project doc (W3-A),
+ * localStorage as seed/fallback/shadow. Mutation callbacks are
+ * identity-stable: safe in effect deps. */
 export function useTakeComments(sessionId: string, takeId: string | null): TakeCommentsApi {
-  const [comments, setComments] = useState<TakeComment[]>([]);
-  useEffect(() => {
-    setComments(takeId ? loadComments(sessionId, takeId) : []);
-  }, [sessionId, takeId]);
+  const { items: comments, commit } = useCollabTakeList<TakeComment>(
+    sessionId,
+    takeId,
+    "comments",
+    loadComments,
+    saveComments,
+    sortComments,
+  );
 
-  const ref = useRef({ sessionId, takeId, comments });
-  ref.current = { sessionId, takeId, comments };
-  const commit = useCallback((next: TakeComment[]) => {
-    const { sessionId: sid, takeId: tid } = ref.current;
-    if (!tid) return;
-    saveComments(sid, tid, next);
-    setComments(next);
-  }, []);
+  const ref = useRef({ takeId, comments });
+  ref.current = { takeId, comments };
 
   const add = useCallback(
     (input: NewComment): TakeComment | null => {

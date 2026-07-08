@@ -51,6 +51,7 @@ export function TimelineSection({
   markers,
   comments,
   playheadSec,
+  ghostPlayheads,
   marquee,
   onSeekTimeline,
   onAddMarkerAt,
@@ -75,6 +76,8 @@ export function TimelineSection({
   markers: Marker[];
   comments: TakeComment[];
   playheadSec: number | null;
+  /** Other desks' cursors (W3-A presence), arrangement-timeline seconds. */
+  ghostPlayheads: Array<{ clientId: number; name: string; color: string; atSec: number }>;
   marquee: Marquee | null;
   onSeekTimeline: (sec: number) => void;
   onAddMarkerAt: (atSec: number) => void;
@@ -219,6 +222,28 @@ export function TimelineSection({
               }}
             />
           ))}
+
+        {/* Ghost cursors: other desks' playheads (W3-A presence) — a thin
+            translucent hairline with a whisper of a name tag, deliberately
+            quieter than every local line. */}
+        {ghostPlayheads.map((ghost) => (
+          <div
+            key={ghost.clientId}
+            data-ghost-playhead={ghost.clientId}
+            className="pointer-events-none absolute top-0 bottom-0 z-[3] w-px opacity-45 transition-[left] duration-300 ease-linear"
+            style={{
+              left: TRACK_HEADER_W + ghost.atSec * pxPerSec,
+              background: ghost.color,
+            }}
+          >
+            <span
+              className="absolute left-[3px] max-w-[72px] truncate rounded-[3px] px-[4px] py-px font-mono text-[7.5px] font-semibold tracking-[0.4px] text-void"
+              style={{ background: ghost.color, top: RULER_H + 3 }}
+            >
+              {ghost.name}
+            </span>
+          </div>
+        ))}
 
         {/* Playhead: rides the live take's write head while recording,
             the player position during playback. */}

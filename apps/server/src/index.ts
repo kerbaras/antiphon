@@ -11,6 +11,7 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { Archive } from "./archive/index.ts";
 import { FsBlobStore, S3BlobStore } from "./blob/index.ts";
+import { CollabHub } from "./collab/index.ts";
 import { loadConfig, type ServerConfig } from "./config.ts";
 import { createDb, migrateDb } from "./db/index.ts";
 import { createLogger, setLogLevel } from "./logger.ts";
@@ -31,6 +32,10 @@ export async function createServer(config: ServerConfig = loadConfig()) {
       : new FsBlobStore(config.blob.root);
   const archive = new Archive(db, blobs);
   const signaling = new Signaling(archive, config.limits);
+  const collab = new CollabHub(db, {
+    msgRatePerSec: config.limits.msgRatePerSec,
+    msgBurst: config.limits.msgBurst,
+  });
   let ready = false;
 
   const app = new Hono<Env>();
@@ -107,10 +112,13 @@ export async function createServer(config: ServerConfig = loadConfig()) {
   });
 
   /** Hard deletion (RFC §12 MUST). A9 ordering: disconnect live peers so
-   * nothing can recreate state mid-delete, then delete durably (blobs, then
-   * rows). Idempotent — deleting an unknown session is a 204 no-op. */
+   * nothing can recreate state mid-delete (the collab room drops WITHOUT
+   * flushing — a debounced save must not resurrect the doc row), then
+   * delete durably (blobs, then rows, collab doc included). Idempotent —
+   * deleting an unknown session is a 204 no-op. */
   const destroySession = async (sessionId: string): Promise<void> => {
     await signaling.closeSession(sessionId);
+    await collab.closeSession(sessionId);
     await archive.deleteSession(sessionId);
   };
   app.delete("/api/sessions/:sessionId", async (c) => {
@@ -207,6 +215,29 @@ export async function createServer(config: ServerConfig = loadConfig()) {
   app.get("/session/:sessionId/ws", wsHandler("desk"));
   app.get("/join/:sessionId/ws", wsHandler("recorder"));
 
+  // ---- shared project doc (W3-A) --------------------------------------------
+  // Desk-role path like /session/:uuid/ws (join rate limiting included);
+  // binary Yjs sync + awareness frames, persisted per session. Transport
+  // control stays on the signaling socket — see collab/index.ts header.
+  app.use("/session/:sessionId/collab", joinRateLimit);
+  app.get(
+    "/session/:sessionId/collab",
+    upgradeWebSocket((c: { req: { param(name: "sessionId"): string } }) => {
+      const handlers = collab.handleConnection(c.req.param("sessionId"));
+      return {
+        onOpen(_evt: Event, ws: Parameters<typeof handlers.onOpen>[0]) {
+          handlers.onOpen(ws);
+        },
+        onMessage(event: MessageEvent, ws: Parameters<typeof handlers.onOpen>[0]) {
+          handlers.onMessage(event.data, ws);
+        },
+        onClose() {
+          handlers.onClose();
+        },
+      };
+    }),
+  );
+
   // ---- session expiry sweep (RFC §12 MUST) ----------------------------------
   const sweepIdleSessions = async (): Promise<void> => {
     await signaling.pruneIdleRooms();
@@ -225,16 +256,18 @@ export async function createServer(config: ServerConfig = loadConfig()) {
   }, config.retention.sweepIntervalMs);
   sweepTimer.unref();
 
-  /** Graceful teardown: stop timers, drain WS peers + ingest, close the pool. */
+  /** Graceful teardown: stop timers, drain WS peers + ingest, flush collab
+   * docs, close the pool. */
   const close = async (): Promise<void> => {
     ready = false;
     clearInterval(sweepTimer);
     await signaling.close();
+    await collab.close();
     await db.$client.end({ timeout: 5 });
   };
 
   ready = true;
-  return { app, injectWebSocket, signaling, archive, db, config, close };
+  return { app, injectWebSocket, signaling, archive, collab, db, config, close };
 }
 
 // Entrypoint (skipped when imported by tests).

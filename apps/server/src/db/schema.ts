@@ -5,6 +5,7 @@
 import {
   bigint,
   boolean,
+  customType,
   index,
   integer,
   jsonb,
@@ -14,6 +15,11 @@ import {
   timestamp,
   uuid,
 } from "drizzle-orm/pg-core";
+
+/** Postgres bytea (drizzle-orm has no built-in); postgres-js maps Buffer↔bytea. */
+const bytea = customType<{ data: Buffer }>({
+  dataType: () => "bytea",
+});
 
 export const sessions = pgTable("sessions", {
   id: uuid("id").primaryKey(),
@@ -102,6 +108,18 @@ export const gaps = pgTable(
   },
   (t) => [primaryKey({ columns: [t.streamId, t.startSeq] })],
 );
+
+/** W3-A shared project doc (Yjs): the session's mix/markers/comments/arrange
+ * state as one merged CRDT update (`Y.encodeStateAsUpdate`). Audio bytes are
+ * NEVER in here — blobs stay content-addressed in the blob store
+ * (ARCHITECTURE §6); this row is small metadata like everything else. */
+export const collabDocs = pgTable("collab_docs", {
+  sessionId: uuid("session_id")
+    .primaryKey()
+    .references(() => sessions.id, { onDelete: "cascade" }),
+  doc: bytea("doc").notNull(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+});
 
 export const chirps = pgTable("chirps", {
   id: uuid("id").primaryKey(),

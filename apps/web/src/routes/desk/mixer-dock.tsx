@@ -13,6 +13,7 @@ export function MixerDock({
   recording,
   liveMasterLevel,
   levelFor,
+  remoteEditing,
 }: {
   rows: TrackRow[];
   playerSnap: PlayerSnapshot;
@@ -20,6 +21,9 @@ export function MixerDock({
   /** Recording-time master bus estimate (sum of live track peaks). */
   liveMasterLevel: number;
   levelFor: (row: TrackRow) => number;
+  /** Lanes another desk is touching right now (W3-A presence), by
+   * channel key — the strip gets a faint ring in that desk's color. */
+  remoteEditing: Map<string, { name: string; color: string }>;
 }) {
   return (
     <div className="flex min-w-0 border-t border-divider bg-raised">
@@ -31,6 +35,7 @@ export function MixerDock({
             playerSnap={playerSnap}
             recording={recording}
             liveLevel={levelFor(row)}
+            remoteEditor={remoteEditing.get(row.key) ?? null}
           />
         ))}
       </div>
@@ -47,6 +52,7 @@ export function MixerDock({
         eq={playerSnap.masterEq}
         onEq={(patch) => getPlayer().setMasterEq(patch)}
         onEqBypass={() => getPlayer().toggleMasterEqBypass()}
+        remoteEditor={remoteEditing.get("master") ?? null}
         {...(recording ? { dbText: formatDbfs(liveMasterLevel) } : {})}
       />
     </div>
@@ -63,11 +69,13 @@ function RowMixerStrip({
   playerSnap,
   recording,
   liveLevel,
+  remoteEditor,
 }: {
   row: TrackRow;
   playerSnap: PlayerSnapshot;
   recording: boolean;
   liveLevel: number;
+  remoteEditor: { name: string; color: string } | null;
 }) {
   const strip = playerSnap.channels.find((c) => c.key === row.key);
   return (
@@ -76,6 +84,7 @@ function RowMixerStrip({
       color={row.color}
       active={row.receiving}
       level={liveLevel}
+      remoteEditor={remoteEditor}
       gainDb={strip?.gainDb ?? 0}
       onGainDb={(db) => getPlayer().setChannelDb(row.key, db)}
       pan={strip?.pan ?? 0}

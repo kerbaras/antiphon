@@ -101,14 +101,16 @@ export function AvatarStack({
   people,
   onAdd,
 }: {
-  people: Array<{ initials: string; color: string; title: string }>;
+  /** `id` is the stable identity (titles may repeat: two desks both named
+   * "Desk"). */
+  people: Array<{ id: string; initials: string; color: string; title: string }>;
   onAdd?: () => void;
 }) {
   return (
     <div className="flex items-center">
       {people.map((p, i) => (
         <div
-          key={p.title}
+          key={p.id}
           title={p.title}
           className={cx(
             "grid size-[26px] place-items-center rounded-full border-2 border-panel",
@@ -842,6 +844,9 @@ export interface MixerStripProps {
   soloed?: boolean;
   onSolo?: () => void;
   dbText?: string;
+  /** Another desk is touching this strip (W3-A presence): a faint inset
+   * ring in that desk's color, quiet enough to ignore. */
+  remoteEditor?: { name: string; color: string } | null;
 }
 
 export function MixerStrip({
@@ -862,6 +867,7 @@ export function MixerStrip({
   soloed,
   onSolo,
   dbText,
+  remoteEditor,
 }: MixerStripProps) {
   const db =
     dbText ?? (onGainDb ? (gainDb <= FADER_MIN_DB ? "−∞ dB" : `${gainDb.toFixed(1)} dB`) : "—");
@@ -871,6 +877,13 @@ export function MixerStrip({
         "flex flex-none flex-col border-r border-[#0e0f10]",
         master ? "w-[118px] border-l border-l-divider bg-card-hi" : "w-[104px] bg-card",
       )}
+      {...(remoteEditor
+        ? {
+            "data-remote-editor": remoteEditor.name,
+            title: `${remoteEditor.name} is adjusting this strip`,
+            style: { boxShadow: `inset 0 0 0 1px ${hexA(remoteEditor.color, 0.55)}` },
+          }
+        : {})}
     >
       <div className="h-[3px]" style={{ background: color }} />
       <div

@@ -6,12 +6,14 @@
 // which gives bookmarking AND per-song render ranges (W2-A RenderRange)
 // with no range-editing UI at all.
 //
-// PERSISTENCE BOUNDARY (interim until W3-A): markers live in localStorage,
-// keyed per (session, take), as schema-versioned JSON. The pure model above
-// the load/save line is transport-agnostic; when the Yjs shared project doc
-// lands (W3-A), only loadMarkers/saveMarkers get replaced (Y.Array of
-// {id,name,atSec} per takeId — ids are already stable CRDT-friendly keys)
-// and existing local markers can be seeded into the doc from these keys.
+// PERSISTENCE BOUNDARY (W3-A landed): the source of truth is the shared
+// project doc — a Y.Array of {id,name,atSec} per takeId (net/collab-doc.ts,
+// wired in use-desk.ts). Exactly as documented, ONLY the load/save layer
+// changed: the pure model above this line is untouched. loadMarkers/
+// saveMarkers remain as the doc's localStorage SHADOW — the seed source
+// (once per take), the display fallback while the doc has no entry
+// (offline single-desk parity), and cheap offline insurance on every
+// change.
 
 export interface Marker {
   /** Stable identity — rename/delete target, survives re-sorting. */
@@ -100,7 +102,7 @@ export function songFileName(index: number, name: string): string {
   return `${String(index).padStart(2, "0")} ${safe || "song"}.wav`;
 }
 
-// ---- persistence (interim — see the W3-A boundary note up top) ---------------
+// ---- persistence (doc shadow — see the W3-A boundary note up top) -------------
 
 const SCHEMA_VERSION = 1;
 

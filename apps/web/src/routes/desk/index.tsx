@@ -42,12 +42,14 @@ import {
   useReceiving,
   useTick,
 } from "./track-model";
+import { useCollabArrange, useCollabPresence } from "./use-collab";
 import {
   ensureWaveform,
   exportMasterWav,
   exportSongsZip,
   exportStemsZip,
   getCachedWaveform,
+  getDeskCollab,
   getDeskSession,
   getPlayer,
   loadTakeIntoPlayer,
@@ -69,6 +71,10 @@ export function DeskRoute() {
 
 function Desk({ sessionId }: { sessionId: string }) {
   const state = useDeskState(sessionId);
+  // Shared project doc (W3-A): mix/markers/comments/arrange sync + presence.
+  // Idempotent page singleton, same pattern as getDeskSession above.
+  const collab = getDeskCollab(sessionId);
+  const collabSnap = useCollabPresence(collab);
   // Leave a trail for the home page's "recent sessions" list.
   useEffect(() => {
     recordRecentSession(sessionId);
@@ -316,7 +322,10 @@ function Desk({ sessionId }: { sessionId: string }) {
 
   // ---- timeline editing: selection, marquee, clip drag ---------------------
   const [selection, setSelection] = useState<string[]>([]);
-  const [clipStartOverrides, setClipStartOverrides] = useState<Record<string, number>>({});
+  // Clip arrangement lives in the shared doc (W3-A): local drags write
+  // through, remote desks' drags land here live. Same updater shape as the
+  // useState it replaced.
+  const [clipStartOverrides, setClipStartOverrides] = useCollabArrange(collab);
   const [marquee, setMarquee] = useState<Marquee | null>(null);
   const timelineRef = useRef<HTMLDivElement | null>(null);
 
@@ -542,6 +551,7 @@ function Desk({ sessionId }: { sessionId: string }) {
     state.deskStatus,
     state.activeTakeId,
     takeMarkers.addAt,
+    setClipStartOverrides,
   ]);
 
   function seekTimeline(sec: number) {
@@ -557,6 +567,44 @@ function Desk({ sessionId }: { sessionId: string }) {
     : playerLoaded && selectedTakeId
       ? selectedBaseSec + playerSnap.positionSec
       : null;
+
+  // ---- presence (W3-A) -------------------------------------------------------
+  // Publish who we are and where our playhead sits; read the other desks.
+  // Name = the operator's comment-author pref (already user-editable in the
+  // comments panel); color keyed off the doc clientID into the track palette.
+  useEffect(() => {
+    collab.setPresence({
+      name: commentAuthor,
+      color: TRACK_COLORS[collab.doc.clientID % TRACK_COLORS.length] as string,
+    });
+  }, [collab, commentAuthor]);
+  // Ghost cursor position, coarse on purpose (0.25 s — a cursor, not a
+  // clock): setPresence no-ops on equal state, the client throttles the wire.
+  useEffect(() => {
+    collab.setPresence({
+      playheadSec: playheadSec === null ? null : Math.round(playheadSec * 4) / 4,
+      activeTakeId: selectedTakeId,
+    });
+  });
+  const remoteDesks = collabSnap.peers;
+  const ghostPlayheads = remoteDesks
+    .filter((p) => p.playheadSec !== null)
+    .map((p) => ({
+      clientId: p.clientId,
+      name: p.name,
+      color: p.color,
+      atSec: p.playheadSec as number,
+    }));
+  /** Mixer lanes another desk is touching right now → faint strip ring. */
+  const remoteEditing = useMemo(() => {
+    const map = new Map<string, { name: string; color: string }>();
+    for (const p of remoteDesks) {
+      if (p.editing?.startsWith("mix:")) {
+        map.set(p.editing.slice(4), { name: p.name, color: p.color });
+      }
+    }
+    return map;
+  }, [remoteDesks]);
 
   /** Recording-time master bus estimate: the live track peaks summed (all
    * mics share one room, so amplitudes roughly add) and clamped. */
@@ -688,6 +736,7 @@ function Desk({ sessionId }: { sessionId: string }) {
         sessionId={sessionId}
         joinUrl={joinUrl}
         phones={phones}
+        remoteDesks={remoteDesks}
         deskInputLive={deskInput.phase === "live"}
         serverSync={state.serverSync}
         rebuiltChunks={state.rebuiltChunks}
@@ -738,6 +787,7 @@ function Desk({ sessionId }: { sessionId: string }) {
           markers={takeMarkers.markers}
           comments={takeComments.comments}
           playheadSec={playheadSec}
+          ghostPlayheads={ghostPlayheads}
           marquee={marquee}
           onSeekTimeline={seekTimeline}
           onAddMarkerAt={(atSec) => takeMarkers.addAt(atSec)}
@@ -809,6 +859,7 @@ function Desk({ sessionId }: { sessionId: string }) {
         recording={recording}
         liveMasterLevel={liveMasterLevel}
         levelFor={levelFor}
+        remoteEditing={remoteEditing}
       />
     </main>
   );
