@@ -6,6 +6,8 @@
 
 import { DriftEstimator, find_chirp_offset, init as initWasm } from "@antiphon/core-wasm";
 import { DEFAULT_CHIRP_SPEC } from "@antiphon/protocol";
+import type { RenderModel } from "./render";
+import { normalizeAlignDeltas, planSource, type TrackTiming, trackEndSec } from "./timeline-math";
 
 const MIN_DB = -60;
 const MAX_DB = 6;
@@ -462,25 +464,21 @@ export class TakePlayer {
     return (this.alignDelta(track) + driftSamples) / track.buffer.sampleRate;
   }
 
-  /** Samples to trim from each track's head so all aligned tracks share the
-   * room clock. Streams may lock onto different repeats of the sweep (the
-   * §10 schedule emits it twice); deltas are normalized modulo the repeat
-   * interval, which is safe while true inter-device offsets stay under half
-   * the interval (1 s — arming spread is hundreds of ms at worst). */
+  /** Samples to trim from each track's head so all aligned tracks share
+   * the room clock — the modulo-repeat normalization lives in
+   * timeline-math (shared with the offline render). */
   private alignDeltas(): Map<string, number> {
-    const out = new Map<string, number>();
-    const applied = [...this.tracks.values()].filter((t) => t.alignment?.applied);
-    if (applied.length < 2) return out;
     const spec = DEFAULT_CHIRP_SPEC;
-    const base = Math.min(...applied.map((t) => t.alignment?.lagSamples ?? 0));
-    const normalized = applied.map((t) => {
-      const interval = Math.round(((spec.durationMs + spec.gapMs) / 1_000) * t.buffer.sampleRate);
-      const raw = (t.alignment?.lagSamples ?? 0) - base;
-      return [t.streamId, raw - Math.round(raw / interval) * interval] as const;
-    });
-    const min = Math.min(...normalized.map(([, d]) => d));
-    for (const [streamId, d] of normalized) out.set(streamId, d - min);
-    return out;
+    return normalizeAlignDeltas(
+      [...this.tracks.values()]
+        .filter((t) => t.alignment?.applied)
+        .map((t) => ({
+          streamId: t.streamId,
+          lagSamples: t.alignment?.lagSamples ?? 0,
+          sampleRate: t.buffer.sampleRate,
+        })),
+      (spec.durationMs + spec.gapMs) / 1_000,
+    );
   }
 
   private alignDelta(track: Track): number {
@@ -548,16 +546,51 @@ export class TakePlayer {
     return this.clipDelays.get(streamId) ?? 0;
   }
 
+  /** The SAME schedule parameters live playback and the offline render
+   * plan sources with (timeline-math.planSource) — the parity contract. */
+  private timing(track: Track): TrackTiming {
+    return {
+      headSec: this.headSec(track),
+      ratio: this.driftRatio(track),
+      clipDelaySec: this.clipDelay(track.streamId),
+      bufferDurationSec: track.buffer.duration,
+    };
+  }
+
   duration(): number {
     let max = 0;
     for (const t of this.tracks.values()) {
-      // Buffer seconds shrink by the drift ratio on the room timeline.
-      max = Math.max(
-        max,
-        this.clipDelay(t.streamId) + (t.buffer.duration - this.headSec(t)) / this.driftRatio(t),
-      );
+      max = Math.max(max, trackEndSec(this.timing(t)));
     }
     return max;
+  }
+
+  /** Immutable inputs for the offline export path (render.ts): the decoded
+   * buffers (shared by reference, read-only — stored audio is never
+   * mutated), the SAME per-track timing playback schedules with, and the
+   * mixer state resolved exactly as applyGains() resolves it (mute/solo →
+   * gain 0). Null while nothing is loaded. */
+  renderModel(): RenderModel | null {
+    if (!this.loadedTakeId || this.tracks.size === 0) return null;
+    const anySolo = [...this.channels.values()].some((c) => c.soloed);
+    return {
+      takeId: this.loadedTakeId,
+      durationSec: this.duration(),
+      masterGain: dbToLinear(this.masterDb),
+      masterPan: this.masterPan,
+      tracks: [...this.tracks.values()].map((track) => {
+        const strip = this.channel(track.channelKey);
+        const audible = !strip.muted && (!anySolo || strip.soloed);
+        return {
+          streamId: track.streamId,
+          channelKey: track.channelKey,
+          buffer: track.buffer,
+          timing: this.timing(track),
+          gain: audible ? dbToLinear(strip.gainDb) : 0,
+          pan: strip.pan,
+        };
+      }),
+    };
   }
 
   position(): number {
@@ -579,25 +612,16 @@ export class TakePlayer {
     const ctx = this.ensureGraph();
     const when = ctx.currentTime + 0.06;
     for (const track of this.tracks.values()) {
-      const ratio = this.driftRatio(track);
-      const headSec = this.headSec(track);
-      // Timeline time t maps to buffer time headSec + (t − clipDelay)·ratio:
-      // a fast target clock packed more samples into each room-second, so
-      // playbackRate = ratio consumes them at exactly one room-second per
-      // second (±200 ppm is far below audible pitch change).
-      const rel = fromSec - this.clipDelay(track.streamId);
+      // Timeline→buffer mapping (head trim, drift ratio, clip delay) is the
+      // shared planSource — identical for playback and export by design.
+      const timing = this.timing(track);
+      const plan = planSource(timing, fromSec);
+      if (!plan) continue;
       const source = ctx.createBufferSource();
       source.buffer = track.buffer;
-      source.playbackRate.value = ratio;
+      source.playbackRate.value = timing.ratio;
       source.connect(track.gain);
-      if (rel >= 0) {
-        const offset = headSec + rel * ratio;
-        if (offset >= track.buffer.duration) continue;
-        source.start(when, offset);
-      } else {
-        // Clip begins later on the timeline: schedule its future start.
-        source.start(when - rel, headSec);
-      }
+      source.start(when + plan.whenSec, plan.offsetSec);
       this.sources.push(source);
     }
     this.startCtxTime = when;

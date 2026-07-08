@@ -44,6 +44,8 @@ import {
 import type { ChannelStrip, DriftResult, PlayerSnapshot } from "./player";
 import {
   ensureWaveform,
+  exportMasterWav,
+  exportStemsZip,
   getCachedWaveform,
   getDeskSession,
   getPlayer,
@@ -599,7 +601,7 @@ function Desk({ sessionId }: { sessionId: string }) {
     });
   }
 
-  function exportAll() {
+  function exportFlacAll() {
     // Exports carry the lane name (nickname when set) for human filenames.
     const laneOf = new Map<string, string>();
     for (const row of rows) {
@@ -614,6 +616,38 @@ function Desk({ sessionId }: { sessionId: string }) {
         a.download = `${lane ? `${fileSafe(lane)}-` : ""}${desk.streamId.slice(0, 8)}.flac`;
         a.click();
       }
+    }
+  }
+
+  // ---- offline export (W2-A) ----------------------------------------------
+  // Master/stems render exactly what playback would play (render.ts shares
+  // the player's scheduling math), so they gate on playback readiness: the
+  // selected take loaded, alignment settled, transport idle.
+  const canRenderTake = playerLoaded && !recording && !playerSnap.loading && !playerSnap.aligning;
+  const [exportBusy, setExportBusy] = useState<"master" | "stems" | null>(null);
+  const [exportError, setExportError] = useState<string | null>(null);
+
+  async function runExport(kind: "master" | "stems") {
+    if (exportBusy) return;
+    const takeNumber = selectedTakeId ? [...takes.keys()].indexOf(selectedTakeId) + 1 : 0;
+    const takeTag = `take-${String(Math.max(1, takeNumber)).padStart(2, "0")}`;
+    setExportBusy(kind);
+    setExportError(null);
+    try {
+      if (kind === "master") {
+        await exportMasterWav(`${takeTag}-master.wav`);
+      } else {
+        // Stems carry the lane name (nickname when set), like the FLAC path.
+        const laneOf = new Map(rows.map((row) => [row.key, row.name]));
+        await exportStemsZip(`${takeTag}-stems.zip`, (streamId, channelKey) => {
+          const lane = laneOf.get(channelKey);
+          return `${lane ? `${fileSafe(lane)}-` : ""}${streamId.slice(0, 8)}.wav`;
+        });
+      }
+    } catch (e) {
+      setExportError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setExportBusy(null);
     }
   }
 
@@ -707,14 +741,14 @@ function Desk({ sessionId }: { sessionId: string }) {
           >
             {shared ? "Copied!" : "Share"}
           </button>
-          <button
-            type="button"
-            onClick={exportAll}
-            disabled={convergedCount === 0}
-            className="rounded-md bg-accent px-3.5 py-1.5 text-[11px] font-semibold text-white hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
-          >
-            Export ▾
-          </button>
+          <ExportMenu
+            busy={exportBusy}
+            canRender={canRenderTake}
+            canFlac={convergedCount > 0}
+            onMaster={() => void runExport("master")}
+            onStems={() => void runExport("stems")}
+            onFlac={exportFlacAll}
+          />
         </div>
       </header>
 
@@ -751,6 +785,9 @@ function Desk({ sessionId }: { sessionId: string }) {
           )}
           {playerSnap.error && (
             <span className="font-mono text-[9px] text-warn">{playerSnap.error}</span>
+          )}
+          {exportError && (
+            <span className="font-mono text-[9px] text-warn">export: {exportError}</span>
           )}
           {state.errors.length > 0 && (
             <span className="font-mono text-[9px] text-rec">
@@ -931,6 +968,112 @@ function Desk({ sessionId }: { sessionId: string }) {
         />
       </div>
     </main>
+  );
+}
+
+/** Top-bar "Export ▾" dropdown (the prototype's decorative button, live):
+ * offline renders of the loaded take — master WAV, stems ZIP — plus the raw
+ * per-stream FLAC downloads. Render items gate on playback readiness; the
+ * button shows an indeterminate busy label while an OfflineAudioContext
+ * render runs (one-shot: no meaningful progress to report). */
+function ExportMenu({
+  busy,
+  canRender,
+  canFlac,
+  onMaster,
+  onStems,
+  onFlac,
+}: {
+  busy: "master" | "stems" | null;
+  canRender: boolean;
+  canFlac: boolean;
+  onMaster: () => void;
+  onStems: () => void;
+  onFlac: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const pick = (action: () => void) => () => {
+    setOpen(false);
+    action();
+  };
+  return (
+    <div className="relative">
+      <button
+        type="button"
+        aria-expanded={open}
+        aria-haspopup="menu"
+        onClick={() => setOpen((o) => !o)}
+        disabled={busy !== null || (!canRender && !canFlac)}
+        className={`rounded-md bg-accent px-3.5 py-1.5 text-[11px] font-semibold text-white hover:brightness-110 ${
+          busy !== null
+            ? "animate-pulse cursor-wait"
+            : "disabled:cursor-not-allowed disabled:opacity-40"
+        }`}
+      >
+        {busy === "master" ? "Rendering mix…" : busy === "stems" ? "Rendering stems…" : "Export ▾"}
+      </button>
+      {open && (
+        <>
+          {/* Click-away backdrop */}
+          <button
+            type="button"
+            aria-label="Close export menu"
+            tabIndex={-1}
+            onClick={() => setOpen(false)}
+            className="fixed inset-0 z-[19] cursor-default"
+          />
+          <div
+            role="menu"
+            className="absolute top-[calc(100%+6px)] right-0 z-[20] w-[236px] rounded-lg border border-edge-card bg-card p-1 shadow-[0_10px_28px_rgba(0,0,0,.55)]"
+          >
+            <ExportItem
+              title="Master mix"
+              hint="WAV · 24-bit · 48 kHz"
+              disabled={!canRender}
+              onClick={pick(onMaster)}
+            />
+            <ExportItem
+              title="Stems"
+              hint="ZIP · aligned mono WAVs"
+              disabled={!canRender}
+              onClick={pick(onStems)}
+            />
+            <div className="mx-1.5 my-1 h-px bg-divider" />
+            <ExportItem
+              title="Source streams"
+              hint="FLAC · raw per stream"
+              disabled={!canFlac}
+              onClick={pick(onFlac)}
+            />
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+function ExportItem({
+  title,
+  hint,
+  disabled,
+  onClick,
+}: {
+  title: string;
+  hint: string;
+  disabled: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      role="menuitem"
+      disabled={disabled}
+      onClick={onClick}
+      className="flex w-full items-baseline justify-between gap-3 rounded-md px-2.5 py-2 text-left hover:bg-card-hi disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent"
+    >
+      <span className="text-[11px] font-semibold text-text-strong">{title}</span>
+      <span className="font-mono text-[9px] text-text-faint">{hint}</span>
+    </button>
   );
 }
 

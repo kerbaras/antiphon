@@ -4,6 +4,10 @@
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { DeskSession, type DeskSessionState } from "../../net/desk-session";
 import { computeWaveform, type PlayerSnapshot, TakePlayer } from "./player";
+import { renderMaster, renderStems } from "./render";
+import type { RenderRange } from "./timeline-math";
+import { encodeWav } from "./wav";
+import { buildZip } from "./zip";
 
 let session: DeskSession | null = null;
 let latest: DeskSessionState | null = null;
@@ -91,6 +95,60 @@ export async function loadTakeIntoPlayer(
     if (track.waveform.length > 0) waveformCache.set(track.streamId, track.waveform);
   }
   return ok;
+}
+
+// ---- export (W2-A) -----------------------------------------------------------
+// Heavy offline work lives here, out of the component tree: render the
+// loaded take through an OfflineAudioContext (render.ts), encode WAV/ZIP
+// (wav.ts/zip.ts), hand the bytes to the browser as a download. Both are
+// range-capable (RenderRange, room-timeline seconds) for W2-B markers;
+// today's UI passes no range = whole take.
+
+/** Render the loaded take's master mix (mixer + master state, alignment,
+ * drift — exactly what playback monitors) to a 24-bit 48 kHz stereo WAV. */
+export async function exportMasterWav(fileName: string, range?: RenderRange): Promise<void> {
+  const model = getPlayer().renderModel();
+  if (!model) throw new Error("no take loaded");
+  const buffer = await renderMaster(model, range);
+  downloadBlob(
+    fileName,
+    new Blob([encodeWav(channelData(buffer), buffer.sampleRate)], {
+      type: "audio/wav",
+    }),
+  );
+}
+
+/** Render aligned+drift-corrected mono stems (pre-mix: strip gain/pan/
+ * mute/solo intentionally not baked — see renderStems) and bundle them
+ * into a STORE ZIP. `stemName` maps each track to its archive filename. */
+export async function exportStemsZip(
+  fileName: string,
+  stemName: (streamId: string, channelKey: string) => string,
+  range?: RenderRange,
+): Promise<void> {
+  const model = getPlayer().renderModel();
+  if (!model) throw new Error("no take loaded");
+  const stems = await renderStems(model, range);
+  const entries = stems.map((stem) => ({
+    name: stemName(stem.streamId, stem.channelKey),
+    data: new Uint8Array(encodeWav(channelData(stem.buffer), stem.buffer.sampleRate)),
+  }));
+  downloadBlob(fileName, new Blob([buildZip(entries)], { type: "application/zip" }));
+}
+
+function channelData(buffer: AudioBuffer): Float32Array[] {
+  return Array.from({ length: buffer.numberOfChannels }, (_, ch) => buffer.getChannelData(ch));
+}
+
+function downloadBlob(name: string, blob: Blob): void {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = name;
+  a.click();
+  // Revoke after the download has had time to start (revoking immediately
+  // races the browser's fetch of the blob URL).
+  window.setTimeout(() => URL.revokeObjectURL(url), 10_000);
 }
 
 // ---- persistent true-waveform cache -----------------------------------------
