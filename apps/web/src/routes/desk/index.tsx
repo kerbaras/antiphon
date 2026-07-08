@@ -62,6 +62,7 @@ import {
   useTakeMarkers,
   waveformCacheSize,
 } from "./use-desk";
+import { type DeskInputState, getDeskInput, useDeskInput } from "./use-desk-input";
 
 const TRACK_COLORS = [
   "#4fb8a8",
@@ -165,6 +166,10 @@ function Desk({ sessionId }: { sessionId: string }) {
   const recording = state.activeTakeId !== null;
   useTick(recording, 100);
   const recorders = (state.session?.peers ?? []).filter((p) => p.role === "recorder");
+  // The desk's own input joins as a recorder peer (W2-D); it gets a lane
+  // like everyone else but is not a "phone" anywhere the copy says so.
+  const deskInput = useDeskInput(sessionId);
+  const phones = recorders.filter((p) => p.peerId !== deskInput.peerId);
   const peerByStream = useMemo(() => {
     const map = new Map<string, string>();
     for (const s of state.streams) if (s.peerId) map.set(s.streamId, s.peerId);
@@ -198,8 +203,12 @@ function Desk({ sessionId }: { sessionId: string }) {
           peerInitials:
             initialsOf(nickname) ?? (peerId ?? stream.streamId).slice(0, 2).toUpperCase(),
           // The chip keeps the device provenance even when a nickname rules
-          // the lane title ("Maria" · chip "iPhone").
-          peerLabel: peer ? deviceName(peer.deviceInfo.userAgent) : null,
+          // the lane title ("Maria" · chip "iPhone"; the desk input · "Desk").
+          peerLabel: peer
+            ? peer.peerId === deskInput.peerId
+              ? "Desk"
+              : deviceName(peer.deviceInfo.userAgent)
+            : null,
           streams: [],
           receiving: false,
           armed: false,
@@ -212,7 +221,7 @@ function Desk({ sessionId }: { sessionId: string }) {
       if (stream.takeId === state.activeTakeId) row.armed = true;
     }
     return order.map((k) => byKey.get(k) as TrackRow);
-  }, [state.deskStatus, peerByStream, recorders, receiving, state.activeTakeId]);
+  }, [state.deskStatus, peerByStream, recorders, receiving, state.activeTakeId, deskInput.peerId]);
 
   // Takes in CHRONOLOGICAL order with sequential timeline offsets. Stream
   // announces arrive live (in take order); deskStatus alone is sorted by
@@ -725,7 +734,8 @@ function Desk({ sessionId }: { sessionId: string }) {
               Session {sessionId.slice(0, 8)}
             </span>
             <span className="truncate text-[10px] text-text-dim">
-              {recorders.length} phone{recorders.length === 1 ? "" : "s"} connected · archive{" "}
+              {phones.length} phone{phones.length === 1 ? "" : "s"} connected
+              {deskInput.phase === "live" ? " · desk input" : ""} · archive{" "}
               {state.serverSync === "connected" ? "linked" : state.serverSync}
               {state.rebuiltChunks > 0 ? ` · ${state.rebuiltChunks} chunks recovered` : ""}
             </span>
@@ -788,7 +798,7 @@ function Desk({ sessionId }: { sessionId: string }) {
           <AvatarStack
             people={[
               { initials: "DK", color: "#c8c9cb", title: "You (Desk)" },
-              ...recorders.slice(0, 3).map((p, i) => ({
+              ...phones.slice(0, 3).map((p, i) => ({
                 initials: initialsOf(p.deviceInfo.label) ?? p.peerId.slice(0, 2).toUpperCase(),
                 color: TRACK_COLORS[i % TRACK_COLORS.length] as string,
                 title: p.deviceInfo.label?.trim() || deviceName(p.deviceInfo.userAgent),
@@ -1059,12 +1069,13 @@ function Desk({ sessionId }: { sessionId: string }) {
           {tab === "performers" ? (
             <PerformersPanel
               sessionId={sessionId}
-              recorders={recorders}
+              recorders={phones}
               rows={rows}
               joinUrl={joinUrl}
               activeTakeId={state.activeTakeId}
               streams={state.streams}
               levelForRow={levelFor}
+              deskInput={deskInput}
             />
           ) : tab === "songs" ? (
             <SongsPanel
@@ -1706,6 +1717,7 @@ function PerformersPanel({
   activeTakeId,
   streams,
   levelForRow,
+  deskInput,
 }: {
   sessionId: string;
   recorders: PeerInfo[];
@@ -1714,6 +1726,7 @@ function PerformersPanel({
   activeTakeId: string | null;
   streams: Array<{ streamId: string; takeId: string; peerId: string | null }>;
   levelForRow: (row: TrackRow) => number;
+  deskInput: DeskInputState;
 }) {
   const [showQr, setShowQr] = useState<boolean | null>(null);
   // Auto-open while the room is empty, tuck away once performers arrive;
@@ -1767,6 +1780,13 @@ function PerformersPanel({
         );
       })}
 
+      <DeskInputBlock
+        sessionId={sessionId}
+        input={deskInput}
+        takeRolling={activeTakeId !== null}
+        color={rows.find((r) => r.peerId === deskInput.peerId)?.color ?? null}
+      />
+
       <button
         type="button"
         onClick={() => setShowQr(!qrVisible)}
@@ -1789,6 +1809,169 @@ function PerformersPanel({
         sync {session.snapshot().serverSync}
       </p>
     </div>
+  );
+}
+
+/** The desk's own hardware input (W2-D): pick an interface/mic and run it
+ * as an embedded recorder lane — the ARCHITECTURE §2.2 room reference mic.
+ * Device labels are blank until permission grants, so the picker opens
+ * through a one-off probe; the live card shows the real capture level and
+ * the same EC/NS/AGC honesty as the phone page. Enable/disable sit out
+ * rolling takes: a lane must never appear or vanish mid-take. */
+function DeskInputBlock({
+  sessionId,
+  input,
+  takeRolling,
+  color,
+}: {
+  sessionId: string;
+  input: DeskInputState;
+  takeRolling: boolean;
+  color: string | null;
+}) {
+  const [pickedId, setPickedId] = useState<string | null>(null);
+  const mgr = getDeskInput(sessionId);
+
+  if (input.phase === "off") {
+    return (
+      <div className="flex flex-col gap-1">
+        <button
+          type="button"
+          disabled={takeRolling}
+          onClick={() => void (input.resumeLabel ? mgr.resume() : mgr.openPicker())}
+          className="flex items-center justify-center gap-2 rounded-lg border border-dashed border-edge-strong p-2.5 text-[11px] font-semibold text-text-dim hover:text-text disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          {input.resumeLabel ? "⏻ Resume desk input" : "+ Add desk input"}
+          <span className="rounded border border-edge-strong px-1.5 py-px font-mono text-[9px]">
+            MIC
+          </span>
+        </button>
+        {input.resumeLabel && (
+          <div className="flex items-baseline justify-between gap-2 px-1">
+            <span className="truncate font-mono text-[9px] text-text-faint">
+              {input.resumeLabel}
+            </span>
+            <button
+              type="button"
+              onClick={() => void mgr.openPicker()}
+              className="flex-none font-mono text-[9px] text-text-dim hover:text-accent"
+            >
+              change
+            </button>
+          </div>
+        )}
+        {input.error && <p className="px-1 font-mono text-[9px] text-rec">{input.error}</p>}
+      </div>
+    );
+  }
+
+  if (input.phase === "picking" || input.phase === "starting") {
+    const picked = input.devices.find((d) => d.id === pickedId) ?? input.devices[0];
+    return (
+      <div className="flex flex-col gap-2 rounded-lg border border-edge-card bg-card p-2.5">
+        <SectionLabel>Desk input</SectionLabel>
+        <select
+          aria-label="Desk input device"
+          value={picked?.id ?? ""}
+          onChange={(e) => setPickedId(e.target.value)}
+          disabled={input.phase === "starting"}
+          className="w-full rounded-md border border-edge-inset bg-bg px-2 py-1.5 text-[11px] text-text outline-none focus:border-accent"
+        >
+          {input.devices.length === 0 && <option value="">no inputs found</option>}
+          {input.devices.map((d) => (
+            <option key={d.id} value={d.id}>
+              {d.label}
+            </option>
+          ))}
+        </select>
+        <div className="flex items-center gap-1.5">
+          <button
+            type="button"
+            disabled={!picked || takeRolling || input.phase === "starting"}
+            onClick={() => {
+              if (picked) void mgr.enable(picked);
+            }}
+            className="rounded-md bg-accent px-3 py-1.5 text-[11px] font-semibold text-white hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40"
+          >
+            {input.phase === "starting" ? "Starting…" : "Use input"}
+          </button>
+          <button
+            type="button"
+            onClick={() => mgr.closePicker()}
+            disabled={input.phase === "starting"}
+            className="rounded-md border border-edge-strong px-3 py-1.5 text-[11px] font-semibold text-text hover:bg-card-hi disabled:opacity-40"
+          >
+            Cancel
+          </button>
+        </div>
+        {takeRolling && (
+          <p className="font-mono text-[9px] text-text-faint">available between takes</p>
+        )}
+        {input.error && <p className="font-mono text-[9px] text-rec">{input.error}</p>}
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-[7px] rounded-lg border border-edge-card bg-card-hi px-2.5 py-[9px]">
+      <div className="flex items-center gap-2">
+        <Avatar
+          initials={initialsOf(input.laneLabel ?? undefined) ?? "RM"}
+          color={color ?? "var(--color-accent)"}
+          dot={input.recording ? "var(--color-rec)" : "var(--color-ok)"}
+        />
+        <div className="min-w-0 flex-1">
+          <div className="truncate text-[11.5px] font-semibold text-text-strong">
+            {input.laneLabel ?? "Desk input"}
+          </div>
+          <div className="truncate font-mono text-[9.5px] text-text-dim">
+            {input.input?.label}
+            {input.sampleRate ? ` · ${(input.sampleRate / 1000).toFixed(1)} kHz` : ""}
+          </div>
+        </div>
+        <StatusPill tone={input.recording ? "rec" : "ok"}>
+          {input.recording ? "recording" : "ready"}
+        </StatusPill>
+      </div>
+      <VUMeter level={input.peak} />
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex gap-1">
+          <CaptureFlagChip label="EC" value={input.flags?.echoCancellation} />
+          <CaptureFlagChip label="NS" value={input.flags?.noiseSuppression} />
+          <CaptureFlagChip label="AGC" value={input.flags?.autoGainControl} />
+        </div>
+        <button
+          type="button"
+          disabled={takeRolling}
+          onClick={() => void mgr.disable()}
+          title={takeRolling ? "Available between takes" : "Release this input"}
+          className="flex-none font-mono text-[9px] font-semibold tracking-[0.5px] text-text-dim uppercase hover:text-rec disabled:cursor-not-allowed disabled:opacity-40"
+        >
+          disable
+        </button>
+      </div>
+      {input.unplugged && (
+        <p className="font-mono text-[9px] leading-relaxed text-warn">
+          input unplugged — the lane records silence; swap or disable between takes
+        </p>
+      )}
+      {input.error && <p className="font-mono text-[9px] text-rec">{input.error}</p>}
+    </div>
+  );
+}
+
+/** EC/NS/AGC honesty chip (desk-compact twin of the phone page badges):
+ * all three must be OFF for a truthful recording. */
+function CaptureFlagChip({ label, value }: { label: string; value: boolean | string | undefined }) {
+  const off = value === false || value === "none";
+  return (
+    <span
+      className={`rounded-[3px] border border-edge bg-bg px-1.5 py-px font-mono text-[8px] font-bold tracking-[0.5px] ${
+        off ? "text-ok" : value === undefined ? "text-warn" : "text-rec"
+      }`}
+    >
+      {label} {off ? "OFF" : value === undefined ? "—" : "ON"}
+    </span>
   );
 }
 

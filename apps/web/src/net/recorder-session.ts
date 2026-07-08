@@ -28,6 +28,17 @@ interface SinkLink {
   wanted: boolean;
 }
 
+/** Alternate identity for an embedded recorder (the desk's hardware input,
+ * W2-D). Omitted = phone defaults: persisted nickname + browser deviceId. */
+export interface RecorderIdentity {
+  /** Stable A12 deviceId this recorder joins with. */
+  deviceId: string;
+  /** Initial lane label (nickname). */
+  label: string | null;
+  /** Where renames (self- or desk-initiated, A13) persist. */
+  persistLabel: (label: string) => void;
+}
+
 export interface RecorderSessionState {
   signalingConnected: boolean;
   peerId: string | null;
@@ -47,6 +58,7 @@ type Listener = (state: RecorderSessionState) => void;
 export class RecorderSession {
   private readonly signaling: SignalingClient;
   private readonly controller: CaptureController;
+  private readonly persistLabel: (label: string) => void;
   private readonly links = new Map<number, SinkLink>();
   private readonly listeners = new Set<Listener>();
   private timeSyncTimer: number | null = null;
@@ -56,9 +68,15 @@ export class RecorderSession {
   private sittingOutTakeId: string | null = null;
   private stoppedForFinal: { takeId: string; streamId: string } | null = null;
 
-  constructor(sessionId: string, controller: CaptureController) {
+  constructor(sessionId: string, controller: CaptureController, identity?: RecorderIdentity) {
     this.controller = controller;
-    this.signaling = new SignalingClient("recorder", sessionId, getNickname());
+    this.persistLabel = identity ? identity.persistLabel : setNickname;
+    this.signaling = new SignalingClient(
+      "recorder",
+      sessionId,
+      identity ? identity.label : getNickname(),
+      identity?.deviceId ?? null,
+    );
   }
 
   start(): void {
@@ -107,7 +125,7 @@ export class RecorderSession {
    * tell the room when connected. Empty clears back to the device name. */
   rename(label: string): void {
     const trimmed = label.trim();
-    setNickname(trimmed);
+    this.persistLabel(trimmed);
     this.signaling.label = trimmed || null;
     const me = this.signaling.state.peerId;
     if (this.signaling.state.connected && me) {
@@ -151,7 +169,7 @@ export class RecorderSession {
       case "peer-update":
         // The desk renamed us: adopt + persist so the name survives reloads.
         if (msg.peerId === this.signaling.state.peerId) {
-          setNickname(msg.label);
+          this.persistLabel(msg.label);
           this.signaling.label = msg.label.trim() || null;
         }
         break;

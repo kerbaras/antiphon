@@ -3,7 +3,9 @@
 // speakers, and the acoustic loop (speaker → air → mic) drives real chirp
 // alignment. Then playback, seek, mute/solo, and faders are exercised.
 //
-// Run with the preview (4173) + server (8787) up:  node e2e/live-validate.mjs
+// Run with the preview + server up:  node e2e/live-validate.mjs
+// Defaults to the fixed ports (4173/8787); in a worktree running the e2e
+// suite, pass its derived port via ANTIPHON_E2E_WEB_PORT (see e2e/ports.ts).
 
 import { chromium } from "@playwright/test";
 
@@ -19,7 +21,7 @@ const browser = await chromium.launch({
   args: ["--autoplay-policy=no-user-gesture-required"],
 });
 const sessionId = crypto.randomUUID();
-const origin = "http://localhost:4173";
+const origin = `http://localhost:${process.env.ANTIPHON_E2E_WEB_PORT ?? 4173}`;
 
 // --- desk ------------------------------------------------------------------
 const deskCtx = await browser.newContext({ viewport: { width: 1440, height: 900 } });

@@ -15,6 +15,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { expect, type Page, test } from "@playwright/test";
+import { WEB_PORT } from "../ports";
 import {
   freePort,
   type SameOriginProxy,
@@ -34,8 +35,9 @@ import {
   stopTake,
 } from "./helpers/session";
 
-/** Vite preview port from playwright.config.ts (baseURL). */
-const WEB_PREVIEW_PORT = 4173;
+/** Vite preview port — same worktree-derived port the playwright.config
+ * baseURL uses (e2e/ports.ts). */
+const WEB_PREVIEW_PORT = WEB_PORT;
 
 /** Poll the dedicated server directly (test-runner fetch): resilient to
  * the server being down mid-poll. */

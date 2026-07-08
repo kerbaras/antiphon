@@ -12,10 +12,14 @@ const crossOriginIsolation = {
 
 // Control plane + archive REST live on the app server; one origin for the
 // browser (and for a single cloudflared tunnel) via proxy in dev/preview.
+// The e2e suite runs one preview+server pair per git worktree on derived
+// ports (e2e/ports.ts) and threads the server origin in here; dev and CI
+// keep the fixed :8787 default.
+const serverOrigin = process.env.ANTIPHON_SERVER_ORIGIN ?? "http://localhost:8787";
 const serverProxy = {
-  "/api": { target: "http://localhost:8787", changeOrigin: true },
+  "/api": { target: serverOrigin, changeOrigin: true },
   "^/(session|join)/[^/]+/ws$": {
-    target: "http://localhost:8787",
+    target: serverOrigin,
     ws: true,
     changeOrigin: true,
   },

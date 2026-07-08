@@ -52,6 +52,13 @@ export interface ArmOptions {
   retainLocal?: boolean;
 }
 
+export interface CaptureStartOptions {
+  /** Capture a specific input (desk hardware lanes); default = user default mic. */
+  deviceId?: string;
+  /** Screen wake lock (phone backgrounding UX); the desk skips it. Default true. */
+  wakeLock?: boolean;
+}
+
 export class CaptureController {
   private context: AudioContext | null = null;
   private stream: MediaStream | null = null;
@@ -91,9 +98,18 @@ export class CaptureController {
     return this.context?.sampleRate ?? null;
   }
 
+  /** The live input track (unplug detection: 'ended' fires when the device
+   * goes away; the graph then feeds silence, keeping the sample domain
+   * contiguous — take integrity over dead air). */
+  get audioTrack(): MediaStreamTrack | null {
+    return this.stream?.getAudioTracks()[0] ?? null;
+  }
+
   /** Ask for the mic with every processing flag OFF and start the pipeline.
-   * Must be called from a user gesture (iOS). */
-  async start(): Promise<void> {
+   * Must be called from a user gesture (iOS). Multichannel inputs downmix
+   * to mono in the worklet node (channelCount 1, explicit): stereo becomes
+   * (L+R)/2 per Web Audio up/down-mix rules — protocol v1 is mono (§6.2). */
+  async start(options: CaptureStartOptions = {}): Promise<void> {
     if (this.context) return;
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
@@ -102,6 +118,7 @@ export class CaptureController {
           noiseSuppression: false,
           autoGainControl: false,
           channelCount: 1,
+          ...(options.deviceId !== undefined ? { deviceId: { exact: options.deviceId } } : {}),
         },
       });
       this.stream = stream;
@@ -144,7 +161,7 @@ export class CaptureController {
         },
         error: null,
       });
-      await this.acquireWakeLock();
+      if (options.wakeLock !== false) await this.acquireWakeLock();
     } catch (e) {
       this.publish({ error: `capture start failed: ${String(e)}` });
       throw e;

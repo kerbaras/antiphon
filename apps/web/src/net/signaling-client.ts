@@ -28,6 +28,9 @@ export class SignalingClient {
   /** Nickname sent as `deviceInfo.label` on (re)hello (A13). Mutable so a
    * rename survives the next reconnect handshake. */
   label: string | null;
+  /** A12 identity override (the desk's embedded recorder derives its own);
+   * null = this browser's persisted deviceId. */
+  private readonly deviceId: string | null;
   private ws: WebSocket | null = null;
   private closed = false;
   private attempts = 0;
@@ -35,10 +38,16 @@ export class SignalingClient {
   private readonly stateListeners = new Set<StateListener>();
   state: SignalingClientState = { connected: false, peerId: null, session: null };
 
-  constructor(role: PeerRole, sessionId: string, label: string | null = null) {
+  constructor(
+    role: PeerRole,
+    sessionId: string,
+    label: string | null = null,
+    deviceId: string | null = null,
+  ) {
     this.role = role;
     this.sessionId = sessionId;
     this.label = label;
+    this.deviceId = deviceId;
   }
 
   connect(): void {
@@ -57,7 +66,7 @@ export class SignalingClient {
         deviceInfo: {
           userAgent: navigator.userAgent.slice(0, 500),
           // Stable per-browser id (A12): the server resumes our peerId.
-          deviceId: getDeviceId(),
+          deviceId: this.deviceId ?? getDeviceId(),
           ...(label ? { label } : {}),
         },
         protocolVersions: [1],

@@ -5,6 +5,7 @@
 
 import { expect, test } from "@playwright/test";
 import { readBarcodes } from "zxing-wasm/reader";
+import { WEB_PORT } from "../ports";
 
 test("styled join QR decodes to the join URL", async ({ page }) => {
   const sessionId = crypto.randomUUID();
@@ -73,5 +74,6 @@ test("styled join QR decodes to the join URL", async ({ page }) => {
     tryInvert: true,
     tryHarder: true,
   });
-  expect(results.map((r) => r.text)).toContain(`http://localhost:4173/join/${sessionId}`);
+  // The QR encodes window.location.origin — the (worktree-derived) baseURL.
+  expect(results.map((r) => r.text)).toContain(`http://localhost:${WEB_PORT}/join/${sessionId}`);
 });

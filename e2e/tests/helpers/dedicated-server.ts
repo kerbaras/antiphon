@@ -4,9 +4,9 @@
 // breaking parallel tests, so these specs spawn their own instance (own
 // PORT + BLOB_FS_ROOT, same Postgres) and put a tiny reverse proxy in
 // front: the web app is strictly same-origin (vite preview proxies /api
-// and the WS endpoints to a hardcoded :8787), so pages get a dedicated
-// origin whose /api + signaling routes hit the dedicated server while
-// everything else is served by the shared vite preview.
+// and the WS endpoints to the suite's server port), so pages get a
+// dedicated origin whose /api + signaling routes hit the dedicated server
+// while everything else is served by the shared vite preview.
 
 import { type ChildProcess, spawn } from "node:child_process";
 import http from "node:http";
@@ -23,6 +23,10 @@ export const DATABASE_URL =
  * /health for liveness probes. Everything else is the web app. */
 const SERVER_PATHS = /^\/(?:api(?:\/|$)|health$)|^\/(?:session|join)\/[^/]+\/ws$/;
 
+/** OS-assigned ephemeral port (listen on 0). Ephemeral ranges start at
+ * 32768 (Linux) / 49152 (macOS), so these can never collide with the
+ * worktree-derived 20000-29999 pairs in e2e/ports.ts or the fixed CI
+ * defaults. */
 export async function freePort(): Promise<number> {
   return await new Promise((resolve, reject) => {
     const srv = net.createServer();
