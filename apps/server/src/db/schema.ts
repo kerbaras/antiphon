@@ -28,6 +28,8 @@ export const peers = pgTable("peers", {
   role: text("role", { enum: ["desk", "recorder"] }).notNull(),
   userAgent: text("user_agent").notNull().default(""),
   label: text("label"),
+  /** Stable browser identity (A12): (session, role, device) resumes this peer id. */
+  deviceId: uuid("device_id"),
   joinedAt: timestamp("joined_at", { withTimezone: true }).notNull().defaultNow(),
 });
 

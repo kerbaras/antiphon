@@ -8,6 +8,7 @@ import {
   type SessionState,
   type SignalingMessage,
 } from "@antiphon/protocol";
+import { getDeviceId } from "./device-identity";
 
 type MessageListener = (msg: SignalingMessage) => void;
 type StateListener = (state: SignalingClientState) => void;
@@ -24,6 +25,9 @@ const RECONNECT_MAX_MS = 8_000;
 export class SignalingClient {
   readonly role: PeerRole;
   readonly sessionId: string;
+  /** Nickname sent as `deviceInfo.label` on (re)hello (A13). Mutable so a
+   * rename survives the next reconnect handshake. */
+  label: string | null;
   private ws: WebSocket | null = null;
   private closed = false;
   private attempts = 0;
@@ -31,9 +35,10 @@ export class SignalingClient {
   private readonly stateListeners = new Set<StateListener>();
   state: SignalingClientState = { connected: false, peerId: null, session: null };
 
-  constructor(role: PeerRole, sessionId: string) {
+  constructor(role: PeerRole, sessionId: string, label: string | null = null) {
     this.role = role;
     this.sessionId = sessionId;
+    this.label = label;
   }
 
   connect(): void {
@@ -44,11 +49,17 @@ export class SignalingClient {
     this.ws = ws;
     ws.addEventListener("open", () => {
       this.attempts = 0;
+      const label = this.label?.trim();
       this.sendRaw({
         v: 1,
         type: "hello",
         role: this.role,
-        deviceInfo: { userAgent: navigator.userAgent.slice(0, 500) },
+        deviceInfo: {
+          userAgent: navigator.userAgent.slice(0, 500),
+          // Stable per-browser id (A12): the server resumes our peerId.
+          deviceId: getDeviceId(),
+          ...(label ? { label } : {}),
+        },
         protocolVersions: [1],
       });
     });
@@ -64,6 +75,19 @@ export class SignalingClient {
         this.setState({ connected: true, peerId: msg.peerId, session: msg.session });
       } else if (msg.type === "peer-status") {
         this.setState({ ...this.state, session: msg.session });
+      } else if (msg.type === "peer-update" && this.state.session) {
+        // Live rename (A13): patch the snapshot so every consumer sees the
+        // new label without waiting for the next peer-status.
+        const update = msg;
+        const peers = this.state.session.peers.map((p) => {
+          if (p.peerId !== update.peerId) return p;
+          const { label: _drop, ...rest } = p.deviceInfo;
+          return {
+            ...p,
+            deviceInfo: { ...rest, ...(update.label ? { label: update.label } : {}) },
+          };
+        });
+        this.setState({ ...this.state, session: { ...this.state.session, peers } });
       }
       for (const l of this.messageListeners) l(msg);
     });

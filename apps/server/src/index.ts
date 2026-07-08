@@ -73,6 +73,7 @@ export async function createServer(config: ServerConfig = loadConfig()) {
         sessionId: c.req.param("sessionId"),
         pathRole: role,
         peerId: null,
+        epoch: 0,
       };
       return {
         onMessage(event: MessageEvent, ws: Parameters<Signaling["handleMessage"]>[1]) {

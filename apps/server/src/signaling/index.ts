@@ -22,12 +22,24 @@ interface RoomPeer {
   role: PeerRole;
   deviceInfo: DeviceInfo;
   joinedAt: string;
+  /** Connection generation: leave() from a superseded socket must not
+   * evict the peer that adopted a newer one (A12 zombie replacement). */
+  epoch: number;
   ws: WSContext;
+}
+
+/** Resumable identity (A12): what survives a peer's disconnect. */
+interface DeviceRecord {
+  peerId: string;
+  label: string | undefined;
+  joinedAt: string;
 }
 
 interface Room {
   sessionId: string;
   peers: Map<string, RoomPeer>;
+  /** `role:deviceId` → identity, for peerId resume across reconnects. */
+  devices: Map<string, DeviceRecord>;
   ingest: SessionIngest;
   activeTake: TakeInfo | null;
 }
@@ -37,11 +49,13 @@ export interface ConnState {
   sessionId: string;
   pathRole: PeerRole;
   peerId: string | null;
+  epoch: number;
 }
 
 export class Signaling {
   private readonly rooms = new Map<string, Promise<Room>>();
   private readonly archive: Archive;
+  private epochs = 0;
 
   constructor(archive: Archive) {
     this.archive = archive;
@@ -54,6 +68,7 @@ export class Signaling {
         const room: Room = {
           sessionId,
           peers: new Map(),
+          devices: new Map(),
           activeTake: null,
           ingest: new SessionIngest(sessionId, this.archive, {
             onLocalCandidate: (peerId, candidate, mid) => {
@@ -75,6 +90,16 @@ export class Signaling {
           }),
         };
         await room.ingest.init();
+        // Rebuild the device→peer index so identity resume (A12) survives
+        // a server restart the same way archive state does.
+        for (const row of await this.archive.loadPeers(sessionId)) {
+          if (!row.deviceId) continue;
+          room.devices.set(`${row.role}:${row.deviceId}`, {
+            peerId: row.id,
+            label: row.label ?? undefined,
+            joinedAt: row.joinedAt.toISOString(),
+          });
+        }
         return room;
       })();
       this.rooms.set(sessionId, pending);
@@ -227,6 +252,35 @@ export class Signaling {
         this.fanout(room, msg);
         break;
       }
+      case "peer-update": {
+        // A13 authority: a recorder renames only itself; the desk (session
+        // authority) renames anyone.
+        if (from.role !== "desk" && msg.peerId !== from.peerId) {
+          this.send(ws, {
+            v: 1,
+            type: "error",
+            code: "not-authorized",
+            message: "only the desk may rename other peers",
+          });
+          return;
+        }
+        const label = msg.label.trim() || undefined; // empty clears
+        const target = room.peers.get(msg.peerId);
+        const device = [...room.devices.values()].find((d) => d.peerId === msg.peerId);
+        if (!target && !device) {
+          this.send(ws, { v: 1, type: "error", code: "unknown-peer", message: "no such peer" });
+          return;
+        }
+        if (target) {
+          const { label: _drop, ...rest } = target.deviceInfo;
+          target.deviceInfo = { ...rest, ...(label ? { label } : {}) };
+        }
+        if (device) device.label = label;
+        await this.archive.updatePeerLabel(msg.peerId, label ?? null);
+        this.fanout(room, { v: 1, type: "peer-update", peerId: msg.peerId, label: label ?? "" });
+        this.fanoutPeerStatus(room);
+        break;
+      }
       case "bye": {
         this.leave(conn, room);
         break;
@@ -266,14 +320,52 @@ export class Signaling {
       return;
     }
     await this.archive.ensureSession(conn.sessionId);
-    const peerId = crypto.randomUUID();
+    // Identity resume (A12): the same device rejoining with the same role
+    // gets its previous peerId back — the desk keeps the lane, the mixer
+    // mapping, and the name. No deviceId = anonymous fresh peer, as before.
+    const deviceId = msg.deviceInfo.deviceId ?? null;
+    const known = deviceId ? room.devices.get(`${msg.role}:${deviceId}`) : undefined;
+    const peerId = known?.peerId ?? crypto.randomUUID();
+    // Zombie replacement: the previous socket for this identity is still
+    // open (the network lost it before we did) — error it out, newest wins.
+    const zombie = room.peers.get(peerId);
+    if (zombie) {
+      this.send(zombie.ws, {
+        v: 1,
+        type: "error",
+        code: "superseded",
+        message: "device reconnected on a new connection",
+        fatal: true,
+      });
+      try {
+        zombie.ws.close();
+      } catch {
+        // already gone
+      }
+      room.peers.delete(peerId);
+    }
+    // A non-empty hello label wins (the device speaks for itself); a silent
+    // reconnect keeps the stored nickname (possibly desk-given).
+    const label = msg.deviceInfo.label?.trim() || known?.label;
+    const joinedAt = known?.joinedAt ?? new Date().toISOString();
+    const epoch = ++this.epochs;
     conn.peerId = peerId;
-    room.peers.set(peerId, {
+    conn.epoch = epoch;
+    const deviceInfo: DeviceInfo = {
+      userAgent: msg.deviceInfo.userAgent,
+      ...(label ? { label } : {}),
+      ...(deviceId ? { deviceId } : {}),
+    };
+    room.peers.set(peerId, { peerId, role: msg.role, deviceInfo, joinedAt, epoch, ws });
+    if (deviceId) room.devices.set(`${msg.role}:${deviceId}`, { peerId, label, joinedAt });
+    await this.archive.upsertPeer({
       peerId,
+      sessionId: conn.sessionId,
       role: msg.role,
-      deviceInfo: msg.deviceInfo,
-      joinedAt: new Date().toISOString(),
-      ws,
+      userAgent: msg.deviceInfo.userAgent,
+      label: label ?? null,
+      deviceId,
+      joinedAt: new Date(joinedAt),
     });
     this.send(ws, {
       v: 1,
@@ -293,7 +385,11 @@ export class Signaling {
 
   private leave(conn: ConnState, room: Room): void {
     if (!conn.peerId) return;
-    if (room.peers.delete(conn.peerId)) {
+    // A superseded socket (A12) must not evict its successor: only the
+    // connection generation that owns the peer entry removes it.
+    const peer = room.peers.get(conn.peerId);
+    if (peer && peer.epoch === conn.epoch) {
+      room.peers.delete(conn.peerId);
       room.ingest.closePeer(conn.peerId);
       this.fanoutPeerStatus(room);
     }

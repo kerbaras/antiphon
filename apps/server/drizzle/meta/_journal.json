@@ -8,6 +8,13 @@
       "when": 1783303964978,
       "tag": "0000_stale_living_mummy",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1783488309844,
+      "tag": "0001_stiff_smiling_tiger",
+      "breakpoints": true
     }
   ]
 }

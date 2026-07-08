@@ -160,6 +160,12 @@ export class DeskSession {
     this.signaling.send({ v: 1, type: "take-stop", takeId: this.state.activeTakeId });
   }
 
+  /** Rename any peer (A13: the desk is the session authority). The server
+   * validates, persists, and fans out; our snapshot updates on the echo. */
+  renamePeer(peerId: string, label: string): void {
+    this.signaling.send({ v: 1, type: "peer-update", peerId, label: label.trim() });
+  }
+
   /** Play the calibration chirp (RFC §10) and announce it. */
   async playChirp(): Promise<void> {
     await initWasm();

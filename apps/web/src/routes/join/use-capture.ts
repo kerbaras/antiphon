@@ -3,6 +3,7 @@
 
 import { useCallback, useSyncExternalStore } from "react";
 import { CaptureController, type CaptureSnapshot } from "../../audio/capture-controller";
+import { setNickname } from "../../net/device-identity";
 import { RecorderSession, type RecorderSessionState } from "../../net/recorder-session";
 
 let controller: CaptureController | null = null;
@@ -43,6 +44,13 @@ export function joinSession(sessionId: string): RecorderSession {
     session.start();
   }
   return session;
+}
+
+/** Set the performer nickname: persisted locally always; announced to the
+ * room (peer-update, A13) when a session is live. */
+export function renameSelf(label: string): void {
+  if (session) session.rename(label);
+  else setNickname(label);
 }
 
 const EMPTY: CaptureSnapshot = {

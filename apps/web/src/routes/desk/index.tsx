@@ -6,6 +6,7 @@
 // chirp auto-alignment, and the gain/mute/solo mixer are all live; only
 // editing tools and pan (mono v1) remain visibly inert.
 
+import type { PeerInfo } from "@antiphon/protocol";
 import { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useParams } from "react-router";
 import type { DeskStreamStatus } from "../../audio/sink-worker-protocol";
@@ -80,6 +81,8 @@ export function DeskRoute() {
 interface TrackRow {
   key: string;
   index: number;
+  /** Renameable lane ⇔ it maps to a known peer (peer-update target). */
+  peerId: string | null;
   name: string;
   color: string;
   peerInitials: string;
@@ -115,6 +118,21 @@ function useReceiving(deskStatus: DeskStreamStatus[]): Set<string> {
 function deviceName(userAgent: string): string {
   const m = /iPhone|iPad|Android|Macintosh|Windows/.exec(userAgent);
   return m ? m[0] : "Browser";
+}
+
+/** Avatar initials from a nickname: first letters of the first two words. */
+function initialsOf(label: string | undefined): string | null {
+  const words = label?.trim().split(/\s+/).filter(Boolean) ?? [];
+  if (words.length === 0) return null;
+  return words
+    .slice(0, 2)
+    .map((w) => (w[0] as string).toUpperCase())
+    .join("");
+}
+
+/** Filesystem-safe lane name for export filenames. */
+function fileSafe(name: string): string {
+  return name.replace(/[^\p{L}\p{N}]+/gu, "-").replace(/^-+|-+$/g, "") || "track";
 }
 
 /** Re-render at `ms` cadence while `active` (live timecode + growing clip). */
@@ -158,14 +176,22 @@ function Desk({ sessionId }: { sessionId: string }) {
       if (!row) {
         const index = order.length;
         const peer = recorders.find((p) => p.peerId === peerId);
+        // Nickname first (A13); fall back to the device-derived name.
+        const nickname = peer?.deviceInfo.label?.trim();
         row = {
           key,
           index,
-          name: peer
-            ? `${deviceName(peer.deviceInfo.userAgent)} ${index + 1}`
-            : `Stream ${index + 1}`,
+          peerId: peer?.peerId ?? null,
+          name:
+            nickname ||
+            (peer
+              ? `${deviceName(peer.deviceInfo.userAgent)} ${index + 1}`
+              : `Stream ${index + 1}`),
           color: TRACK_COLORS[index % TRACK_COLORS.length] as string,
-          peerInitials: (peerId ?? stream.streamId).slice(0, 2).toUpperCase(),
+          peerInitials:
+            initialsOf(nickname) ?? (peerId ?? stream.streamId).slice(0, 2).toUpperCase(),
+          // The chip keeps the device provenance even when a nickname rules
+          // the lane title ("Maria" · chip "iPhone").
           peerLabel: peer ? deviceName(peer.deviceInfo.userAgent) : null,
           streams: [],
           receiving: false,
@@ -567,12 +593,18 @@ function Desk({ sessionId }: { sessionId: string }) {
   }
 
   function exportAll() {
+    // Exports carry the lane name (nickname when set) for human filenames.
+    const laneOf = new Map<string, string>();
+    for (const row of rows) {
+      for (const s of row.streams) laneOf.set(s.streamId, row.name);
+    }
     for (const desk of state.deskStatus) {
       const server = serverStatus.get(desk.streamId);
       if (desk.complete && server?.complete && desk.digest === server.digest) {
         const a = document.createElement("a");
+        const lane = laneOf.get(desk.streamId);
         a.href = `/api/streams/${desk.streamId}/flac`;
-        a.download = `${desk.streamId}.flac`;
+        a.download = `${lane ? `${fileSafe(lane)}-` : ""}${desk.streamId.slice(0, 8)}.flac`;
         a.click();
       }
     }
@@ -654,9 +686,9 @@ function Desk({ sessionId }: { sessionId: string }) {
             people={[
               { initials: "DK", color: "#c8c9cb", title: "You (Desk)" },
               ...recorders.slice(0, 3).map((p, i) => ({
-                initials: p.peerId.slice(0, 2).toUpperCase(),
+                initials: initialsOf(p.deviceInfo.label) ?? p.peerId.slice(0, 2).toUpperCase(),
                 color: TRACK_COLORS[i % TRACK_COLORS.length] as string,
-                title: deviceName(p.deviceInfo.userAgent),
+                title: p.deviceInfo.label?.trim() || deviceName(p.deviceInfo.userAgent),
               })),
             ]}
             onAdd={() => setTab("performers")}
@@ -783,6 +815,12 @@ function Desk({ sessionId }: { sessionId: string }) {
                 strip={playerSnap.channels.find((c) => c.key === row.key)}
                 armed={recording ? row.armed : !state.disarmedPeers.includes(row.key)}
                 onToggleArm={() => getDeskSession(sessionId).toggleArm(row.key)}
+                {...(row.peerId
+                  ? {
+                      onRename: (label: string) =>
+                        getDeskSession(sessionId).renamePeer(row.peerId as string, label),
+                    }
+                  : {})}
               />
             ))}
 
@@ -938,6 +976,7 @@ function TimelineRow({
   strip,
   armed,
   onToggleArm,
+  onRename,
 }: {
   row: TrackRow;
   clips: ClipModel[];
@@ -947,6 +986,7 @@ function TimelineRow({
   strip: ChannelStrip | undefined;
   armed: boolean;
   onToggleArm: () => void;
+  onRename?: (label: string) => void;
 }) {
   return (
     <div className="flex border-b border-[#0e0f10]" style={{ height: TRACK_ROW_H }}>
@@ -957,10 +997,8 @@ function TimelineRow({
       >
         <div className="w-1 flex-none" style={{ background: row.color }} />
         <div className="flex min-w-0 flex-1 flex-col justify-between px-2 py-[7px]">
-          <div className="flex min-w-0 items-center gap-1.5">
-            <span className="truncate text-[11.5px] font-semibold text-text-strong">
-              {row.name}
-            </span>
+          <div className="group/lane flex min-w-0 items-center gap-1.5">
+            <LaneName name={row.name} {...(onRename ? { onRename } : {})} />
             <Badge className="flex-none">audio</Badge>
           </div>
           <div className="flex items-center gap-[5px]">
@@ -1018,6 +1056,73 @@ function TimelineRow({
   );
 }
 
+/** Lane title with inline rename: double-click the name, or the pencil
+ * that appears on header hover. Renames go through peer-update (A13) —
+ * the server persists and fans out; the title updates on the echo. Only
+ * lanes that map to a known peer get the affordance. */
+function LaneName({ name, onRename }: { name: string; onRename?: (label: string) => void }) {
+  const [draft, setDraft] = useState<string | null>(null);
+  const cancelled = useRef(false);
+
+  if (draft !== null && onRename) {
+    const commit = (value: string) => {
+      setDraft(null);
+      const next = value.trim();
+      if (next !== name) onRename(next);
+    };
+    return (
+      <input
+        // biome-ignore lint/a11y/noAutofocus: user explicitly opened the editor
+        autoFocus
+        value={draft}
+        maxLength={48}
+        aria-label="Rename lane"
+        onChange={(e) => setDraft(e.target.value)}
+        onFocus={(e) => e.target.select()}
+        onBlur={(e) => {
+          if (cancelled.current) {
+            cancelled.current = false;
+            setDraft(null);
+          } else {
+            commit(e.target.value);
+          }
+        }}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") e.currentTarget.blur();
+          if (e.key === "Escape") {
+            cancelled.current = true;
+            e.currentTarget.blur();
+          }
+        }}
+        className="w-full min-w-0 rounded-[3px] border border-accent bg-bg px-1 py-px text-[11.5px] font-semibold text-text-hi outline-none"
+      />
+    );
+  }
+  if (!onRename) {
+    return <span className="truncate text-[11.5px] font-semibold text-text-strong">{name}</span>;
+  }
+  return (
+    <>
+      <button
+        type="button"
+        onDoubleClick={() => setDraft(name)}
+        title="Double-click to rename"
+        className="min-w-0 cursor-text truncate text-left text-[11.5px] font-semibold text-text-strong"
+      >
+        {name}
+      </button>
+      <button
+        type="button"
+        aria-label={`Rename ${name}`}
+        onClick={() => setDraft(name)}
+        className="hidden flex-none font-mono text-[10px] leading-none text-text-faint group-hover/lane:inline hover:text-accent"
+      >
+        ✎
+      </button>
+    </>
+  );
+}
+
 // ---- right rail panels --------------------------------------------------------
 
 function PerformersPanel({
@@ -1030,7 +1135,7 @@ function PerformersPanel({
   levelForRow,
 }: {
   sessionId: string;
-  recorders: Array<{ peerId: string; deviceInfo: { userAgent: string } }>;
+  recorders: PeerInfo[];
   rows: TrackRow[];
   joinUrl: string;
   activeTakeId: string | null;
@@ -1061,16 +1166,18 @@ function PerformersPanel({
           >
             <div className="flex items-center gap-2">
               <Avatar
-                initials={peer.peerId.slice(0, 2).toUpperCase()}
+                initials={
+                  initialsOf(peer.deviceInfo.label) ?? peer.peerId.slice(0, 2).toUpperCase()
+                }
                 color={color}
                 dot={isRecording ? "var(--color-rec)" : "var(--color-ok)"}
               />
               <div className="min-w-0 flex-1">
                 <div className="truncate text-[11.5px] font-semibold text-text-strong">
-                  {deviceName(peer.deviceInfo.userAgent)}
+                  {peer.deviceInfo.label?.trim() || deviceName(peer.deviceInfo.userAgent)}
                 </div>
                 <div className="truncate font-mono text-[9.5px] text-text-dim">
-                  {peer.peerId.slice(0, 13)}
+                  {deviceName(peer.deviceInfo.userAgent)} · {peer.peerId.slice(0, 8)}
                 </div>
               </div>
               <StatusPill tone={isRecording ? "rec" : "ok"}>

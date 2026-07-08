@@ -3,9 +3,10 @@
 // status pill, live VU, mono readouts, inset displays. Capture flags
 // (EC/NS/AGC all OFF) are surfaced with pass/fail badges because iOS lies.
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useParams } from "react-router";
 import { randomId } from "../../audio/capture-controller";
+import { getNickname } from "../../net/device-identity";
 import {
   Badge,
   Button,
@@ -21,6 +22,7 @@ import {
 import {
   getCaptureController,
   joinSession,
+  renameSelf,
   useCaptureSnapshot,
   useRecorderSessionState,
 } from "./use-capture";
@@ -83,6 +85,9 @@ export function JoinRoute() {
           </span>
         </div>
       </header>
+
+      {/* Performer identity: the name the desk sees on this lane */}
+      <PerformerPanel deskLabel={sessionState?.label ?? null} />
 
       {/* Status hero */}
       <Panel className="p-4">
@@ -291,6 +296,83 @@ export function JoinRoute() {
         cross-origin isolated: {String(globalThis.crossOriginIsolated)}
       </p>
     </main>
+  );
+}
+
+/** Nickname display + edit (A13). Persisted on the phone, prefilled on
+ * return visits, sent on hello, live-renameable while connected. A desk
+ * rename lands here too (`deskLabel` mirrors the session's view of us). */
+function PerformerPanel({ deskLabel }: { deskLabel: string | null }) {
+  const [name, setName] = useState(() => getNickname() ?? "");
+  const [draft, setDraft] = useState<string | null>(null); // null = not editing
+  const editing = draft !== null;
+
+  // Adopt desk-initiated renames unless the user is mid-edit.
+  useEffect(() => {
+    if (deskLabel !== null && !editing) setName(deskLabel);
+  }, [deskLabel, editing]);
+
+  function commit() {
+    if (draft === null) return;
+    const trimmed = draft.trim();
+    renameSelf(trimmed);
+    setName(trimmed);
+    setDraft(null);
+  }
+
+  return (
+    <Panel className="p-4">
+      <div className="flex items-center justify-between">
+        <SectionLabel>Performer</SectionLabel>
+        {!editing && (
+          <button
+            type="button"
+            onClick={() => setDraft(name)}
+            className="font-mono text-[10px] font-semibold tracking-[0.5px] text-accent uppercase hover:brightness-110"
+          >
+            ✎ edit
+          </button>
+        )}
+      </div>
+      {editing ? (
+        <div className="mt-2.5 flex items-stretch gap-2">
+          <input
+            // biome-ignore lint/a11y/noAutofocus: user explicitly opened the editor
+            autoFocus
+            value={draft}
+            maxLength={48}
+            placeholder="Your name"
+            onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") commit();
+              if (e.key === "Escape") setDraft(null);
+            }}
+            className="min-w-0 flex-1 rounded-md border border-edge-inset bg-bg px-3 py-1.5 font-mono text-[14px] font-semibold text-text-hi outline-none focus:border-accent"
+          />
+          <Button variant="accent" className="px-3 py-1.5" onClick={commit}>
+            Save
+          </Button>
+        </div>
+      ) : (
+        <button type="button" onClick={() => setDraft(name)} className="mt-2.5 block w-full">
+          <InsetDisplay className="flex items-baseline justify-between px-3 py-1.5">
+            <span
+              className={`truncate font-mono text-[15px] font-semibold tracking-[0.5px] ${
+                name ? "text-text-hi" : "text-text-faint"
+              }`}
+            >
+              {name || "unnamed performer"}
+            </span>
+            <span className="ml-3 flex-none font-mono text-[9px] text-text-faint">
+              {name ? "tap to edit" : "tap to set"}
+            </span>
+          </InsetDisplay>
+        </button>
+      )}
+      <p className="mt-2 text-[10px] leading-relaxed text-text-faint">
+        Names this phone's track on the desk. Saved for next time.
+      </p>
+    </Panel>
   );
 }
 

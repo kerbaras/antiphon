@@ -37,6 +37,23 @@ export type HelloMessage = z.infer<typeof HelloMessage>;
 export const ByeMessage = z.object({ ...base, type: z.literal("bye") });
 export type ByeMessage = z.infer<typeof ByeMessage>;
 
+// ---- peer identity (A13) ---------------------------------------------------
+
+/**
+ * Live nickname change (proposed amendment A13). A recorder may rename
+ * ITSELF; the desk (session authority) may rename ANY peer. The server
+ * validates authority, updates its session state, persists, and fans the
+ * same message out to all peers. An empty (or whitespace-only) `label`
+ * clears the nickname back to the device-derived fallback.
+ */
+export const PeerUpdateMessage = z.object({
+  ...base,
+  type: z.literal("peer-update"),
+  peerId: PeerId,
+  label: z.string().max(256),
+});
+export type PeerUpdateMessage = z.infer<typeof PeerUpdateMessage>;
+
 // ---- WebRTC signaling relay (either direction; server addresses/stamps) ---
 
 export const IceOfferMessage = z.object({
@@ -202,6 +219,7 @@ export type ErrorMessage = z.infer<typeof ErrorMessage>;
 export const SignalingMessage = z.discriminatedUnion("type", [
   HelloMessage,
   ByeMessage,
+  PeerUpdateMessage,
   IceOfferMessage,
   IceAnswerMessage,
   IceCandidateMessage,

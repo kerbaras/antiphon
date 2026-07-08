@@ -53,6 +53,45 @@ export class Archive {
       .onConflictDoNothing();
   }
 
+  /** Peer row upsert, keyed by peerId (A12): an identity resume refreshes
+   * the same row instead of forking a new one. */
+  async upsertPeer(peer: {
+    peerId: string;
+    sessionId: string;
+    role: "desk" | "recorder";
+    userAgent: string;
+    label: string | null;
+    deviceId: string | null;
+    joinedAt: Date;
+  }): Promise<void> {
+    await this.db
+      .insert(schema.peers)
+      .values({
+        id: peer.peerId,
+        sessionId: peer.sessionId,
+        role: peer.role,
+        userAgent: peer.userAgent,
+        label: peer.label,
+        deviceId: peer.deviceId,
+        joinedAt: peer.joinedAt,
+      })
+      .onConflictDoUpdate({
+        target: schema.peers.id,
+        set: { userAgent: peer.userAgent, label: peer.label, deviceId: peer.deviceId },
+      });
+  }
+
+  /** Live rename (A13). */
+  async updatePeerLabel(peerId: string, label: string | null): Promise<void> {
+    await this.db.update(schema.peers).set({ label }).where(eq(schema.peers.id, peerId));
+  }
+
+  /** Known peers of a session — rebuilds the device→peer index on room boot
+   * so identity resume survives a server restart. */
+  async loadPeers(sessionId: string) {
+    return await this.db.select().from(schema.peers).where(eq(schema.peers.sessionId, sessionId));
+  }
+
   async stopTake(takeId: string): Promise<void> {
     await this.db
       .update(schema.takes)

@@ -21,7 +21,11 @@ export type PeerRole = z.infer<typeof PeerRole>;
 
 export const DeviceInfo = z.object({
   userAgent: z.string().max(512),
+  /** Human nickname shown on desk lanes/mixer/exports (A13 `peer-update`). */
   label: z.string().max(256).optional(),
+  /** Stable per-browser id (localStorage) enabling peer identity resume
+   * across reconnects (A12). Optional so pre-A12 peers stay valid. */
+  deviceId: z.uuid().optional(),
 });
 export type DeviceInfo = z.infer<typeof DeviceInfo>;
 

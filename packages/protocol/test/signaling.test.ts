@@ -19,7 +19,16 @@ describe("parseSignalingMessage", () => {
         deviceInfo: { userAgent: "test" },
         protocolVersions: [1],
       },
+      {
+        v: 1,
+        type: "hello",
+        role: "recorder",
+        deviceInfo: { userAgent: "test", label: "Alto — Maria", deviceId: SESSION },
+        protocolVersions: [1],
+      },
       { v: 1, type: "bye" },
+      { v: 1, type: "peer-update", peerId: PEER, label: "Alto — Maria" },
+      { v: 1, type: "peer-update", peerId: PEER, label: "" },
       { v: 1, type: "ice-offer", targetPeerId: PEER, sdp: "v=0..." },
       { v: 1, type: "ice-answer", targetPeerId: PEER, fromPeerId: PEER, sdp: "v=0..." },
       {
@@ -81,6 +90,26 @@ describe("parseSignalingMessage", () => {
   it("throws on malformed known messages", () => {
     expect(() =>
       parseSignalingMessage(JSON.stringify({ v: 1, type: "take-start", takeId: "not-a-uuid" })),
+    ).toThrow();
+  });
+
+  it("rejects a non-UUID deviceId (A12)", () => {
+    expect(() =>
+      parseSignalingMessage(
+        JSON.stringify({
+          v: 1,
+          type: "hello",
+          role: "recorder",
+          deviceInfo: { userAgent: "test", deviceId: "not-a-uuid" },
+          protocolVersions: [1],
+        }),
+      ),
+    ).toThrow();
+  });
+
+  it("rejects a peer-update without a label field (A13)", () => {
+    expect(() =>
+      parseSignalingMessage(JSON.stringify({ v: 1, type: "peer-update", peerId: PEER })),
     ).toThrow();
   });
 });

@@ -6,6 +6,7 @@
 import { SERVER_PEER_ID, type SignalingMessage } from "@antiphon/protocol";
 import type { CaptureController, SinkPort } from "../audio/capture-controller";
 import { uuidToBytes } from "../audio/capture-controller";
+import { getNickname, setNickname } from "./device-identity";
 import { offerChannel } from "./rtc";
 import { SignalingClient } from "./signaling-client";
 
@@ -30,6 +31,8 @@ interface SinkLink {
 export interface RecorderSessionState {
   signalingConnected: boolean;
   peerId: string | null;
+  /** Our nickname (persisted; the desk may rename us via peer-update). */
+  label: string | null;
   serverLink: "connected" | "connecting" | "down";
   deskLink: "connected" | "connecting" | "down" | "absent";
   activeTakeId: string | null;
@@ -55,7 +58,7 @@ export class RecorderSession {
 
   constructor(sessionId: string, controller: CaptureController) {
     this.controller = controller;
-    this.signaling = new SignalingClient("recorder", sessionId);
+    this.signaling = new SignalingClient("recorder", sessionId, getNickname());
   }
 
   start(): void {
@@ -90,6 +93,7 @@ export class RecorderSession {
     return {
       signalingConnected: this.signaling.state.connected,
       peerId: this.signaling.state.peerId,
+      label: this.signaling.label,
       serverLink: linkState(SINK_SERVER),
       deskLink: this.deskPeerId() ? linkState(SINK_DESK) : "absent",
       activeTakeId: this.activeTakeId,
@@ -97,6 +101,19 @@ export class RecorderSession {
       outageUntil: this.outageUntil,
       sittingOut: this.sittingOutTakeId !== null,
     };
+  }
+
+  /** Rename ourselves (A13): persist locally, carry on future hellos, and
+   * tell the room when connected. Empty clears back to the device name. */
+  rename(label: string): void {
+    const trimmed = label.trim();
+    setNickname(trimmed);
+    this.signaling.label = trimmed || null;
+    const me = this.signaling.state.peerId;
+    if (this.signaling.state.connected && me) {
+      this.signaling.send({ v: 1, type: "peer-update", peerId: me, label: trimmed });
+    }
+    this.publish();
   }
 
   /** Demo/testing hook: kill every transport for `ms`. Capture continues;
@@ -130,6 +147,13 @@ export class RecorderSession {
       }
       case "peer-status":
         this.ensureLinks();
+        break;
+      case "peer-update":
+        // The desk renamed us: adopt + persist so the name survives reloads.
+        if (msg.peerId === this.signaling.state.peerId) {
+          setNickname(msg.label);
+          this.signaling.label = msg.label.trim() || null;
+        }
         break;
       case "take-start":
         if (this.activeTakeId === msg.takeId) break;

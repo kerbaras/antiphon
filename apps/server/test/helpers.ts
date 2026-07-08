@@ -3,7 +3,12 @@
 // WASM RecorderEngine. Only the microphone is synthetic.
 
 import { init as initWasm, RecorderEngine } from "@antiphon/core-wasm";
-import { parseSignalingMessage, SERVER_PEER_ID, type SignalingMessage } from "@antiphon/protocol";
+import {
+  parseSignalingMessage,
+  SERVER_PEER_ID,
+  type SessionState,
+  type SignalingMessage,
+} from "@antiphon/protocol";
 import { serve } from "@hono/node-server";
 import nodeDataChannel from "node-datachannel";
 import { createServer } from "../src/index.ts";
@@ -56,20 +61,31 @@ function uuidToBytes(uuid: string): Uint8Array {
   return out;
 }
 
+/** Identity extras for `hello.deviceInfo` (A12/A13). */
+export interface FakeDeviceInfo {
+  deviceId?: string;
+  label?: string;
+}
+
 export class FakeRecorder {
   ws!: WebSocket;
   peerId: string | null = null;
+  session: SessionState | null = null;
+  wsClosed = false;
   engine: RecorderEngine | null = null;
+  readonly received: SignalingMessage[] = [];
   private pc: InstanceType<typeof PeerConnection> | null = null;
   private dc: nodeDataChannel.DataChannel | null = null;
   private takeStartListeners: Array<(takeId: string) => void> = [];
   readonly sentFrames: Uint8Array[] = [];
   private readonly baseUrl: string;
   private readonly sessionId: string;
+  private readonly deviceInfo: FakeDeviceInfo;
 
-  constructor(baseUrl: string, sessionId: string) {
+  constructor(baseUrl: string, sessionId: string, deviceInfo: FakeDeviceInfo = {}) {
     this.baseUrl = baseUrl;
     this.sessionId = sessionId;
+    this.deviceInfo = deviceInfo;
   }
 
   /** Connect signaling and complete hello/welcome. */
@@ -82,14 +98,36 @@ export class FakeRecorder {
       this.ws.addEventListener("open", () => resolve(), { once: true });
     });
     this.ws.addEventListener("message", (ev) => this.onSignal(String(ev.data)));
+    this.ws.addEventListener("close", () => {
+      this.wsClosed = true;
+    });
     this.send({
       v: 1,
       type: "hello",
       role: "recorder",
-      deviceInfo: { userAgent: "fake-recorder" },
+      deviceInfo: { userAgent: "fake-recorder", ...this.deviceInfo },
       protocolVersions: [1],
     });
     await this.waitFor(() => this.peerId !== null, "welcome");
+  }
+
+  /** A13 rename (self, unless the server lets us do more). */
+  rename(peerId: string, label: string): void {
+    this.send({ v: 1, type: "peer-update", peerId, label });
+  }
+
+  /** Next already-received (or future) message of the given type. */
+  async waitForMessage<T extends SignalingMessage["type"]>(
+    type: T,
+    timeoutMs = 10_000,
+  ): Promise<Extract<SignalingMessage, { type: T }>> {
+    const start = Date.now();
+    for (;;) {
+      const found = this.received.find((m) => m.type === type);
+      if (found) return found as Extract<SignalingMessage, { type: T }>;
+      if (Date.now() - start > timeoutMs) throw new Error(`timeout waiting for ${type}`);
+      await new Promise((r) => setTimeout(r, 25));
+    }
   }
 
   /** Open (or re-open) the DataChannel leg toward the server sink. */
@@ -231,9 +269,14 @@ export class FakeRecorder {
       return;
     }
     if (!msg) return;
+    this.received.push(msg);
     switch (msg.type) {
       case "welcome":
         this.peerId = msg.peerId;
+        this.session = msg.session;
+        break;
+      case "peer-status":
+        this.session = msg.session;
         break;
       case "ice-answer":
         this.pc?.setRemoteDescription(msg.sdp, "answer");
@@ -271,13 +314,16 @@ export class FakeRecorder {
 export class FakeDesk {
   ws!: WebSocket;
   peerId: string | null = null;
+  session: SessionState | null = null;
   readonly received: SignalingMessage[] = [];
   private readonly baseUrl: string;
   private readonly sessionId: string;
+  private readonly deviceInfo: FakeDeviceInfo;
 
-  constructor(baseUrl: string, sessionId: string) {
+  constructor(baseUrl: string, sessionId: string, deviceInfo: FakeDeviceInfo = {}) {
     this.baseUrl = baseUrl;
     this.sessionId = sessionId;
+    this.deviceInfo = deviceInfo;
   }
 
   async join(): Promise<void> {
@@ -291,14 +337,18 @@ export class FakeDesk {
       const msg = safeParse(String(ev.data));
       if (!msg) return;
       this.received.push(msg);
-      if (msg.type === "welcome") this.peerId = msg.peerId;
+      if (msg.type === "welcome") {
+        this.peerId = msg.peerId;
+        this.session = msg.session;
+      }
+      if (msg.type === "peer-status") this.session = msg.session;
     });
     this.ws.send(
       JSON.stringify({
         v: 1,
         type: "hello",
         role: "desk",
-        deviceInfo: { userAgent: "fake-desk" },
+        deviceInfo: { userAgent: "fake-desk", ...this.deviceInfo },
         protocolVersions: [1],
       }),
     );
@@ -307,6 +357,11 @@ export class FakeDesk {
       if (Date.now() - start > 5_000) throw new Error("desk welcome timeout");
       await new Promise((r) => setTimeout(r, 20));
     }
+  }
+
+  /** A13: the desk (session authority) renames any peer. */
+  renamePeer(peerId: string, label: string): void {
+    this.ws.send(JSON.stringify({ v: 1, type: "peer-update", peerId, label }));
   }
 
   takeStart(takeId: string): void {

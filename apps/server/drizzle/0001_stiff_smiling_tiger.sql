@@ -1,0 +1,1 @@
+ALTER TABLE "peers" ADD COLUMN "device_id" uuid;

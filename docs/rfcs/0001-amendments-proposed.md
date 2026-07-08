@@ -124,3 +124,51 @@ is rolling.
   `packages/core` (Cargo workspace member `antiphon-core`).
 - The layout table in the architecture doc's companion scaffolding doc
   should match (crates under `packages/`).
+
+## A12. `deviceId` in `hello.deviceInfo` — peer identity resume, extension of §5
+
+Without a stable device identity, every reconnect (page reload, radio
+blip, Safari tab discard) mints a fresh `peerId`: the desk forks a new
+lane and the peer's mixer mapping (gain/pan/mute/solo, arm state) is
+orphaned. Extension: `deviceInfo` MAY carry `deviceId`, a UUID the
+browser generates once and persists locally (localStorage key
+`antiphon:device-id`). Optional field, protocol version stays 1; peers
+without it behave exactly as before.
+
+Server semantics on a `hello` carrying `deviceId`:
+
+- If a peer of the SAME session and SAME role was previously seen with
+  this `deviceId`, the server MUST reuse that `peerId` in `welcome` —
+  the peer resumes its lane. The stored nickname survives: a hello with
+  a non-empty `label` wins (the device speaks for itself), otherwise the
+  previously known label is kept.
+- If the previous connection is still open (a zombie — the network lost
+  the old socket before the server did), the server MUST send it a
+  control-plane `error` (`code="superseded"`, `fatal=true`), close it,
+  and adopt the new socket. One socket per identity, newest wins.
+- The mapping is persisted with the peer row, so resume survives a
+  server restart the same way archive state does (§8 spirit).
+
+Boundary (A6 unchanged): identity resume is PEER-level only. A recorder
+that reloads mid-take still arms a fresh `stream_id` — the capture ring
+died with the page and the sample domain must not restart inside one
+stream. What `deviceId` buys is continuity of everything keyed by
+`peerId`: the desk lane, the nickname, and per-peer mixer/arm state.
+
+## A13. `peer-update` control message — addition to §5
+
+Human names for lanes. `{ v, type: "peer-update", peerId, label }`,
+peer→server, then server→all after validation. Authority rules:
+
+- A recorder MAY rename ITSELF (`peerId` = its own).
+- The desk (session authority, §3) MAY rename ANY peer.
+- Anything else is refused with `error code="not-authorized"`; unknown
+  `peerId` with `error code="unknown-peer"`. Refusals do not fan out.
+
+The server updates its session state, persists the label on the peer
+row, and fans out both the `peer-update` (explicit signal — a renamed
+recorder persists a desk-given name locally) and a `peer-status`
+snapshot (the existing convergence mechanism). An empty/whitespace
+`label` clears the nickname; displays fall back to a device-derived
+name. Initial labels ride `hello.deviceInfo.label`; `peer-update` is
+only the live-rename path.
