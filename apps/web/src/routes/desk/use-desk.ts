@@ -4,6 +4,18 @@
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { DeskSession, type DeskSessionState } from "../../net/desk-session";
 import {
+  addComment,
+  editCommentText,
+  loadComments,
+  type NewComment,
+  openCommentCount,
+  removeComment,
+  resolveComment,
+  saveComments,
+  type TakeComment,
+  unresolveComment,
+} from "./comments";
+import {
   addMarker,
   loadMarkers,
   type Marker,
@@ -33,6 +45,8 @@ export interface DeskUiMirror {
   waveformsCached: number;
   /** Song markers of the selected take (W2-B), timeline-sorted. */
   markers: Marker[];
+  /** Comments of the selected take (W2-F), timeline-sorted. */
+  comments: TakeComment[];
 }
 
 let uiMirror: DeskUiMirror | null = null;
@@ -277,6 +291,76 @@ export function useTakeMarkers(sessionId: string, takeId: string | null): TakeMa
   );
 
   return { markers, addAt, rename, remove };
+}
+
+// ---- take comments (W2-F) ------------------------------------------------------
+
+export interface TakeCommentsApi {
+  /** Timeline-sorted comments of the current take ([] when none selected). */
+  comments: TakeComment[];
+  /** Comments not yet marked done (the panel-tab badge count). */
+  openCount: number;
+  /** Add a comment; null when the trimmed text is empty. */
+  add(input: NewComment): TakeComment | null;
+  editText(id: string, text: string): void;
+  resolve(id: string): void;
+  unresolve(id: string): void;
+  remove(id: string): void;
+}
+
+/** The selected take's comments with write-through persistence
+ * (localStorage, interim until the W3-A Yjs project doc — see comments.ts).
+ * Mutation callbacks are identity-stable: safe in effect deps. */
+export function useTakeComments(sessionId: string, takeId: string | null): TakeCommentsApi {
+  const [comments, setComments] = useState<TakeComment[]>([]);
+  useEffect(() => {
+    setComments(takeId ? loadComments(sessionId, takeId) : []);
+  }, [sessionId, takeId]);
+
+  const ref = useRef({ sessionId, takeId, comments });
+  ref.current = { sessionId, takeId, comments };
+  const commit = useCallback((next: TakeComment[]) => {
+    const { sessionId: sid, takeId: tid } = ref.current;
+    if (!tid) return;
+    saveComments(sid, tid, next);
+    setComments(next);
+  }, []);
+
+  const add = useCallback(
+    (input: NewComment): TakeComment | null => {
+      if (!ref.current.takeId) return null;
+      const { comments: next, added } = addComment(ref.current.comments, input);
+      if (added) commit(next);
+      return added;
+    },
+    [commit],
+  );
+  const editText = useCallback(
+    (id: string, text: string) => commit(editCommentText(ref.current.comments, id, text)),
+    [commit],
+  );
+  const resolve = useCallback(
+    (id: string) => commit(resolveComment(ref.current.comments, id)),
+    [commit],
+  );
+  const unresolve = useCallback(
+    (id: string) => commit(unresolveComment(ref.current.comments, id)),
+    [commit],
+  );
+  const remove = useCallback(
+    (id: string) => commit(removeComment(ref.current.comments, id)),
+    [commit],
+  );
+
+  return {
+    comments,
+    openCount: openCommentCount(comments),
+    add,
+    editText,
+    resolve,
+    unresolve,
+    remove,
+  };
 }
 
 export interface ServerStreamStatus {
