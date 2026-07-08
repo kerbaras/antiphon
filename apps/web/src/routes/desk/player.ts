@@ -1,9 +1,10 @@
 // Take playback engine: decodes each stream's archived FLAC into an
 // AudioBuffer and plays them through per-track gain → analyser → master
-// gain → analyser → speakers. Alignment offsets from chirp correlation are
-// applied at schedule time — stored audio is never touched (RFC §13).
+// gain → analyser → speakers. Alignment offsets from chirp correlation and
+// per-stream drift ratios are applied at schedule time — stored audio is
+// never touched (RFC §13).
 
-import { find_chirp_offset, init as initWasm } from "@antiphon/core-wasm";
+import { DriftEstimator, find_chirp_offset, init as initWasm } from "@antiphon/core-wasm";
 import { DEFAULT_CHIRP_SPEC } from "@antiphon/protocol";
 
 const MIN_DB = -60;
@@ -11,11 +12,32 @@ const MAX_DB = 6;
 /** Correlate against at most this much of the stream head. */
 const ALIGN_WINDOW_SECONDS = 25;
 const ALIGN_MIN_CONFIDENCE = 2.5;
+/** Drift guard rails: below this confidence, or beyond this |ratio−1|,
+ * fall back to ratio 1 — a wrong ratio is worse than uncorrected drift,
+ * and real ADC crystals never miss by a full 1000 ppm. */
+const DRIFT_MIN_CONFIDENCE = 0.5;
+const DRIFT_MAX_PPM = 1_000;
 
 export interface AlignmentResult {
   lagSamples: number;
   confidence: number;
   applied: boolean;
+}
+
+/** Clock-drift fit vs the reference stream (ARCHITECTURE §4 layer 3).
+ * `ratio`/`initialOffsetSamples` are the values in force at schedule time:
+ * zeroed to the identity when `applied` is false; `ppm`/`confidence` keep
+ * the measurement for diagnostics either way. */
+export interface DriftResult {
+  /** target_clock/reference_clock, applied as playbackRate. */
+  ratio: number;
+  ppm: number;
+  initialOffsetSamples: number;
+  confidence: number;
+  windowsUsed: number;
+  applied: boolean;
+  /** True for the stream every other track was measured against. */
+  isReference: boolean;
 }
 
 export interface PlayerTrackSnapshot {
@@ -28,6 +50,7 @@ export interface PlayerTrackSnapshot {
   /** 0..1 instantaneous peak while playing. */
   level: number;
   alignment: AlignmentResult | null;
+  drift: DriftResult | null;
   /** True absolute peak waveform from the decoded audio (0..1 per bucket). */
   waveform: number[];
 }
@@ -71,6 +94,7 @@ interface Track {
   analyser: AnalyserNode;
   scratch: Float32Array<ArrayBuffer>;
   alignment: AlignmentResult | null;
+  drift: DriftResult | null;
   waveform: number[];
 }
 
@@ -107,6 +131,13 @@ export class TakePlayer {
   private masterScratch: Float32Array<ArrayBuffer> | null = null;
   private tracks = new Map<string, Track>();
   private readonly channels = new Map<string, ChannelStrip>();
+  /** Drift estimates survive take switches like waveforms do; keyed by
+   * stream, valid only for the (reference, head-trim) pair they were
+   * measured against. */
+  private readonly driftCache = new Map<
+    string,
+    { referenceId: string; refDelta: number; trackDelta: number; result: DriftResult }
+  >();
   private sources: AudioBufferSourceNode[] = [];
   /** Per-clip timeline delay (seconds ≥ 0 relative to the take's base):
    * the arrangement position of each clip, set by timeline edits. */
@@ -153,6 +184,7 @@ export class TakePlayer {
           soloed: strip.soloed,
           level: this.levels.get(t.streamId) ?? 0,
           alignment: t.alignment,
+          drift: t.drift,
           waveform: t.waveform,
         };
       }),
@@ -237,6 +269,7 @@ export class TakePlayer {
           analyser,
           scratch: new Float32Array(analyser.fftSize),
           alignment: previous?.alignment ?? null,
+          drift: previous?.drift ?? null,
           waveform: computeWaveform(buffer),
         });
       }
@@ -298,6 +331,8 @@ export class TakePlayer {
           track.alignment = { lagSamples: 0, confidence: 0, applied: false };
         }
       }
+      // Chirp offsets fix the take head; drift keeps it fixed for 45 min.
+      await this.estimateDrift();
       // Re-schedule if currently playing so offsets take effect audibly.
       if (this.playing) {
         const pos = this.position();
@@ -308,6 +343,123 @@ export class TakePlayer {
       this.aligning = false;
       this.notify();
     }
+  }
+
+  /** Per-stream clock-drift estimation (ARCHITECTURE §4 layer 3). The
+   * reference is the chirp alignment anchor — the track whose head-trim is
+   * zero, i.e. the sample domain every other track is already mapped onto.
+   * (A future desk room-reference mic slots in here; the dsp API is
+   * reference-agnostic.) Runs chunked off the audio thread like align():
+   * window pairs are sliced on demand, pushed to wasm, UI yielded between
+   * correlations. Results are cached per stream. */
+  private async estimateDrift(): Promise<void> {
+    const deltas = this.alignDeltas();
+    if (deltas.size < 2) return; // no anchor to drift against
+    const aligned = [...this.tracks.values()].filter((t) => deltas.has(t.streamId));
+    const reference = aligned.reduce((a, b) =>
+      (deltas.get(b.streamId) as number) < (deltas.get(a.streamId) as number) ? b : a,
+    );
+    reference.drift = {
+      ratio: 1,
+      ppm: 0,
+      initialOffsetSamples: 0,
+      confidence: 1,
+      windowsUsed: 0,
+      applied: false,
+      isReference: true,
+    };
+    const refDelta = deltas.get(reference.streamId) as number;
+    const refData = reference.buffer.getChannelData(0);
+    for (const track of aligned) {
+      if (track === reference) continue;
+      const trackDelta = deltas.get(track.streamId) as number;
+      const cached = this.driftCache.get(track.streamId);
+      if (
+        cached &&
+        cached.referenceId === reference.streamId &&
+        cached.refDelta === refDelta &&
+        cached.trackDelta === trackDelta
+      ) {
+        track.drift = cached.result;
+        continue;
+      }
+      const result = await this.estimateTrackDrift(track, refData, refDelta, trackDelta);
+      track.drift = result;
+      this.driftCache.set(track.streamId, {
+        referenceId: reference.streamId,
+        refDelta,
+        trackDelta,
+        result,
+      });
+    }
+  }
+
+  /** Drive the pull-based wasm estimator for one track, then apply the
+   * guard rails: an implausible or low-confidence fit degrades to ratio 1
+   * (measurement kept for the diagnostics readout) — drift correction must
+   * never make playback worse than no correction. */
+  private async estimateTrackDrift(
+    track: Track,
+    refData: Float32Array,
+    refDelta: number,
+    trackDelta: number,
+  ): Promise<DriftResult> {
+    const data = track.buffer.getChannelData(0);
+    const estimator = new DriftEstimator(
+      track.buffer.sampleRate,
+      refData.length - refDelta,
+      data.length - trackDelta,
+    );
+    try {
+      for (;;) {
+        const reqJson = estimator.next_request_json();
+        if (!reqJson) break;
+        const req = JSON.parse(reqJson) as {
+          targetStart: number;
+          targetLen: number;
+          refStart: number;
+          refLen: number;
+        };
+        estimator.push_window(
+          refData.subarray(refDelta + req.refStart, refDelta + req.refStart + req.refLen),
+          data.subarray(trackDelta + req.targetStart, trackDelta + req.targetStart + req.targetLen),
+        );
+        // Yield to the UI between (potentially ~10ms) correlations.
+        await new Promise((r) => setTimeout(r, 0));
+      }
+      const est = JSON.parse(estimator.estimate_json()) as {
+        ratio: number;
+        ppm: number;
+        initialOffsetSamples: number;
+        confidence: number;
+        windowsUsed: number;
+        windowsTotal: number;
+      };
+      const applied = est.confidence >= DRIFT_MIN_CONFIDENCE && Math.abs(est.ppm) <= DRIFT_MAX_PPM;
+      return {
+        ratio: applied ? est.ratio : 1,
+        ppm: est.ppm,
+        initialOffsetSamples: applied ? est.initialOffsetSamples : 0,
+        confidence: est.confidence,
+        windowsUsed: est.windowsUsed,
+        applied,
+        isReference: false,
+      };
+    } finally {
+      estimator.free();
+    }
+  }
+
+  /** Applied playback-rate factor: target_clock/reference_clock, 1 = off. */
+  private driftRatio(track: Track): number {
+    return track.drift?.applied ? track.drift.ratio : 1;
+  }
+
+  /** Seconds of buffer consumed before the track's room-time zero: chirp
+   * head-trim plus the drift fit's residual offset. */
+  private headSec(track: Track): number {
+    const driftSamples = track.drift?.applied ? track.drift.initialOffsetSamples : 0;
+    return (this.alignDelta(track) + driftSamples) / track.buffer.sampleRate;
   }
 
   /** Samples to trim from each track's head so all aligned tracks share the
@@ -349,6 +501,7 @@ export class TakePlayer {
       this.tracks.delete(streamId);
       this.levels.delete(streamId);
       this.clipDelays.delete(streamId);
+      this.driftCache.delete(streamId);
       removed = true;
     }
     if (!removed) return;
@@ -398,9 +551,10 @@ export class TakePlayer {
   duration(): number {
     let max = 0;
     for (const t of this.tracks.values()) {
+      // Buffer seconds shrink by the drift ratio on the room timeline.
       max = Math.max(
         max,
-        this.clipDelay(t.streamId) + t.buffer.duration - this.alignDelta(t) / t.buffer.sampleRate,
+        this.clipDelay(t.streamId) + (t.buffer.duration - this.headSec(t)) / this.driftRatio(t),
       );
     }
     return max;
@@ -425,19 +579,24 @@ export class TakePlayer {
     const ctx = this.ensureGraph();
     const when = ctx.currentTime + 0.06;
     for (const track of this.tracks.values()) {
-      const alignSec = this.alignDelta(track) / track.buffer.sampleRate;
-      // Timeline time t maps to buffer time (t - clipDelay + alignSec).
+      const ratio = this.driftRatio(track);
+      const headSec = this.headSec(track);
+      // Timeline time t maps to buffer time headSec + (t − clipDelay)·ratio:
+      // a fast target clock packed more samples into each room-second, so
+      // playbackRate = ratio consumes them at exactly one room-second per
+      // second (±200 ppm is far below audible pitch change).
       const rel = fromSec - this.clipDelay(track.streamId);
       const source = ctx.createBufferSource();
       source.buffer = track.buffer;
+      source.playbackRate.value = ratio;
       source.connect(track.gain);
       if (rel >= 0) {
-        const offset = rel + alignSec;
+        const offset = headSec + rel * ratio;
         if (offset >= track.buffer.duration) continue;
         source.start(when, offset);
       } else {
         // Clip begins later on the timeline: schedule its future start.
-        source.start(when - rel, alignSec);
+        source.start(when - rel, headSec);
       }
       this.sources.push(source);
     }

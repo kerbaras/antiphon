@@ -8,6 +8,7 @@ import wasmInit, { initSync } from "../pkg/antiphon.js";
 export {
   chunk_meta_json,
   constants_json,
+  DriftEstimator,
   decode_meter_frame,
   encode_have_summary,
   encode_meter_frame,

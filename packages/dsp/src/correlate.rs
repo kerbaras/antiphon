@@ -20,26 +20,15 @@ pub struct ChirpMatch {
     pub confidence: f32,
 }
 
-/// Cross-correlate `signal` against `reference`, returning the best lag.
-/// Returns `None` for degenerate inputs (empty, silent, or reference longer
-/// than signal).
-pub fn cross_correlate_peak(signal: &[f32], reference: &[f32]) -> Option<ChirpMatch> {
-    cross_correlate_peak_excluding(signal, reference, &[])
-}
-
-/// As `cross_correlate_peak`, but lags at `best ± offset` for each entry in
-/// `expected_echo_offsets` are excluded from the sidelobe scan — used when
-/// the reference is known to repeat in the signal (chirp `repeats` > 1), so
-/// the sibling sweep's equally-strong peak doesn't destroy confidence.
-pub fn cross_correlate_peak_excluding(
-    signal: &[f32],
-    reference: &[f32],
-    expected_echo_offsets: &[usize],
-) -> Option<ChirpMatch> {
+/// Raw linear cross-correlation for every valid lag:
+/// `out[lag] = Σᵢ signal[lag+i]·reference[i]`, lag ∈ `0..=signal.len()-reference.len()`.
+/// The shared engine behind chirp location and drift window re-correlation.
+/// Returns `None` for degenerate inputs (empty reference, or reference
+/// longer than signal).
+pub fn correlation_series(signal: &[f32], reference: &[f32]) -> Option<Vec<f32>> {
     if reference.is_empty() || signal.len() < reference.len() {
         return None;
     }
-    let corr_len = signal.len(); // valid lags: 0..=signal.len()-reference.len()
     let fft_len = (signal.len() + reference.len()).next_power_of_two();
 
     let mut planner = RealFftPlanner::<f32>::new();
@@ -65,7 +54,33 @@ pub fn cross_correlate_peak_excluding(
     let mut corr = vec![0.0f32; fft_len];
     ifft.process(&mut cross, &mut corr).ok()?;
 
-    let max_lag = corr_len - reference.len();
+    // ifft output is unnormalized: scale by 1/fft_len so entries are true
+    // dot products, then keep only the valid (non-wrapped) lags.
+    let scale = 1.0 / fft_len as f32;
+    corr.truncate(signal.len() - reference.len() + 1);
+    for v in &mut corr {
+        *v *= scale;
+    }
+    Some(corr)
+}
+
+/// Cross-correlate `signal` against `reference`, returning the best lag.
+/// Returns `None` for degenerate inputs (empty, silent, or reference longer
+/// than signal).
+pub fn cross_correlate_peak(signal: &[f32], reference: &[f32]) -> Option<ChirpMatch> {
+    cross_correlate_peak_excluding(signal, reference, &[])
+}
+
+/// As `cross_correlate_peak`, but lags at `best ± offset` for each entry in
+/// `expected_echo_offsets` are excluded from the sidelobe scan — used when
+/// the reference is known to repeat in the signal (chirp `repeats` > 1), so
+/// the sibling sweep's equally-strong peak doesn't destroy confidence.
+pub fn cross_correlate_peak_excluding(
+    signal: &[f32],
+    reference: &[f32],
+    expected_echo_offsets: &[usize],
+) -> Option<ChirpMatch> {
+    let corr = correlation_series(signal, reference)?;
     let ref_energy: f32 = reference.iter().map(|v| v * v).sum();
     if ref_energy <= f32::EPSILON {
         return None;
@@ -74,7 +89,7 @@ pub fn cross_correlate_peak_excluding(
     // Find the global peak among valid lags.
     let mut best_lag = 0usize;
     let mut best_val = f32::MIN;
-    for (lag, &value) in corr.iter().enumerate().take(max_lag + 1) {
+    for (lag, &value) in corr.iter().enumerate() {
         let v = value.abs();
         if v > best_val {
             best_val = v;
@@ -90,9 +105,8 @@ pub fn cross_correlate_peak_excluding(
     let window = &signal[best_lag..(best_lag + reference.len()).min(signal.len())];
     let sig_energy: f32 = window.iter().map(|v| v * v).sum();
     let denom = (ref_energy * sig_energy).sqrt();
-    // ifft output is unnormalized: divide by fft_len.
     let peak = if denom > f32::EPSILON {
-        (best_val / fft_len as f32) / denom * fft_len as f32
+        best_val / denom
     } else {
         0.0
     };
@@ -110,7 +124,7 @@ pub fn cross_correlate_peak_excluding(
         })
     };
     let mut sidelobe = 0.0f32;
-    for (lag, &value) in corr.iter().enumerate().take(max_lag + 1) {
+    for (lag, &value) in corr.iter().enumerate() {
         if !excluded(lag) {
             sidelobe = sidelobe.max(value.abs());
         }

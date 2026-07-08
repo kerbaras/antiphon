@@ -41,7 +41,7 @@ import {
   VUVertical,
   ZoomControl,
 } from "./daw";
-import type { ChannelStrip, PlayerSnapshot } from "./player";
+import type { ChannelStrip, DriftResult, PlayerSnapshot } from "./player";
 import {
   ensureWaveform,
   getCachedWaveform,
@@ -318,6 +318,13 @@ function Desk({ sessionId }: { sessionId: string }) {
   const alignmentByStream = useMemo(() => {
     const map = new Map<string, boolean>();
     for (const t of playerSnap.tracks) map.set(t.streamId, t.alignment?.applied ?? false);
+    return map;
+  }, [playerSnap.tracks]);
+  const driftByStream = useMemo(() => {
+    const map = new Map<string, DriftResult>();
+    for (const t of playerSnap.tracks) {
+      if (t.drift) map.set(t.streamId, t.drift);
+    }
     return map;
   }, [playerSnap.tracks]);
 
@@ -888,7 +895,11 @@ function Desk({ sessionId }: { sessionId: string }) {
               levelForRow={levelFor}
             />
           ) : (
-            <SinksPanel deskStatus={state.deskStatus} serverStatus={serverStatus} />
+            <SinksPanel
+              deskStatus={state.deskStatus}
+              serverStatus={serverStatus}
+              driftByStream={driftByStream}
+            />
           )}
         </aside>
       </div>
@@ -1219,12 +1230,28 @@ function PerformersPanel({
   );
 }
 
+/** Drift readout: clock-rate error vs the reference stream in ppm, with
+ * the fit confidence — "off" marks a measurement the guard rails bypassed
+ * (played uncorrected rather than wrongly corrected). */
+function driftReadout(drift: DriftResult) {
+  if (drift.isReference) return "reference";
+  const ppm = `${drift.ppm >= 0 ? "+" : ""}${drift.ppm.toFixed(1)} ppm`;
+  const conf = `c ${drift.confidence.toFixed(2)}`;
+  return (
+    <span className={drift.applied ? undefined : "text-warn"}>
+      {drift.applied ? `${ppm} · ${conf}` : `${ppm} · ${conf} · off`}
+    </span>
+  );
+}
+
 function SinksPanel({
   deskStatus,
   serverStatus,
+  driftByStream,
 }: {
   deskStatus: DeskStreamStatus[];
   serverStatus: Map<string, ServerStreamStatus>;
+  driftByStream: Map<string, DriftResult>;
 }) {
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto p-2.5">
@@ -1233,6 +1260,7 @@ function SinksPanel({
       )}
       {deskStatus.map((desk) => {
         const server = serverStatus.get(desk.streamId);
+        const drift = driftByStream.get(desk.streamId);
         const converged =
           desk.complete && (server?.complete ?? false) && desk.digest === server?.digest;
         return (
@@ -1269,6 +1297,7 @@ function SinksPanel({
               }
             />
             {desk.finalSeq !== null && <MonoReadout label="final seq" value={desk.finalSeq} />}
+            {drift && <MonoReadout label="drift" value={driftReadout(drift)} />}
             {converged && (
               <a
                 href={`/api/streams/${desk.streamId}/flac`}

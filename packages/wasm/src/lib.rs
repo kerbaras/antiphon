@@ -6,10 +6,12 @@
 //! crates. Timestamps cross the boundary as f64 microseconds (exact far
 //! beyond any session length); UUIDs as 16-byte arrays; frames as bytes.
 
+mod drift;
 mod json;
 mod recorder;
 mod sink;
 
+pub use drift::DriftEstimator;
 pub use recorder::RecorderEngine;
 pub use sink::{IngestResult, SinkEngine, TimeSyncSession};
 
