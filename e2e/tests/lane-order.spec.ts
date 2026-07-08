@@ -90,8 +90,17 @@ test.describe("stable lane order (F8)", () => {
 
     // --- take 1: still [Alice, Bob] ----------------------------------------
     const take1 = await startTake(desk);
+    // While a take rolls the arm toggle is honestly DISABLED (QA low):
+    // arm changes only apply between takes, so a mid-take click was a
+    // silent no-op — the control now says so (the hover title spells out
+    // the between-takes semantics either way).
+    const armAlice = desk.getByRole("button", { name: "Arm Alice" });
+    await expect(armAlice).toBeDisabled();
+    await expect(armAlice).toHaveAttribute("title", "arm changes apply between takes");
     await desk.waitForTimeout(2_500);
     await stopTake(desk);
+    // …and re-enables the moment the take stops.
+    await expect(armAlice).toBeEnabled();
     await expectTakeConverged(desk, sessionId, take1, 2);
     expect((await laneOrder(desk)).map((l) => l.name)).toEqual(["Alice", "Bob"]);
 

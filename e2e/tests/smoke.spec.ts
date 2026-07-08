@@ -28,12 +28,21 @@ test("favicon is served and no route 404s a resource", async ({ page, browserNam
   const ico = await page.request.get("/favicon.ico");
   expect(ico.status()).toBe(200);
 
+  // One deliberate exemption: this sweep visits fresh uuids nobody ever
+  // opened, and GET /api/sessions/:id answers an honest 404 for those
+  // (nano-batch server fix — the F19 existence probe and the desk's cold
+  // attribution fetch read that status by design). Semantics, not a
+  // missing resource; everything else must still be 404-free.
+  const honestExistence404 = /\/api\/sessions\/[0-9a-f-]{36}$/;
   const notFound: string[] = [];
   page.on("response", (response) => {
-    if (response.status() === 404) notFound.push(response.url());
+    if (response.status() === 404 && !honestExistence404.test(response.url())) {
+      notFound.push(response.url());
+    }
   });
   page.on("console", (message) => {
     if (message.type() === "error" && message.text().includes("404")) {
+      if (honestExistence404.test(message.location().url ?? "")) return;
       notFound.push(message.text());
     }
   });

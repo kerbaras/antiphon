@@ -2,11 +2,10 @@
 //
 // F19 — joining a made-up session id used to render the normal join page and
 // happily enable the mic into a void. The join page now probes
-// GET /api/sessions/:id on load (the endpoint answers 200 with an empty
-// summary for unknown ids — no 404, flagged for the server wave; existence
-// is therefore derived from the body: any takes, or any peer with role
-// "desk") and renders an honest, non-gating warning that clears by gentle
-// re-probe once a desk opens the link.
+// GET /api/sessions/:id on load (the endpoint 404s for unknown session rows
+// since the nano-batch server fix, so existence reads straight off the HTTP
+// status) and renders an honest, non-gating warning that clears by gentle
+// re-probe once a desk opens the link (the desk's WS hello creates the row).
 //
 // LOWs — nickname 48-char cap enforceable at commit (paste/programmatic
 // included), avatar initials must not split surrogate pairs (QA #14), and

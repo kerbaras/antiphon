@@ -1,33 +1,32 @@
 // F19: honest session-existence feedback for the join page and the
 // landing's join-by-code.
 //
-// Server facts (verified live, 2026-07-08):
-// - GET /api/sessions/:id answers 200 with an EMPTY summary for any id —
-//   it never 404s (flagged for the server-owning agent: an honest 404 for
-//   an unknown session row would make this probe exact). Existence is
-//   therefore derived from the body: a session is real once a desk has
-//   ever opened it (invite links/QRs come from a desk) or it holds takes.
-//   A lone recorder who joined a void earlier does NOT make it real.
+// Server facts:
+// - GET /api/sessions/:id 404s when no session row exists (nano-batch —
+//   the exact signal this probe's first design note asked for) and 200s
+//   once the row does (a desk opening the invite, POST /api/sessions, or
+//   ingest). The verdict is therefore STATUS-based; the body no longer
+//   matters here. Accepted bound: a recorder joining a void creates the
+//   row too, so its own session reads "present" from then on — a session
+//   with a live recorder in it is real enough, and the typo-warning
+//   window that matters is before anyone joins.
 // - Rate limiting sits on the WS upgrade paths (/…/ws, /…/collab) only,
 //   NOT on this GET (35 rapid probes → 35× 200), so a gentle poll is safe.
 //
 // Probe philosophy: capture NEVER gates on the network. Fetch failures and
-// malformed bodies read as "unknown" — we warn only on a definite miss,
-// and the verdict can only ever upgrade (absent → present), never flap.
+// non-200/404 statuses (5xx, proxy noise) read as "unknown" — we warn only
+// on a definite miss, and the verdict can only ever upgrade
+// (absent → present), never flap.
 
 import { useEffect, useRef, useState } from "react";
 
 export type SessionExistence = "unknown" | "absent" | "present";
 
-/** Decode a session-summary body into an existence verdict. */
-export function interpretSummary(body: unknown): SessionExistence {
-  if (typeof body !== "object" || body === null) return "unknown";
-  const { takes, peers } = body as { takes?: unknown; peers?: unknown };
-  if (!Array.isArray(takes) || !Array.isArray(peers)) return "unknown";
-  const hasDesk = peers.some(
-    (p) => typeof p === "object" && p !== null && (p as { role?: unknown }).role === "desk",
-  );
-  return takes.length > 0 || hasDesk ? "present" : "absent";
+/** Decode a probe's HTTP status into an existence verdict. */
+export function interpretProbeStatus(status: number): SessionExistence {
+  if (status === 200) return "present";
+  if (status === 404) return "absent";
+  return "unknown";
 }
 
 /** Gentle re-probe: 5s while the desk may be "opening right now", backing
@@ -67,7 +66,7 @@ export function useSessionExistence(sessionId: string | null, confirmed = false)
       let next: SessionExistence = "unknown";
       try {
         const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}`);
-        if (res.ok) next = interpretSummary(await res.json());
+        next = interpretProbeStatus(res.status);
       } catch {
         // Offline / server unreachable: stay "unknown" — never a false warning.
       }

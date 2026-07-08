@@ -619,9 +619,10 @@ export function useSessionAttribution(
       } catch {
         // fall through: server away — same handling as a non-OK response
       }
-      // Server away/erroring: mark ready (loads proceed on the live
-      // fallback) and let the interval retry while unattributed takes
-      // remain on screen.
+      // Server away/erroring — including the honest 404 a brand-new
+      // session answers until this desk's own WS hello upserts the row:
+      // mark ready (loads proceed on the live fallback) and let the
+      // interval retry while unattributed takes remain on screen.
       if (!cancelled) setAttribution((prev) => (prev.ready ? prev : { ...prev, ready: true }));
     };
     void fetchAttribution();
@@ -849,15 +850,23 @@ export function useServerStatus(
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: takeIdsKey re-arms polling when the take set changes
   useEffect(() => {
-    let cancelled = false;
+    // One AbortController per effect generation (QA LOW, G5 root cause):
+    // a tick in flight holds this generation's sessionId in its closure,
+    // so clearing the interval alone still let an already-running loop
+    // fire one stray cross-session GET after a session switch. Aborting
+    // on cleanup cancels the in-flight fetch AND gates every later await
+    // resumption in the loop.
+    const controller = new AbortController();
+    const { signal } = controller;
     const tick = async () => {
       const pending = takeIdsRef.current.filter((takeId) => !settledRef.current.has(takeId));
       if (pending.length === 0) return;
       const updates = new Map<string, ServerStreamStatus>();
       const settledNow: string[] = [];
       for (const takeId of pending) {
+        if (signal.aborted) return; // stale generation: no further requests
         try {
-          const res = await fetch(`/api/sessions/${sessionId}/takes/${takeId}`);
+          const res = await fetch(`/api/sessions/${sessionId}/takes/${takeId}`, { signal });
           if (!res.ok) continue; // not archived yet (or gone): retry next tick
           const body = (await res.json()) as { streams: ServerStreamStatus[] };
           for (const s of body.streams) updates.set(s.streamId, s);
@@ -865,12 +874,13 @@ export function useServerStatus(
             settledNow.push(takeId);
           }
         } catch {
-          // Silent by design: this poll fires every 2 s — an unreachable
-          // server would spam; the UI already shows archive/sync state.
+          // Silent by design (aborts land here too): this poll fires every
+          // 2 s — an unreachable server would spam; the UI already shows
+          // archive/sync state.
           return; // keep the last view
         }
       }
-      if (cancelled) return;
+      if (signal.aborted) return;
       for (const takeId of settledNow) settledRef.current.add(takeId);
       if (updates.size > 0) {
         setStatuses((prev) => {
@@ -883,7 +893,7 @@ export function useServerStatus(
     void tick();
     const timer = window.setInterval(tick, 2_000);
     return () => {
-      cancelled = true;
+      controller.abort();
       window.clearInterval(timer);
     };
   }, [sessionId, takeIdsKey]);

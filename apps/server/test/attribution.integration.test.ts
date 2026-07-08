@@ -157,4 +157,41 @@ suite("session attribution (F1)", () => {
     // The desk peer is listed too (role attribution for lane filtering).
     expect(body.peers.some((p) => p.role === "desk")).toBe(true);
   }, 90_000);
+
+  // Nano-batch (tightens the F19 probe): the summary used to answer 200
+  // with empty arrays for ANY uuid — existence had to be inferred from the
+  // body. An id without a session row is now an honest 404; a session that
+  // EXISTS but holds nothing yet stays a 200 with empty arrays.
+  it("404s an unknown session id; a created-but-empty session answers 200", async () => {
+    // Unknown uuid: no session row anywhere → 404, same error shape as the
+    // takes route.
+    const ghost = await fetch(`${server.baseUrl}/api/sessions/${crypto.randomUUID()}`);
+    expect(ghost.status).toBe(404);
+    expect(await ghost.json()).toEqual({ error: "unknown session" });
+
+    // Malformed id: definitionally no row (the column is a uuid) → still an
+    // honest 404, never a 500 from the uuid cast.
+    expect((await fetch(`${server.baseUrl}/api/sessions/not-a-uuid`)).status).toBe(404);
+
+    // Created (row exists) but empty: 200 with empty arrays.
+    const { sessionId } = (await (
+      await fetch(`${server.baseUrl}/api/sessions`, { method: "POST" })
+    ).json()) as { sessionId: string };
+    const created = await fetch(`${server.baseUrl}/api/sessions/${sessionId}`);
+    expect(created.status).toBe(200);
+    expect(await created.json()).toEqual({ sessionId, takes: [], peers: [] });
+
+    // A desk opening a fresh invite link makes it real the same way (the
+    // WS hello upserts the row): 200, no takes, the desk on the roster.
+    const freshId = crypto.randomUUID();
+    expect((await fetch(`${server.baseUrl}/api/sessions/${freshId}`)).status).toBe(404);
+    const desk = new FakeDesk(server.baseUrl, freshId);
+    await desk.join();
+    const joined = await fetch(`${server.baseUrl}/api/sessions/${freshId}`);
+    expect(joined.status).toBe(200);
+    const joinedBody = (await joined.json()) as SessionSummaryBody;
+    expect(joinedBody.takes).toEqual([]);
+    expect(joinedBody.peers.map((p) => p.role)).toEqual(["desk"]);
+    desk.close();
+  }, 30_000);
 });

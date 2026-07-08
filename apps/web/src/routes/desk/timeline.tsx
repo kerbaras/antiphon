@@ -216,6 +216,7 @@ export function TimelineSection({
             laneWidth={laneWidth}
             level={levelFor(row)}
             strip={channels.find((c) => c.key === row.key)}
+            recording={recording}
             armed={recording ? row.armed : !disarmedPeers.includes(row.key)}
             onToggleArm={() => getDeskSession(sessionId).toggleArm(row.key)}
             {...(row.peerId
@@ -381,6 +382,7 @@ function TimelineRow({
   laneWidth,
   level,
   strip,
+  recording,
   armed,
   onToggleArm,
   onRename,
@@ -391,6 +393,9 @@ function TimelineRow({
   laneWidth: number;
   level: number;
   strip: ChannelStrip | undefined;
+  /** A take is rolling: arm changes can't act until it stops, so the
+   * arm toggle is honestly disabled instead of silently deferring. */
+  recording: boolean;
   armed: boolean;
   onToggleArm: () => void;
   onRename?: (label: string) => void;
@@ -427,6 +432,7 @@ function TimelineRow({
               label="●"
               ariaLabel={`Arm ${row.name}`}
               armed={armed}
+              disabled={recording}
               onClick={onToggleArm}
             />
             {row.peerLabel && (

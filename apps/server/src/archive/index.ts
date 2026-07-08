@@ -343,8 +343,17 @@ export class Archive {
    * order each carrying its streams' stream→peer mapping, plus every peer
    * ever seen (label/deviceId/role) — everything a cold desk needs to
    * rebuild lanes, take ordering, and its status-polling set in ONE
-   * round-trip. `takes[].id` stays for existing consumers. */
+   * round-trip. `takes[].id` stays for existing consumers.
+   *
+   * An id with no session row resolves to null (→ an honest 404), never
+   * to a fabricated empty summary — the F19 existence probe reads the
+   * status, not the body. */
   async sessionSummary(sessionId: string) {
+    const [session] = await this.db
+      .select({ id: schema.sessions.id })
+      .from(schema.sessions)
+      .where(eq(schema.sessions.id, sessionId));
+    if (!session) return null;
     const takes = await this.db
       .select()
       .from(schema.takes)

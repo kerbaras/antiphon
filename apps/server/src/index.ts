@@ -114,8 +114,17 @@ export async function createServer(config: ServerConfig = loadConfig()) {
     return c.json({ sessionId }, 201);
   });
 
+  // Unknown sessions are an honest 404 — the F19 existence probe reads the
+  // status, not the body (a session that exists but holds nothing yet stays
+  // a 200 with empty arrays). The uuid-shape guard keeps a malformed id —
+  // this route is probed with raw URL params, typos included — an honest
+  // 404 too, instead of a 500 out of the Postgres uuid cast.
+  const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
   app.get("/api/sessions/:sessionId", async (c) => {
-    return c.json(await archive.sessionSummary(c.req.param("sessionId")));
+    const sessionId = c.req.param("sessionId");
+    const summary = UUID_SHAPE.test(sessionId) ? await archive.sessionSummary(sessionId) : null;
+    if (summary === null) return c.json({ error: "unknown session" }, 404);
+    return c.json(summary);
   });
 
   /** Hard deletion (RFC §12 MUST). A9 ordering: disconnect live peers so

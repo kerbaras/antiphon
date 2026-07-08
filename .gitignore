@@ -27,3 +27,6 @@ data/
 .DS_Store
 *.log
 .idea/
+
+# QA browser artifacts
+.playwright-mcp/

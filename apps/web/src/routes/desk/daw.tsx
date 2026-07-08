@@ -442,16 +442,19 @@ export function ClipCard({ clip }: { clip: ClipModel }) {
           </span>
         )}
         {/* Too narrow for words: a status dot in the badge's tones (rec
-            pulses, syncing AND the terminal incomplete warn amber — the
-            dot vocabulary can't split them, the title's words do; settled
-            states read white like their badges). */}
+            pulses; settled states read white like their badges). Both
+            warn-amber states stay distinguishable at 4px by FORM, echoing
+            their badges: syncing is transient and HOLLOW (a ring, like its
+            translucent badge), incomplete is a terminal verdict and SOLID
+            (like its filled badge). The title carries the words either way. */}
         {!showBadge && clip.badge !== null && (
           <span
             data-status-dot={clip.badge}
             className={cx(
               "ml-auto size-[4px] flex-none rounded-full",
               clip.badge === "rec" && "bg-rec animate-recpulse",
-              (clip.badge === "syncing" || clip.badge === "incomplete") && "bg-warn",
+              clip.badge === "syncing" && "border border-warn",
+              clip.badge === "incomplete" && "bg-warn",
               (clip.badge === "converged" || clip.badge === "aligned") && "bg-white/70",
             )}
           />
@@ -540,13 +543,16 @@ export function laneGridStyle(pxPerSec: number): React.CSSProperties {
  * carries aria-pressed too, plus the sticky-disarm honesty title: arm
  * changes never interrupt a rolling take — they apply between takes
  * (deliberate product semantics; the QA "mid-take disarm silently inert"
- * low is answered by SAYING so, not by changing the behavior). */
+ * low is answered by SAYING so, not by changing the behavior — and while
+ * a take rolls the arm button is honestly `disabled`, since a click could
+ * never act before the next take anyway). */
 export function TrackMiniButton({
   label,
   armed,
   inert,
   active,
   tone,
+  disabled,
   onClick,
   ariaLabel,
 }: {
@@ -556,6 +562,8 @@ export function TrackMiniButton({
   /** Engaged state for clickable buttons (mute gold, solo teal). */
   active?: boolean;
   tone?: "gold" | "teal";
+  /** Honestly inoperable right now (e.g. arm while a take rolls). */
+  disabled?: boolean;
   onClick?: () => void;
   ariaLabel?: string;
 }) {
@@ -564,7 +572,7 @@ export function TrackMiniButton({
     "grid size-[18px] place-items-center rounded border border-edge-btn text-[9px] font-bold",
     armed ? "bg-rec text-white" : active ? activeClass : "bg-[#232425] text-text-dim",
     inert && "cursor-not-allowed",
-    onClick && "hover:brightness-125",
+    onClick && "enabled:hover:brightness-125 disabled:cursor-not-allowed disabled:opacity-40",
   );
   if (onClick) {
     return (
@@ -573,6 +581,7 @@ export function TrackMiniButton({
         aria-label={ariaLabel ?? label}
         aria-pressed={armed ?? active}
         {...(armed !== undefined ? { title: "arm changes apply between takes" } : {})}
+        disabled={disabled ?? false}
         onClick={onClick}
         className={className}
       >
