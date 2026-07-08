@@ -125,6 +125,14 @@
   ::selection {
     background: color-mix(in srgb, var(--color-accent) 40%, transparent);
   }
+
+  /* Keyboard focus: a visible accent ring on every interactive element.
+     :focus-visible keeps pointer interaction quiet; utilities (e.g. inputs
+     with their own focus border) can still override from a later layer. */
+  :focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 1px;
+  }
 }
 
 @layer utilities {

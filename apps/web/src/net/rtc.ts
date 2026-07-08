@@ -40,6 +40,9 @@ export function wireIce(
   pc.addEventListener("icecandidate", onLocalCandidate);
 
   const addCandidate = (init: RTCIceCandidateInit) => {
+    // Silent by design: addIceCandidate routinely rejects for candidates
+    // racing teardown or arriving after the pair is already connected —
+    // recoverable ICE noise, not signal.
     void pc.addIceCandidate(init).catch(() => {});
   };
 
@@ -58,7 +61,12 @@ export function wireIce(
       void pc
         .setRemoteDescription({ type: "answer", sdp: msg.sdp })
         .then(flushPending)
-        .catch(() => {});
+        .catch((e: unknown) => {
+          // A rejected answer means this link never establishes. The
+          // connection-failed/timeout paths surface that, but the SDP
+          // error itself is only visible here.
+          console.warn(`[rtc] setRemoteDescription failed (peer ${targetPeerId})`, e);
+        });
     }
     if (msg.type === "ice-candidate" && msg.fromPeerId === targetPeerId && msg.candidate) {
       const init: RTCIceCandidateInit = {

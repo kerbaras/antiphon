@@ -136,9 +136,12 @@ export class DeskInput {
     try {
       // No wake lock: the desk is the active tab by definition.
       await controller.start({ deviceId: device.id, wakeLock: false });
-    } catch {
+    } catch (e) {
       this.controller = null;
       void controller.teardown();
+      // The card shows the friendly line; keep the raw cause for devtools
+      // (NotAllowedError vs NotFoundError vs OverconstrainedError…).
+      console.warn("[desk-input] capture failed to start", e);
       this.patch({ phase: "picking", error: "input failed to start — is it still connected?" });
       return;
     }

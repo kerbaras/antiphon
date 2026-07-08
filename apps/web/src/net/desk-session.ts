@@ -431,6 +431,9 @@ export class DeskSession {
         this.exchangeHaves();
       })
       .catch(() => {
+        // Silent by design: serverSync "down" is surfaced in the top bar
+        // and this retry loop fires every ~2 s while the server is away —
+        // per-attempt logging would flood the console during a restart.
         this.serverConnecting = false;
         this.patch({ serverSync: "down" });
         window.setTimeout(() => this.ensureServerSync(), RECONNECT_DELAY_MS);
@@ -485,7 +488,7 @@ export class DeskSession {
           try {
             conn.channel.send(frame);
           } catch {
-            break;
+            break; // channel died mid-burst; the close handler reconnects
           }
         }
       }
@@ -500,7 +503,7 @@ export class DeskSession {
         try {
           server.channel.send(frame);
         } catch {
-          break;
+          break; // channel died mid-burst; the reconnect loop re-exchanges
         }
       }
     });
@@ -576,7 +579,7 @@ export class DeskSession {
         try {
           channel.send(frame);
         } catch {
-          return;
+          return; // channel died mid-push; reconciliation re-plans on reconnect
         }
       }
       if (i < frames.length) {

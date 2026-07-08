@@ -134,8 +134,16 @@ export function AvatarStack({
 
 // ---- toolbar ---------------------------------------------------------------
 
-const TOOLS: Array<{ name: string; key: string }> = [
-  { name: "Select", key: "V" },
+/** Muted "soon" chip marking prototype chrome that is not yet functional. */
+function SoonChip() {
+  return (
+    <span className="rounded-[3px] bg-edge px-1 py-px font-mono text-[7.5px] font-semibold tracking-[0.5px] text-text-faint uppercase">
+      soon
+    </span>
+  );
+}
+
+const INERT_TOOLS: Array<{ name: string; key: string }> = [
   { name: "Trim", key: "T" },
   { name: "Split", key: "S" },
   { name: "Stretch", key: "R" },
@@ -143,58 +151,71 @@ const TOOLS: Array<{ name: string; key: string }> = [
   { name: "Align", key: "A" },
 ];
 
-/** Editing tool group — visually faithful, inert until the DAW milestone. */
+/** Editing tool group. Select is the one live tool (clip click / marquee /
+ * drag on the timeline); the rest keep the prototype's layout but read
+ * unmistakably disabled — dimmed, cursor-blocked, tagged "soon". */
 export function ToolGroup() {
   return (
-    <div
-      aria-disabled="true"
-      title="Editing tools arrive with the timeline milestone"
-      className="flex cursor-not-allowed gap-0.5 rounded-md border border-edge bg-bg p-[2px]"
-    >
-      {TOOLS.map((tool, i) => (
-        <span
-          key={tool.name}
-          className={cx(
-            "flex items-center gap-1.5 rounded px-2.5 py-1 text-[11px] font-semibold",
-            i === 0 ? "bg-edge text-text-mute" : "text-text-faint",
-          )}
-        >
-          {tool.name}
-          <span className="font-mono text-[9px] opacity-70">{tool.key}</span>
-        </span>
-      ))}
+    <div className="flex items-center gap-0.5 rounded-md border border-edge bg-bg p-[2px]">
+      <span className="flex items-center gap-1.5 rounded bg-edge px-2.5 py-1 text-[11px] font-semibold text-text-mute">
+        Select
+        <span className="font-mono text-[9px] opacity-70">V</span>
+      </span>
+      <span
+        aria-disabled="true"
+        title="Coming soon — editing tools arrive with the timeline milestone"
+        className="flex cursor-not-allowed items-center gap-0.5 opacity-40"
+      >
+        {INERT_TOOLS.map((tool) => (
+          <span
+            key={tool.name}
+            className="flex items-center gap-1.5 rounded px-2.5 py-1 text-[11px] font-semibold text-text-faint"
+          >
+            {tool.name}
+            <span className="font-mono text-[9px] opacity-70">{tool.key}</span>
+          </span>
+        ))}
+      </span>
+      <span className="pr-1 pl-0.5">
+        <SoonChip />
+      </span>
     </div>
   );
 }
 
-/** Snap / Grid inset chips (inert until editing lands). */
+/** Snap / Grid inset chips — visibly disabled until editing lands. */
 export function SnapGrid() {
   return (
     <div
       aria-disabled="true"
+      title="Coming soon — snap and grid land with the editing tools"
       className="flex cursor-not-allowed items-center gap-2 text-[11px] text-text-faint"
     >
-      <span>Snap</span>
-      <span className="rounded-[5px] border border-edge bg-bg px-2 py-[3px] font-semibold text-text-dim">
-        Bar ▾
+      <span className="flex items-center gap-2 opacity-40">
+        <span>Snap</span>
+        <span className="rounded-[5px] border border-edge bg-bg px-2 py-[3px] font-semibold text-text-dim">
+          Bar ▾
+        </span>
+        <span>Grid</span>
+        <span className="rounded-[5px] border border-edge bg-bg px-2 py-[3px] font-mono font-semibold text-text-dim">
+          1/16
+        </span>
       </span>
-      <span>Grid</span>
-      <span className="rounded-[5px] border border-edge bg-bg px-2 py-[3px] font-mono font-semibold text-text-dim">
-        1/16
-      </span>
+      <SoonChip />
     </div>
   );
 }
 
-/** Arrange / Session inset tab pair (Session arrives with the DAW). */
+/** Arrange / Session inset tab pair — Session is visibly disabled until
+ * the DAW milestone (Arrange is the only real view). */
 export function ViewTabs() {
   return (
     <div className="flex rounded-md border border-edge bg-bg p-[2px] text-[11px] font-semibold">
       <span className="rounded bg-accent px-3.5 py-1 text-white">Arrange</span>
       <span
         aria-disabled="true"
-        title="Session view arrives with the DAW milestone"
-        className="cursor-not-allowed px-3.5 py-1 text-text-faint"
+        title="Coming soon — Session view arrives with the DAW milestone"
+        className="cursor-not-allowed px-3.5 py-1 text-text-faint opacity-40"
       >
         Session
       </span>

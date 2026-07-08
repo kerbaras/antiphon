@@ -92,34 +92,38 @@ export function JoinRoute() {
       {/* Status hero */}
       <Panel className="p-4">
         <div className="flex items-center justify-between">
-          <StatusPill
-            tone={
-              sessionState?.sittingOut
-                ? "warn"
-                : recording
-                  ? "rec"
-                  : state === "draining"
-                    ? "warn"
-                    : state === "closed"
-                      ? "ok"
-                      : capturing
-                        ? "accent"
-                        : "idle"
-            }
-          >
-            {recording && <RecDot />}
-            {sessionState?.sittingOut
-              ? "sitting out (desk disarmed)"
-              : !capturing
-                ? "no mic"
-                : state === "idle"
-                  ? "ready"
-                  : state === "streaming"
-                    ? "recording"
-                    : state === "closed"
-                      ? "take saved"
-                      : state}
-          </StatusPill>
+          {/* aria-live on the pill only (not the running clock beside it):
+              performers hear take start/stop without looking. */}
+          <span aria-live="polite">
+            <StatusPill
+              tone={
+                sessionState?.sittingOut
+                  ? "warn"
+                  : recording
+                    ? "rec"
+                    : state === "draining"
+                      ? "warn"
+                      : state === "closed"
+                        ? "ok"
+                        : capturing
+                          ? "accent"
+                          : "idle"
+              }
+            >
+              {recording && <RecDot />}
+              {sessionState?.sittingOut
+                ? "sitting out (desk disarmed)"
+                : !capturing
+                  ? "no mic"
+                  : state === "idle"
+                    ? "ready"
+                    : state === "streaming"
+                      ? "recording"
+                      : state === "closed"
+                        ? "take saved"
+                        : state}
+            </StatusPill>
+          </span>
           <InsetDisplay className="px-3 py-1">
             <span className="font-mono text-[15px] font-semibold tracking-[1px] text-text-hi">
               {formatClock(seconds)}
@@ -288,13 +292,13 @@ export function JoinRoute() {
               }
             />
             {snap.finalSeq !== null && <MonoReadout label="final seq" value={snap.finalSeq} />}
+            <MonoReadout
+              label="cross-origin isolated"
+              value={String(globalThis.crossOriginIsolated)}
+            />
           </div>
         </Panel>
       )}
-
-      <p className="mt-auto pt-2 text-center font-mono text-[9px] text-text-faint">
-        cross-origin isolated: {String(globalThis.crossOriginIsolated)}
-      </p>
     </main>
   );
 }

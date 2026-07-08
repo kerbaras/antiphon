@@ -76,7 +76,10 @@ export class SignalingClient {
       let msg: SignalingMessage | null = null;
       try {
         msg = parseSignalingMessage(String(ev.data));
-      } catch {
+      } catch (e) {
+        // A frame we can't parse means a protocol mismatch — worth a
+        // trace, never worth killing the socket handler.
+        console.warn("[signaling] unparseable message", e);
         return;
       }
       if (!msg) return;

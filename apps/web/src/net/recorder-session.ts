@@ -294,6 +294,9 @@ export class RecorderSession {
         this.publish();
       })
       .catch(() => {
+        // Silent by design: the link state is surfaced on the phone page
+        // (server/desk sink "down") and this retry loop re-offers every
+        // ~2 s while the sink is unreachable — logging would just spam.
         link.connecting = false;
         this.controller.setSinkConnected(sinkId, false);
         this.publish();

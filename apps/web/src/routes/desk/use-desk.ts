@@ -203,6 +203,7 @@ function downloadBlob(name: string, blob: Blob): void {
 
 const waveformCache = new Map<string, number[]>();
 const waveformInFlight = new Set<string>();
+const waveformWarned = new Set<string>();
 
 export function getCachedWaveform(streamId: string): number[] | undefined {
   return waveformCache.get(streamId);
@@ -228,7 +229,14 @@ export async function ensureWaveform(
     const buffer = await scratch.decodeAudioData(flac);
     waveformCache.set(streamId, computeWaveform(buffer));
     return true;
-  } catch {
+  } catch (e) {
+    // A complete stream that won't assemble/decode is real signal (corrupt
+    // FLAC, OPFS trouble) — but the status poll retries every tick, so
+    // warn once per stream, not once per attempt.
+    if (!waveformWarned.has(streamId)) {
+      waveformWarned.add(streamId);
+      console.warn(`[desk] waveform decode failed (stream ${streamId})`, e);
+    }
     return false;
   } finally {
     waveformInFlight.delete(streamId);
@@ -399,8 +407,9 @@ export function useServerStatus(
           const body = (await res.json()) as { streams: ServerStreamStatus[] };
           for (const s of body.streams) next.set(s.streamId, s);
         } catch {
-          // server unreachable; keep the last view
-          return;
+          // Silent by design: this poll fires every 2 s — an unreachable
+          // server would spam; the UI already shows archive/sync state.
+          return; // keep the last view
         }
       }
       if (!cancelled) setStatuses(next);
