@@ -9,74 +9,13 @@
 //
 // If this test passes, the DAW is the easy 80%.
 
-import { expect, type Page, test } from "@playwright/test";
-
-interface DeskStreamStatus {
-  takeId: string;
-  streamId: string;
-  chwm: number | null;
-  heldCount: number;
-  holes: Array<[number, number]>;
-  gaps: Array<[number, number]>;
-  finalSeq: number | null;
-  complete: boolean;
-  settled: boolean;
-  flagged: boolean;
-  digest: string;
-}
-
-interface ServerStreamStatus {
-  streamId: string;
-  chunkCount: number;
-  holes: Array<[number, number]>;
-  gaps: Array<[number, number]>;
-  finalSeq: number | null;
-  complete: boolean;
-  flagged: boolean;
-  digest: string;
-}
-
-async function deskStatus(desk: Page): Promise<DeskStreamStatus[]> {
-  return await desk.evaluate(() => {
-    const hook = (
-      globalThis as unknown as {
-        __antiphonDesk?: { snapshot(): { deskStatus: DeskStreamStatus[] } | null };
-      }
-    ).__antiphonDesk;
-    return hook?.snapshot()?.deskStatus ?? [];
-  });
-}
-
-async function recorderSamples(page: Page): Promise<number> {
-  return await page.evaluate(() => {
-    const hook = (
-      globalThis as unknown as {
-        __antiphon?: { snapshot(): { stats: { samplesIn: number } | null } | null };
-      }
-    ).__antiphon;
-    return hook?.snapshot()?.stats?.samplesIn ?? 0;
-  });
-}
-
-async function joinAsRecorder(page: Page, sessionId: string): Promise<void> {
-  await page.goto(`/join/${sessionId}`);
-  await page.getByRole("button", { name: /enable microphone/i }).click();
-  await expect(page.getByText("server sink")).toBeVisible();
-  await expect
-    .poll(
-      async () =>
-        await page.evaluate(() => {
-          const hook = (
-            globalThis as unknown as {
-              __antiphon?: { sessionState(): { serverLink: string } | null };
-            }
-          ).__antiphon;
-          return hook?.sessionState()?.serverLink ?? "down";
-        }),
-      { timeout: 20_000 },
-    )
-    .toBe("connected");
-}
+import { expect, test } from "@playwright/test";
+import {
+  deskStatus,
+  joinAsRecorder,
+  recorderSamples,
+  type ServerStreamStatus,
+} from "./helpers/session";
 
 test.describe("Milestone 1", () => {
   test.skip(({ browserName }) => browserName !== "chromium", "fake mic is Chromium-only");
