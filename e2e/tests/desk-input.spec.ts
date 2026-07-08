@@ -213,5 +213,25 @@ test.describe("desk hardware input (W2-D)", () => {
 
     // And the UI shows one desk-input lane, still nicknamed.
     await expect(desk.getByText(/^Room mic \(/).first()).toBeVisible();
+
+    // --- unplugged input: the status chip stops claiming "ready" (QA low) --
+    // Simulate the hardware vanishing by ending the capture track (the same
+    // 'ended' signal a real unplug fires); the card must flip to a warn
+    // "unplugged" chip and spell out the silence consequence.
+    await desk.evaluate(() => {
+      const hook = (
+        globalThis as unknown as {
+          __antiphonDeskInput?: {
+            input: { controller?: { audioTrack?: MediaStreamTrack | null } | null };
+          };
+        }
+      ).__antiphonDeskInput;
+      hook?.input.controller?.audioTrack?.dispatchEvent(new Event("ended"));
+    });
+    await expect
+      .poll(async () => (await deskInputState(desk))?.unplugged ?? false, { timeout: 10_000 })
+      .toBe(true);
+    await expect(desk.getByText("unplugged", { exact: true })).toBeVisible();
+    await expect(desk.getByText(/input unplugged — the lane records silence/)).toBeVisible();
   });
 });

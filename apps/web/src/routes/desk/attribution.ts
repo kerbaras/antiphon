@@ -32,6 +32,9 @@ export interface ArchivedPeer {
   userAgent: string;
   label: string | null;
   deviceId: string | null;
+  /** Join time (epoch ms) — the F8 canonical lane-order key; null when the
+   * archive's timestamp doesn't parse. */
+  joinedAtMs: number | null;
 }
 
 /** Rebuilt lookups. All maps are complete for whatever the archive holds;
@@ -77,12 +80,14 @@ export function buildAttribution(payload: SessionSummaryPayload): SessionAttribu
   }
   const peers = new Map<string, ArchivedPeer>();
   for (const p of payload.peers) {
+    const joinedAtMs = Date.parse(p.joinedAt);
     peers.set(p.peerId, {
       peerId: p.peerId,
       role: p.role,
       userAgent: p.userAgent,
       label: p.label,
       deviceId: p.deviceId,
+      joinedAtMs: Number.isFinite(joinedAtMs) ? joinedAtMs : null,
     });
   }
   return { peerByStream, takeStartedAt, peers };

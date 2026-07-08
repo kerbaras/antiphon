@@ -4,6 +4,8 @@ import {
   getDeviceId,
   getNickname,
   NICKNAME_KEY,
+  NICKNAME_MAX_LENGTH,
+  normalizeNickname,
   setNickname,
 } from "./device-identity";
 
@@ -70,5 +72,43 @@ describe("nickname persistence (A13)", () => {
     const store = fakeStore({ [NICKNAME_KEY]: "Maria" });
     setNickname("   ", store);
     expect(getNickname(store)).toBeNull();
+  });
+});
+
+// QA LOW: "nickname 48-char cap bypassable on commit" — the cap lived only
+// on the input's maxLength attribute; paste and programmatic writes walked
+// straight past it. Enforced here, in the model, at commit time.
+describe("nickname 48-char cap at commit", () => {
+  it("exposes the cap the inputs mirror via maxLength", () => {
+    expect(NICKNAME_MAX_LENGTH).toBe(48);
+  });
+
+  it("caps a 300-char paste at 48 UTF-16 units, after trimming", () => {
+    const store = fakeStore();
+    setNickname(`  ${"x".repeat(300)}  `, store);
+    expect(getNickname(store)).toBe("x".repeat(48));
+  });
+
+  it("never splits a surrogate pair at the cap boundary (no U+FFFD)", () => {
+    // 47 ASCII + an emoji: the pair straddles units 48/49 — the cut must
+    // drop the whole emoji, not leave a lone high surrogate behind.
+    const name = normalizeNickname(`${"a".repeat(47)}🎤 tail`);
+    expect(name).toBe("a".repeat(47));
+    expect(/[\uD800-\uDFFF]/u.test(name)).toBe(false);
+  });
+
+  it("keeps a pair that fits exactly inside the cap", () => {
+    const name = normalizeNickname(`${"a".repeat(46)}🎤 tail`);
+    expect(name).toBe(`${"a".repeat(46)}🎤`);
+    expect(name).toHaveLength(48);
+  });
+
+  it("re-trims whitespace exposed by the cut", () => {
+    expect(normalizeNickname(`${"a".repeat(47)} b`)).toBe("a".repeat(47));
+  });
+
+  it("heals an overlong previously-persisted value on read", () => {
+    const store = fakeStore({ [NICKNAME_KEY]: "y".repeat(200) });
+    expect(getNickname(store)).toBe("y".repeat(48));
   });
 });

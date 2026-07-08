@@ -12,6 +12,7 @@ import {
   type TakeStartMessage,
 } from "@antiphon/protocol";
 import type { DeskStreamStatus, FromSinkWorker, ToSinkWorker } from "../audio/sink-worker-protocol";
+import { normalizeNickname } from "./device-identity";
 import { offerChannel, RTC_CONFIG, wireIce } from "./rtc";
 import { type FatalSignalingError, SignalingClient } from "./signaling-client";
 
@@ -177,10 +178,19 @@ export class DeskSession {
     this.signaling.send({ v: 1, type: "take-stop", takeId: this.state.activeTakeId });
   }
 
+  /** Deliberate rejoin after a fatal halt (F3) — the desk flavor of the
+   * phone's take-over: clears the terminal state and reconnects under this
+   * device identity, knowingly superseding whichever tab owns it now. */
+  takeOver(): void {
+    this.signaling.reopen();
+  }
+
   /** Rename any peer (A13: the desk is the session authority). The server
-   * validates, persists, and fans out; our snapshot updates on the echo. */
+   * validates, persists, and fans out; our snapshot updates on the echo.
+   * Normalized at commit (48-char UI cap, surrogate-safe) — the lane
+   * input's maxLength alone doesn't survive paste/programmatic writes. */
   renamePeer(peerId: string, label: string): void {
-    this.signaling.send({ v: 1, type: "peer-update", peerId, label: label.trim() });
+    this.signaling.send({ v: 1, type: "peer-update", peerId, label: normalizeNickname(label) });
   }
 
   /** Play the calibration chirp (RFC §10) and announce it. */

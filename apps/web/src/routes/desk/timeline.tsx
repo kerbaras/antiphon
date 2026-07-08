@@ -4,7 +4,7 @@
 // (index.tsx); this module renders it.
 
 import type { RefObject } from "react";
-import { useRef, useState } from "react";
+import { useLayoutEffect, useRef, useState } from "react";
 import { Badge, SectionLabel } from "../../ui/kit";
 import type { TakeComment } from "./comments";
 import {
@@ -86,6 +86,33 @@ export function TimelineSection({
   onSeekTimeline: (sec: number) => void;
   onAddMarkerAt: (atSec: number) => void;
 }) {
+  // LOW — anchored zoom. A zoom change rescales every lane x, so with a raw
+  // scrollLeft the content slides under the operator's eye. Correct the
+  // viewport in the same frame (layout effect: after the new widths are in
+  // the DOM, before paint): whatever second sits under the ANCHOR keeps its
+  // viewport x. Anchor = the playhead when it's inside the visible lane
+  // area, else the center of that area (lanes start after the sticky
+  // header). Clamped at 0 — zooming out near the origin can't over-scroll.
+  const prevPxPerSec = useRef(pxPerSec);
+  useLayoutEffect(() => {
+    const prev = prevPxPerSec.current;
+    prevPxPerSec.current = pxPerSec;
+    if (prev === pxPerSec) return;
+    const viewport = timelineRef.current?.parentElement;
+    if (!viewport) return;
+    const scroll = viewport.scrollLeft;
+    // Default anchor: center of the visible lane area, as a content second.
+    let anchorViewportX = (TRACK_HEADER_W + viewport.clientWidth) / 2;
+    let anchorSec = (scroll + anchorViewportX - TRACK_HEADER_W) / prev;
+    if (playheadSec !== null) {
+      const playheadViewportX = TRACK_HEADER_W + playheadSec * prev - scroll;
+      if (playheadViewportX >= TRACK_HEADER_W && playheadViewportX <= viewport.clientWidth) {
+        anchorViewportX = playheadViewportX;
+        anchorSec = playheadSec;
+      }
+    }
+    viewport.scrollLeft = Math.max(0, TRACK_HEADER_W + anchorSec * pxPerSec - anchorViewportX);
+  }, [pxPerSec, playheadSec, timelineRef]);
   return (
     <section className="relative min-w-0 flex-1 overflow-auto bg-bg">
       {/* Pointer editing surface (seek/marquee/drag); the transport
@@ -258,6 +285,7 @@ export function TimelineSection({
             the player position during playback. */}
         {playheadSec !== null && (
           <div
+            data-playhead
             className="pointer-events-none absolute top-0 bottom-0 z-[4] w-px bg-accent"
             style={{ left: TRACK_HEADER_W + playheadSec * pxPerSec }}
           >

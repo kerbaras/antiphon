@@ -6,6 +6,7 @@
 import { useState } from "react";
 import { useNavigate } from "react-router";
 import { Button, Panel, SectionLabel, Wordmark } from "../../ui/kit";
+import { useSessionExistence } from "../join/session-existence";
 import { extractSessionId } from "./join-code";
 import { listRecentSessions, relativeTime } from "./recent-sessions";
 
@@ -59,6 +60,9 @@ export function HomeRoute() {
 function JoinByCode({ onJoin }: { onJoin: (sessionId: string) => void }) {
   const [code, setCode] = useState("");
   const sessionId = extractSessionId(code);
+  // F19: probe the pasted id inline — a heads-up, never a gate (the join
+  // page carries the full honest state and keeps rechecking).
+  const existence = useSessionExistence(sessionId);
 
   function submit() {
     if (sessionId) onJoin(sessionId);
@@ -95,6 +99,11 @@ function JoinByCode({ onJoin }: { onJoin: (sessionId: string) => void }) {
       {code.trim() && !sessionId && (
         <p className="mt-1.5 px-0.5 font-mono text-[9px] text-warn">
           no session id found — expected a uuid or an invite link containing one
+        </p>
+      )}
+      {sessionId && existence === "absent" && (
+        <p className="mt-1.5 px-0.5 font-mono text-[9px] text-warn">
+          no desk has opened this session yet — you can still join and wait for it
         </p>
       )}
     </Panel>

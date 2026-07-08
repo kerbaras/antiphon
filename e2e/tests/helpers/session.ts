@@ -45,6 +45,8 @@ export interface DeskStateSnapshot {
   deskStatus: DeskStreamStatus[];
   rebuiltChunks: number;
   errors: string[];
+  /** Terminal control-plane halt (F3): superseded / session-deleted / caps. */
+  fatal: { code: string; message: string } | null;
   session: {
     peers: Array<{
       peerId: string;

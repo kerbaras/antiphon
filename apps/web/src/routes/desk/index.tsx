@@ -13,6 +13,7 @@
 
 import { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useParams } from "react-router";
+import type { DeskStreamStatus } from "../../audio/sink-worker-protocol";
 import { recordRecentSession } from "../home/recent-sessions";
 import { orderTakeIds } from "./attribution";
 import { loadAuthorPref, saveAuthorPref } from "./comments";
@@ -32,19 +33,23 @@ import { SinksPanel } from "./sinks-panel";
 import { SongsPanel } from "./songs-panel";
 import { type Marquee, TimelineSection } from "./timeline";
 import type { RenderRange } from "./timeline-math";
-import { DeskToolbar } from "./toolbar";
+import { DeskFatalPanel, DeskToolbar } from "./toolbar";
 import { DeskTopBar } from "./top-bar";
 import {
   deviceName,
   fileSafe,
   initialsOf,
+  type LaneCandidate,
   SAMPLE_RATE,
+  stableLaneOrder,
   TAKE_GAP_SECONDS,
   type TakeSlot,
   TRACK_COLORS,
   type TrackRow,
+  useOrphanedStreams,
   useReceiving,
   useTick,
+  withPositionalSongNames,
 } from "./track-model";
 import { useCollabArrange, useCollabPresence } from "./use-collab";
 import {
@@ -105,6 +110,10 @@ function Desk({ sessionId }: { sessionId: string }) {
   const attribution = useSessionAttribution(sessionId, observedTakeIds);
   const serverStatus = useServerStatus(sessionId, observedTakeIds);
   const receiving = useReceiving(state.deskStatus);
+  // A6-truncated streams (F9): a mid-take phone reload leaves the original
+  // stream without a stream-final at EITHER sink — terminally incomplete
+  // by design, presented as such instead of "syncing" forever.
+  const orphanedStreams = useOrphanedStreams(state.deskStatus, serverStatus, state.activeTakeId);
   const [zoom, setZoom] = useState(1);
   const [tab, setTab] = useState<RailTab>("performers");
   const pxPerSec = 24 * zoom;
@@ -127,56 +136,112 @@ function Desk({ sessionId }: { sessionId: string }) {
     return map;
   }, [attribution, state.streams]);
 
-  // Rows: one per performer (falling back to per-stream for rebuilt takes
-  // the archive couldn't attribute either). Identity resolves from the
-  // live roster first, then the archived peer (F1) — so lanes keep their
-  // nickname/device name after a phone disconnects or a desk reload.
+  // Rows: one per CONNECTED performer (a lane appears the moment a phone —
+  // or the desk input — joins, in join order) plus one per stream-derived
+  // lane for archived history whose peer left or was never attributed.
+  // Identity resolves from the live roster first, then the archived peer
+  // (F1) — so lanes keep their nickname/device name after a phone
+  // disconnects or a desk reload.
+  //
+  // ORDER IS FROZEN (F8): each lane's rank is assigned on first sight and
+  // held in a ref for the page's lifetime — takes, renames, reconnects,
+  // status-order churn and late attribution never move a visible row (the
+  // mixer strips mirror rows, so they hold too). New lanes append, ordered
+  // among themselves by the peer's joinedAt — live roster or archive — so
+  // a cold reload rebuilds the identical order (see track-model.ts).
+  const laneRanks = useRef(new Map<string, number>());
+  const laneRanksSession = useRef(sessionId);
+  if (laneRanksSession.current !== sessionId) {
+    laneRanksSession.current = sessionId;
+    laneRanks.current = new Map();
+  }
   const rows = useMemo(() => {
-    const byKey = new Map<string, TrackRow>();
-    const order: string[] = [];
+    const streamsByKey = new Map<string, DeskStreamStatus[]>();
+    const aliasesByKey = new Map<string, string[]>();
+    const streamKeyOrder: string[] = [];
     for (const stream of state.deskStatus) {
       const peerId = peerByStream.get(stream.streamId) ?? null;
+      // Cold reload: OPFS-rebuilt streams can reach deskStatus BEFORE the
+      // attribution fetch returns. Freezing streamId-keyed lanes now would
+      // lock in worker-iteration order; hold them one round-trip until the
+      // archive has had its say (ready also flips on a failed fetch, so a
+      // server-away desk still shows everything, observed order).
+      if (!peerId && !attribution.ready) continue;
       const key = peerId ?? stream.streamId;
-      let row = byKey.get(key);
-      if (!row) {
-        const index = order.length;
-        const peer = recorders.find((p) => p.peerId === peerId);
-        const archived = peerId ? attribution.peers.get(peerId) : undefined;
-        // Nickname first (A13); fall back to the device-derived name.
-        const nickname = peer?.deviceInfo.label?.trim() || archived?.label?.trim();
-        const userAgent = peer?.deviceInfo.userAgent ?? archived?.userAgent;
-        row = {
-          key,
-          index,
-          peerId: peer?.peerId ?? archived?.peerId ?? null,
-          name:
-            nickname ||
-            (userAgent !== undefined
-              ? `${deviceName(userAgent)} ${index + 1}`
-              : `Stream ${index + 1}`),
-          color: TRACK_COLORS[index % TRACK_COLORS.length] as string,
-          peerInitials:
-            initialsOf(nickname) ?? (peerId ?? stream.streamId).slice(0, 2).toUpperCase(),
-          // The chip keeps the device provenance even when a nickname rules
-          // the lane title ("Maria" · chip "iPhone"; the desk input · "Desk").
-          peerLabel:
-            peerId && peerId === deskInput.peerId
-              ? "Desk"
-              : userAgent !== undefined
-                ? deviceName(userAgent)
-                : null,
-          streams: [],
-          receiving: false,
-          armed: false,
-        };
-        byKey.set(key, row);
-        order.push(key);
+      const bucket = streamsByKey.get(key);
+      if (bucket) bucket.push(stream);
+      else {
+        streamsByKey.set(key, [stream]);
+        streamKeyOrder.push(key);
       }
-      row.streams.push(stream);
-      if (receiving.has(stream.streamId)) row.receiving = true;
-      if (stream.takeId === state.activeTakeId) row.armed = true;
+      if (peerId) {
+        const aliases = aliasesByKey.get(key);
+        if (aliases) aliases.push(stream.streamId);
+        else aliasesByKey.set(key, [stream.streamId]);
+      }
     }
-    return order.map((k) => byKey.get(k) as TrackRow);
+    const joinedAtOf = (peerId: string): number | null => {
+      const live = recorders.find((p) => p.peerId === peerId);
+      const liveMs = live ? Date.parse(live.joinedAt) : Number.NaN;
+      if (Number.isFinite(liveMs)) return liveMs;
+      return attribution.peers.get(peerId)?.joinedAtMs ?? null;
+    };
+    const candidates: LaneCandidate[] = [];
+    const seen = new Set<string>();
+    for (const peer of recorders) {
+      if (seen.has(peer.peerId)) continue;
+      seen.add(peer.peerId);
+      candidates.push({
+        key: peer.peerId,
+        joinedAtMs: joinedAtOf(peer.peerId),
+        aliases: aliasesByKey.get(peer.peerId) ?? [],
+      });
+    }
+    for (const key of streamKeyOrder) {
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const attributed = aliasesByKey.has(key); // key is a peerId
+      candidates.push({
+        key,
+        joinedAtMs: attributed ? joinedAtOf(key) : null,
+        aliases: aliasesByKey.get(key) ?? [],
+      });
+    }
+    return stableLaneOrder(laneRanks.current, candidates).map((key): TrackRow => {
+      const index = laneRanks.current.get(key) as number;
+      const streams = streamsByKey.get(key) ?? [];
+      const peer = recorders.find((p) => p.peerId === key);
+      const archived = attribution.peers.get(key);
+      const attributed = peer !== undefined || archived !== undefined;
+      // Nickname first (A13); fall back to the device-derived name.
+      const nickname = peer?.deviceInfo.label?.trim() || archived?.label?.trim();
+      const userAgent = peer?.deviceInfo.userAgent ?? archived?.userAgent;
+      return {
+        key,
+        index,
+        peerId: peer?.peerId ?? archived?.peerId ?? null,
+        name:
+          nickname ||
+          (userAgent !== undefined
+            ? `${deviceName(userAgent)} ${index + 1}`
+            : `Stream ${index + 1}`),
+        color: TRACK_COLORS[index % TRACK_COLORS.length] as string,
+        peerInitials:
+          initialsOf(nickname) ??
+          (attributed ? key : (streams[0]?.streamId ?? key)).slice(0, 2).toUpperCase(),
+        // The chip keeps the device provenance even when a nickname rules
+        // the lane title ("Maria" · chip "iPhone"; the desk input · "Desk").
+        peerLabel:
+          attributed && key === deskInput.peerId
+            ? "Desk"
+            : userAgent !== undefined
+              ? deviceName(userAgent)
+              : null,
+        streams,
+        receiving: streams.some((s) => receiving.has(s.streamId)),
+        armed: streams.some((s) => s.takeId === state.activeTakeId),
+      };
+    });
   }, [
     state.deskStatus,
     peerByStream,
@@ -336,7 +401,15 @@ function Desk({ sessionId }: { sessionId: string }) {
   // player.position()/seek() — so seeks and per-song render ranges need no
   // conversion; only drawing adds the arrangement offset (selectedBaseSec).
   const takeMarkers = useTakeMarkers(sessionId, selectedTakeId);
-  const songs = useMemo(() => songsOf(takeMarkers.markers), [takeMarkers.markers]);
+  // Display-level positional renumbering for auto-named songs (QA low:
+  // delete "Song 1" and the panel used to read "01 Song 2"). The stored
+  // model keeps its names; every consumer below — panel, ruler flags,
+  // exports, ui mirror — reads THESE markers, so names agree everywhere.
+  const displayMarkers = useMemo(
+    () => withPositionalSongNames(takeMarkers.markers),
+    [takeMarkers.markers],
+  );
+  const songs = useMemo(() => songsOf(displayMarkers), [displayMarkers]);
   const markersUsable = playerLoaded && !recording;
   // The song under the playhead (panel highlight); the ruler's accent
   // strip additionally requires the transport to be rolling.
@@ -370,6 +443,16 @@ function Desk({ sessionId }: { sessionId: string }) {
     setCommentAuthor(next);
     saveAuthorPref(next);
   }
+
+  /** Stream → lane name (nickname when set), for the sinks cards: a human
+   * label above the diagnostics instead of a bare UUID (QA low / F14). */
+  const laneNameOf = useMemo(() => {
+    const names = new Map<string, string>();
+    for (const row of rows) {
+      for (const s of row.streams) names.set(s.streamId, row.name);
+    }
+    return (streamId: string): string | undefined => names.get(streamId);
+  }, [rows]);
 
   /** The selected take's streams as comment-pin targets, labeled by lane. */
   const commentLanes = useMemo(() => {
@@ -434,13 +517,17 @@ function Desk({ sessionId }: { sessionId: string }) {
           width: durationSec * pxPerSec - 3,
           durationSec,
           live: slot.live,
+          // An orphaned stream (F9) can never align or converge — its
+          // terminal "incomplete" outranks the transient "syncing".
           badge: slot.live
             ? ("rec" as const)
-            : aligned
-              ? ("aligned" as const)
-              : converged
-                ? ("converged" as const)
-                : ("syncing" as const),
+            : orphanedStreams.has(stream.streamId)
+              ? ("incomplete" as const)
+              : aligned
+                ? ("aligned" as const)
+                : converged
+                  ? ("converged" as const)
+                  : ("syncing" as const),
           energy: waveform,
           fillFraction: slot.live && durationSec > 0 ? Math.min(1, recordedSec / durationSec) : 1,
           selected: selection.includes(stream.streamId) && !slot.live,
@@ -510,10 +597,20 @@ function Desk({ sessionId }: { sessionId: string }) {
   /** Clip drag: pressing an unselected clip selects it; dragging moves every
    * selected clip together. A press without movement is just selection —
    * it deliberately does NOT switch the loaded take (QA E3); double-click
-   * is the explicit load action. */
+   * is the explicit load action.
+   *
+   * F17 — additive selection: shift/cmd/ctrl-press TOGGLES the clip in or
+   * out of the current selection and never starts a drag (a toggle is a
+   * selection edit, not a grab — dragging still works from a plain press). */
   function onClipPointerDown(e: React.PointerEvent, streamId: string) {
     if (e.button !== 0) return;
     e.stopPropagation();
+    if (e.shiftKey || e.metaKey || e.ctrlKey) {
+      setSelection((prev) =>
+        prev.includes(streamId) ? prev.filter((id) => id !== streamId) : [...prev, streamId],
+      );
+      return;
+    }
     const dragIds = selection.includes(streamId) ? selection : [streamId];
     if (!selection.includes(streamId)) setSelection([streamId]);
     const originX = e.clientX;
@@ -543,9 +640,14 @@ function Desk({ sessionId }: { sessionId: string }) {
   }
 
   /** Empty-lane press: click seeks the playhead, click-and-hold drags a
-   * marquee that selects every clip it touches. */
+   * marquee that selects every clip it touches. With shift (or cmd/ctrl)
+   * held the marquee ADDS its hits to the selection instead of replacing
+   * it, and a modifier'd click on bare lane preserves the selection (F17)
+   * — additive gestures only ever edit selection, never wipe it. Seeking
+   * is modifier-agnostic. */
   function onLanePointerDown(e: React.PointerEvent) {
     if (e.button !== 0 || recording) return;
+    const additive = e.shiftKey || e.metaKey || e.ctrlKey;
     const target = e.target as HTMLElement;
     if (target.closest("button")) return; // clips and controls handle themselves
     const container = timelineRef.current;
@@ -565,7 +667,7 @@ function Desk({ sessionId }: { sessionId: string }) {
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", up);
       if (!moved) {
-        setSelection([]);
+        if (!additive) setSelection([]);
         seekTimeline((x0 - TRACK_HEADER_W) / pxPerSec);
         setMarquee(null);
         return;
@@ -590,7 +692,9 @@ function Desk({ sessionId }: { sessionId: string }) {
           }
         }
       });
-      setSelection(hit);
+      setSelection((prev) =>
+        additive ? [...prev, ...hit.filter((id) => !prev.includes(id))] : hit,
+      );
       setMarquee(null);
     };
     window.addEventListener("pointermove", move);
@@ -752,8 +856,9 @@ function Desk({ sessionId }: { sessionId: string }) {
       selectedTakeId,
       liveMasterLevel,
       waveformsCached: waveformCacheSize(),
-      markers: takeMarkers.markers,
+      markers: displayMarkers,
       comments: takeComments.comments,
+      lanes: rows.map((row) => ({ key: row.key, name: row.name })),
     });
   });
 
@@ -850,7 +955,9 @@ function Desk({ sessionId }: { sessionId: string }) {
   const projectCtx = () => ({
     sessionId,
     lanes: rows.map((row) => ({ key: row.key, name: row.name, peerId: row.peerId })),
-    markers: takeMarkers.markers,
+    // Display names (positional auto-numbering) — the package must match
+    // what the operator sees in the songs panel and the per-song WAVs.
+    markers: displayMarkers,
     comments: takeComments.comments,
   });
 
@@ -911,9 +1018,13 @@ function Desk({ sessionId }: { sessionId: string }) {
         errors={state.errors}
         exportError={exportError}
         zoom={zoom}
+        laneNameOf={(channelKey) =>
+          rows.find((row) => row.key === channelKey)?.name ?? channelKey.slice(0, 8)
+        }
         onZoom={setZoom}
         onAddMarker={addMarkerAtPlayhead}
         onOpenComments={openCommentComposer}
+        onDismissError={(index) => getDeskSession(sessionId).dismissError(index)}
       />
 
       {/* ================= MAIN ================= */}
@@ -935,7 +1046,7 @@ function Desk({ sessionId }: { sessionId: string }) {
           activeSong={activeSong}
           durationSec={playerSnap.durationSec}
           selectedBaseSec={selectedBaseSec}
-          markers={takeMarkers.markers}
+          markers={displayMarkers}
           comments={takeComments.comments}
           midiLane={midiLane}
           playheadSec={playheadSec}
@@ -1002,6 +1113,8 @@ function Desk({ sessionId }: { sessionId: string }) {
               deskStatus={state.deskStatus}
               serverStatus={serverStatus}
               driftByStream={driftByStream}
+              orphanedStreams={orphanedStreams}
+              laneNameOf={laneNameOf}
             />
           )}
         </aside>
@@ -1022,6 +1135,15 @@ function Desk({ sessionId }: { sessionId: string }) {
           clipCount={pendingDelete.length}
           onConfirm={confirmDelete}
           onCancel={() => setPendingDelete(null)}
+        />
+      )}
+
+      {/* Terminal control-plane halt (F3): signaling stopped for good —
+          render the fact over everything; take-over is the only exit. */}
+      {state.fatal && (
+        <DeskFatalPanel
+          fatal={state.fatal}
+          onTakeOver={() => getDeskSession(sessionId).takeOver()}
         />
       )}
     </main>

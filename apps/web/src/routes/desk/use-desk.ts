@@ -12,6 +12,12 @@ import {
   writeTakeList,
 } from "../../net/collab-doc";
 import { DeskSession, type DeskSessionState } from "../../net/desk-session";
+import {
+  bindAlignmentToCollab,
+  persistTakeAlignment,
+  restoreTakeAlignment,
+  type TakeAlignment,
+} from "./alignment-persist";
 import { ALS_SAMPLES_DIR, type AlsStem, buildAls } from "./als";
 import {
   archivedStreamMetas,
@@ -69,10 +75,14 @@ export interface DeskUiMirror {
   liveMasterLevel: number;
   /** Streams whose TRUE decoded waveform is cached. */
   waveformsCached: number;
-  /** Song markers of the selected take (W2-B), timeline-sorted. */
+  /** Song markers of the selected take (W2-B), timeline-sorted, with the
+   * DISPLAY names (positional auto-numbering) the panels/exports show. */
   markers: Marker[];
   /** Comments of the selected take (W2-F), timeline-sorted. */
   comments: TakeComment[];
+  /** Track rows in render order (F8 regression hook: this order must
+   * never change within a session). */
+  lanes: Array<{ key: string; name: string }>;
 }
 
 let uiMirror: DeskUiMirror | null = null;
@@ -106,6 +116,13 @@ export function getDeskSession(sessionId: string): DeskSession {
       playerSnapshot: () => playerSnap,
       ui: () => uiMirror,
       collab: () => getDeskCollab(sessionId).snapshot(),
+      // Diagnostics/e2e: apply + persist a take's alignment verdict through
+      // the exact restore path a remote desk's doc update takes (F7b).
+      applyAlignment: (takeId: string, entries: TakeAlignment) => {
+        if (getPlayer().restoreAlignment(takeId, entries)) {
+          persistTakeAlignment(getDeskCollab(sessionId), sessionId, takeId, entries);
+        }
+      },
     };
   }
   return session;
@@ -123,6 +140,9 @@ export function getDeskCollab(sessionId: string): CollabClient {
   if (!mixBound.has(collab)) {
     mixBound.add(collab);
     bindMixToCollab(collab, getPlayer());
+    // F7b: settled align() runs persist to the doc (+ localStorage shadow);
+    // remote verdicts reapply to the loaded take at schedule time.
+    bindAlignmentToCollab(collab, getPlayer(), sessionId);
   }
   return collab;
 }
@@ -188,7 +208,12 @@ export interface TakeLoadRequest {
 const takeLoadQueue = new LoadQueue<TakeLoadRequest>(
   async (req, superseded) => {
     const ok = await loadTakeIntoPlayer(req.sessionId, req.takeId, req.streamIds, req.channelOf);
-    if (ok && req.align && !superseded()) await getPlayer().align();
+    if (!ok || superseded()) return;
+    // F7b: a persisted verdict reapplies BEFORE any auto-align — restored
+    // tracks satisfy align()'s idempotence check, so nothing re-measures
+    // and the reloaded take plays with the exact stored schedule offsets.
+    restoreTakeAlignment(getDeskCollab(req.sessionId), getPlayer(), req.sessionId, req.takeId);
+    if (req.align) await getPlayer().align();
   },
   (error, req) => {
     // Load/align failures surface on the transport error strip — a stuck

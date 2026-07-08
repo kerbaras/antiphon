@@ -23,7 +23,9 @@ const MIN_DB = -60;
 const MAX_DB = 6;
 /** Correlate against at most this much of the stream head. */
 const ALIGN_WINDOW_SECONDS = 25;
-const ALIGN_MIN_CONFIDENCE = 2.5;
+/** Chirp-correlation accept threshold — exported so the toolbar's declined
+ * readout can show the honest comparison (F7a). */
+export const ALIGN_MIN_CONFIDENCE = 2.5;
 /** Drift guard rails: below this confidence, or beyond this |ratio−1|,
  * fall back to ratio 1 — a wrong ratio is worse than uncorrected drift,
  * and real ADC crystals never miss by a full 1000 ppm. */
@@ -34,6 +36,21 @@ export interface AlignmentResult {
   lagSamples: number;
   confidence: number;
   applied: boolean;
+}
+
+/** One auto-align run's honest verdict for the toolbar (F7a), derived from
+ * per-track state — so a persisted verdict restored after a reload reads
+ * exactly like a freshly measured one. Null = never ran on this take. */
+export type AlignmentOutcome =
+  | { kind: "aligned"; trackCount: number; referenceStreamId: string | null }
+  | { kind: "declined"; confidence: number }
+  | { kind: "failed"; message: string };
+
+/** Persisted per-stream alignment verdict (F7b): exactly the fields
+ * align() writes, restorable at schedule time with playback parity. */
+export interface StoredTrackAlignment {
+  alignment: AlignmentResult;
+  drift: DriftResult | null;
 }
 
 /** Clock-drift fit vs the reference stream (ARCHITECTURE §4 layer 3).
@@ -95,6 +112,8 @@ export interface PlayerSnapshot {
   tracks: PlayerTrackSnapshot[];
   channels: ChannelStrip[];
   error: string | null;
+  /** Honest auto-align verdict for the toolbar readout (F7a). */
+  alignmentOutcome: AlignmentOutcome | null;
   /** Times source scheduling ran since play() — a continuous, uncut
    * playback stays at 1 (regression guard for re-schedule storms). */
   scheduleCount: number;
@@ -175,9 +194,14 @@ export class TakePlayer {
   private masterPan = 0;
   private masterEq: EqState = defaultEq();
   private error: string | null = null;
+  /** Last align() failure (F7a) — cleared by the next run/load/restore. */
+  private alignError: string | null = null;
   private scheduleCount = 0;
   private raf: number | null = null;
   private listeners = new Set<(snap: PlayerSnapshot) => void>();
+  /** Fired after an align() RUN settles with measurements — the F7b
+   * persistence hook. Restores never fire it (no write-back loops). */
+  private readonly alignmentSettledListeners = new Set<(takeId: string) => void>();
   private levels = new Map<string, number>();
   private masterLevel = 0;
 
@@ -215,7 +239,30 @@ export class TakePlayer {
       }),
       channels: [...this.channels.values()].map((c) => ({ ...c, eq: { ...c.eq } })),
       error: this.error,
+      alignmentOutcome: this.alignmentOutcome(),
       scheduleCount: this.scheduleCount,
+    };
+  }
+
+  /** Derive the honest align verdict (F7a) from per-track state: never-ran
+   * (null), aligned (any applied), declined (measured, none applied — the
+   * best confidence is the number to show), or failed (align() threw). */
+  private alignmentOutcome(): AlignmentOutcome | null {
+    if (this.alignError) return { kind: "failed", message: this.alignError };
+    const measured = [...this.tracks.values()].filter((t) => t.alignment !== null);
+    if (measured.length === 0) return null;
+    const applied = measured.filter((t) => t.alignment?.applied);
+    if (applied.length > 0) {
+      const reference = applied.find((t) => t.drift?.isReference) ?? null;
+      return {
+        kind: "aligned",
+        trackCount: applied.length,
+        referenceStreamId: reference?.streamId ?? null,
+      };
+    }
+    return {
+      kind: "declined",
+      confidence: Math.max(...measured.map((t) => t.alignment?.confidence ?? 0)),
     };
   }
 
@@ -270,6 +317,7 @@ export class TakePlayer {
     this.pause();
     this.loading = true;
     this.error = null;
+    this.alignError = null;
     this.notify();
     try {
       const ctx = this.ensureGraph();
@@ -369,7 +417,9 @@ export class TakePlayer {
   async align(force = false): Promise<void> {
     if (this.tracks.size === 0 || this.aligning) return;
     if (!force && [...this.tracks.values()].every((t) => t.alignment !== null)) return;
+    const takeId = this.loadedTakeId;
     this.aligning = true;
+    this.alignError = null;
     this.notify();
     try {
       await initWasm();
@@ -409,10 +459,66 @@ export class TakePlayer {
         this.stopSources();
         this.schedule(pos);
       }
+    } catch (e) {
+      // Honest failure state (F7a): a wasm/init error must read as
+      // "failed", never as "not run" — and must not kill the load queue.
+      this.alignError = e instanceof Error ? e.message : String(e);
     } finally {
       this.aligning = false;
       this.notify();
     }
+    // Persistence hook (F7b): a completed run with measurements settles the
+    // take's verdict — declined runs persist too (the verdict IS the state).
+    if (
+      !this.alignError &&
+      takeId !== null &&
+      takeId === this.loadedTakeId &&
+      [...this.tracks.values()].some((t) => t.alignment !== null)
+    ) {
+      for (const listener of this.alignmentSettledListeners) listener(takeId);
+    }
+  }
+
+  /** Register for settled align() runs (F7b persistence). */
+  onAlignmentSettled(listener: (takeId: string) => void): () => void {
+    this.alignmentSettledListeners.add(listener);
+    return () => this.alignmentSettledListeners.delete(listener);
+  }
+
+  /** Reapply a persisted per-take alignment verdict (F7b): the same track
+   * fields align() writes, consumed through the same timing()/planSource
+   * math as live playback AND the offline render — parity by construction,
+   * stored audio untouched, schedule-time only. Entries equal to the
+   * current verdict are skipped (idempotent: doc echoes and take
+   * re-selection never cause re-schedule storms); differing entries win, so
+   * desks converge on the shared doc's verdict. Returns true when anything
+   * changed. */
+  restoreAlignment(takeId: string, entries: Record<string, StoredTrackAlignment>): boolean {
+    if (this.loadedTakeId !== takeId || this.aligning || this.loading) return false;
+    let changed = false;
+    for (const track of this.tracks.values()) {
+      const entry = entries[track.streamId];
+      if (!entry) continue;
+      if (
+        track.alignment !== null &&
+        JSON.stringify({ alignment: track.alignment, drift: track.drift }) === JSON.stringify(entry)
+      ) {
+        continue;
+      }
+      track.alignment = { ...entry.alignment };
+      track.drift = entry.drift ? { ...entry.drift } : null;
+      changed = true;
+    }
+    if (!changed) return false;
+    this.alignError = null;
+    if (this.playing) {
+      const pos = this.position();
+      this.stopSources();
+      this.schedule(pos);
+    } else {
+      this.notify();
+    }
+    return true;
   }
 
   /** Per-stream clock-drift estimation (ARCHITECTURE §4 layer 3). The
@@ -534,8 +640,9 @@ export class TakePlayer {
 
   /** Samples to trim from each track's head so all aligned tracks share
    * the room clock — the modulo-repeat normalization lives in
-   * timeline-math (shared with the offline render). */
-  private alignDeltas(): Map<string, number> {
+   * timeline-math (shared with the offline render). Public as a pure
+   * diagnostics readout (F7 e2e asserts restored deltas through it). */
+  alignDeltas(): Map<string, number> {
     const spec = DEFAULT_CHIRP_SPEC;
     return normalizeAlignDeltas(
       [...this.tracks.values()]

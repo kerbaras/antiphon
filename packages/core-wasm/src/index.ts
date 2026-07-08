@@ -24,11 +24,9 @@ export {
   version,
 } from "../pkg/antiphon.js";
 
-let initialized = false;
+let initPromise: Promise<void> | null = null;
 
-/** Idempotent. Resolves when the wasm module is instantiated. */
-export async function init(): Promise<void> {
-  if (initialized) return;
+async function instantiate(): Promise<void> {
   const proc = (globalThis as { process?: { versions?: { node?: string } } }).process;
   if (typeof proc?.versions?.node === "string") {
     // Specifier kept opaque so browser bundlers don't try to resolve the
@@ -46,7 +44,29 @@ export async function init(): Promise<void> {
       module_or_path: new URL("../pkg/antiphon_bg.wasm", import.meta.url),
     });
   }
-  initialized = true;
+}
+
+/**
+ * Idempotent AND race-safe. Resolves when the wasm module is instantiated.
+ *
+ * The in-flight PROMISE is memoized, not a done-flag: concurrent callers on
+ * one thread (the desk main thread calls init() from session start, chirp
+ * playback, and alignment) share a single fetch + instantiate instead of
+ * racing into a double init. A failed init clears the memo so a later call
+ * can retry instead of inheriting a cached rejection.
+ *
+ * NOTE on the QA-2 "wasm asset fetched twice per load" network log: two
+ * fetches per DESK load are INTENDED. Wasm instantiation is per JS context —
+ * the desk needs the module on the main thread (chirp/align/meter decode)
+ * and inside the sink worker; the phone fetches once (encoder worker only).
+ * One fetch per context is the budget; e2e pins it (join-polish.spec.ts).
+ */
+export function init(): Promise<void> {
+  initPromise ??= instantiate().catch((error: unknown) => {
+    initPromise = null;
+    throw error;
+  });
+  return initPromise;
 }
 
 /** Protocol constants (RFC 0001 §13) decoded from the wasm module. */

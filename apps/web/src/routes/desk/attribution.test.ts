@@ -68,6 +68,8 @@ describe("buildAttribution", () => {
     expect(attr.peers.get("peer-a")?.label).toBe("Maria");
     expect(attr.peers.get("peer-a")?.deviceId).toBe("dev-a");
     expect(attr.peers.get("desk-1")?.role).toBe("desk");
+    // F8: joinedAt survives as epoch ms — the canonical lane-order key.
+    expect(attr.peers.get("peer-a")?.joinedAtMs).toBe(Date.parse("2026-07-08T09:59:00.000Z"));
   });
 
   it("flattens takes into announce-equivalent stream metas for sink seeding", () => {

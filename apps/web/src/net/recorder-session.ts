@@ -6,7 +6,7 @@
 import { SERVER_PEER_ID, type SignalingMessage } from "@antiphon/protocol";
 import type { CaptureController, SinkPort } from "../audio/capture-controller";
 import { uuidToBytes } from "../audio/capture-controller";
-import { getNickname, setNickname } from "./device-identity";
+import { getNickname, normalizeNickname, setNickname } from "./device-identity";
 import { offerChannel } from "./rtc";
 import { type FatalSignalingError, SignalingClient } from "./signaling-client";
 
@@ -162,9 +162,11 @@ export class RecorderSession {
   }
 
   /** Rename ourselves (A13): persist locally, carry on future hellos, and
-   * tell the room when connected. Empty clears back to the device name. */
+   * tell the room when connected. Empty clears back to the device name.
+   * Normalized at THIS commit point (48-char cap, surrogate-safe) so
+   * paste/programmatic paths can't outrun the input's maxLength. */
   rename(label: string): void {
-    const trimmed = label.trim();
+    const trimmed = normalizeNickname(label);
     this.persistLabel(trimmed);
     this.signaling.label = trimmed || null;
     const me = this.signaling.state.peerId;
@@ -208,9 +210,12 @@ export class RecorderSession {
         break;
       case "peer-update":
         // The desk renamed us: adopt + persist so the name survives reloads.
+        // Normalized on adoption too — the wire allows 256 (A13), the UI
+        // norm is 48, and every commit path must agree.
         if (msg.peerId === this.signaling.state.peerId) {
-          this.persistLabel(msg.label);
-          this.signaling.label = msg.label.trim() || null;
+          const adopted = normalizeNickname(msg.label);
+          this.persistLabel(adopted);
+          this.signaling.label = adopted || null;
         }
         break;
       case "take-start":

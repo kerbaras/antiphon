@@ -109,10 +109,13 @@ function uuidToBytes(uuid: string): Uint8Array {
   return out;
 }
 
-/** Identity extras for `hello.deviceInfo` (A12/A13). */
+/** Identity extras for `hello.deviceInfo` (A12/A13). `userAgent` overrides
+ * the harness default ("fake-recorder"/"fake-desk") for tests exercising
+ * device-derived naming. */
 export interface FakeDeviceInfo {
   deviceId?: string;
   label?: string;
+  userAgent?: string;
 }
 
 export class FakeRecorder {

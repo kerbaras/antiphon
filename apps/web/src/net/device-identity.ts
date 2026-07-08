@@ -60,6 +60,23 @@ function remove(key: string, store: KVStore | null): void {
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+/** UI-wide nickname cap. The wire bound is 256 (A13, packages/protocol);
+ * 48 is the product norm every nickname input advertises via maxLength —
+ * and maxLength alone is decorative: paste and programmatic writes walk
+ * straight past it, so the cap is enforced HERE, at commit time. */
+export const NICKNAME_MAX_LENGTH = 48;
+
+/** Commit-time normalization: trim, then hard-cap at NICKNAME_MAX_LENGTH
+ * UTF-16 units. A cut that would split a surrogate pair drops the whole
+ * pair instead (a lone surrogate renders as U+FFFD — QA #14's failure
+ * mode), and whitespace exposed by the cut is re-trimmed. */
+export function normalizeNickname(raw: string): string {
+  let name = raw.trim().slice(0, NICKNAME_MAX_LENGTH);
+  const last = name.charCodeAt(name.length - 1);
+  if (last >= 0xd800 && last <= 0xdbff) name = name.slice(0, -1);
+  return name.trim();
+}
+
 /** UUID generated once per browser and persisted (A12). */
 export function getDeviceId(store: KVStore | null = defaultStore()): string {
   const existing = read(DEVICE_ID_KEY, store);
@@ -69,15 +86,17 @@ export function getDeviceId(store: KVStore | null = defaultStore()): string {
   return fresh;
 }
 
-/** Last nickname the user set on this device (prefills the join page). */
+/** Last nickname the user set on this device (prefills the join page).
+ * Normalized on read too, healing overlong values persisted pre-cap. */
 export function getNickname(store: KVStore | null = defaultStore()): string | null {
-  const value = read(NICKNAME_KEY, store)?.trim();
-  return value ? value : null;
+  const value = read(NICKNAME_KEY, store);
+  const normalized = value ? normalizeNickname(value) : "";
+  return normalized ? normalized : null;
 }
 
 /** Persist (or clear, for empty/whitespace) the nickname. */
 export function setNickname(name: string, store: KVStore | null = defaultStore()): void {
-  const trimmed = name.trim();
-  if (trimmed) write(NICKNAME_KEY, trimmed, store);
+  const normalized = normalizeNickname(name);
+  if (normalized) write(NICKNAME_KEY, normalized, store);
   else remove(NICKNAME_KEY, store);
 }

@@ -4,8 +4,10 @@
 // or CI service); skipped when TEST_DATABASE_URL is unreachable.
 
 import { existsSync, mkdtempSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { extract_chunk_payload, extract_codec_header } from "@antiphon/core-wasm";
 import postgres from "postgres";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
@@ -17,6 +19,21 @@ import {
   type TestServer,
   takeSummary,
 } from "./helpers.ts";
+
+/** Independent STREAMINFO bit-reader (FLAC spec, not the implementation):
+ * total-samples is the 36-bit big-endian field at STREAMINFO body offset
+ * 13.4 — in a `fLaC`(4) + block-header(4) + body(34) bootstrap that is the
+ * low nibble of file byte 21 followed by bytes 22..25. */
+function readTotalSamples(flac: Uint8Array): number {
+  expect(String.fromCharCode(...flac.subarray(0, 4))).toBe("fLaC");
+  return (
+    ((flac[21] as number) & 0x0f) * 2 ** 32 +
+    (flac[22] as number) * 2 ** 24 +
+    (flac[23] as number) * 2 ** 16 +
+    (flac[24] as number) * 2 ** 8 +
+    (flac[25] as number)
+  );
+}
 
 const ADMIN_URL =
   process.env.TEST_DATABASE_URL ?? "postgres://antiphon:antiphon@localhost:5433/antiphon";
@@ -103,16 +120,22 @@ suite("server ingest end-to-end", () => {
     expect(summary[0]?.flagged).toBe(false);
 
     // The reconstructed FLAC is served and structurally valid. This
-    // recorder never set a nickname, so the download keeps the full-uuid
-    // name (the pre-F14 contract).
+    // recorder never set a nickname, so the filename falls back to the
+    // device family derived from its userAgent ("fake-recorder" matches no
+    // family → "Browser"), mirroring the desk's unlabeled lane names.
     const flacRes = await fetch(`${server.baseUrl}/api/streams/${streamId}/flac`);
     expect(flacRes.status).toBe(200);
     expect(flacRes.headers.get("content-disposition")).toBe(
-      `attachment; filename="${streamId}.flac"`,
+      `attachment; filename="Browser-${streamId.slice(0, 8)}.flac"`,
     );
     const flac = new Uint8Array(await flacRes.arrayBuffer());
     expect(String.fromCharCode(...flac.subarray(0, 4))).toBe("fLaC");
     expect(flac[42]).toBe(0xff);
+    // QA #27 (server side): the assembled copy's STREAMINFO is finalized
+    // with the true sample count — players report a real duration instead
+    // of N/A. Exactly the samples pushed: 2.2s at 48k.
+    expect(readTotalSamples(flac)).toBe(audio.length);
+    expect(readTotalSamples(flac) / 48_000).toBeCloseTo(2.2, 6);
 
     // Route params are not decorative: the same take under a foreign
     // session id is a 404, not another session's data.
@@ -193,6 +216,133 @@ suite("server ingest end-to-end", () => {
 
     await alto.close();
     await zoe.close();
+    desk.close();
+  }, 60_000);
+
+  it("unlabeled peers download as device-derived names, not raw uuids (F14 follow-up)", async () => {
+    const { sessionId } = (await (
+      await fetch(`${server.baseUrl}/api/sessions`, { method: "POST" })
+    ).json()) as { sessionId: string };
+    const desk = new FakeDesk(server.baseUrl, sessionId);
+    await desk.join();
+    // A phone that never set a nickname: the desk labels its lane by device
+    // family (track-model.ts deviceName), so the download must agree.
+    const phone = new FakeRecorder(server.baseUrl, sessionId, {
+      userAgent:
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1",
+    });
+    await phone.join();
+    await phone.connectDataChannel();
+
+    const takeId = crypto.randomUUID();
+    const streamId = crypto.randomUUID();
+    const started = new Promise<void>((resolve) => {
+      phone.onTakeStart(() => {
+        phone.arm(takeId, streamId);
+        resolve();
+      });
+    });
+    desk.takeStart(takeId);
+    await started;
+    phone.pushAudio(sine(1.2));
+    phone.finish(takeId, streamId);
+    desk.takeStop(takeId);
+    await phone.waitDrained();
+    await pollUntil(
+      () => takeSummary(server.baseUrl, sessionId, takeId),
+      (s) => s.length === 1 && (s[0]?.complete ?? false),
+      "stream archived complete",
+    );
+
+    const res = await fetch(`${server.baseUrl}/api/streams/${streamId}/flac`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-disposition")).toBe(
+      `attachment; filename="iPhone-${streamId.slice(0, 8)}.flac"`,
+    );
+
+    await phone.close();
+    desk.close();
+  }, 60_000);
+
+  it("STREAMINFO finalization: served copies carry the served sample count; stored blobs stay untouched (QA #27)", async () => {
+    const { sessionId } = (await (
+      await fetch(`${server.baseUrl}/api/sessions`, { method: "POST" })
+    ).json()) as { sessionId: string };
+    const desk = new FakeDesk(server.baseUrl, sessionId);
+    await desk.join();
+    const recorder = new FakeRecorder(server.baseUrl, sessionId);
+    await recorder.join();
+    await recorder.connectDataChannel();
+
+    const takeId = crypto.randomUUID();
+    const streamId = crypto.randomUUID();
+    const started = new Promise<void>((resolve) => {
+      recorder.onTakeStart(() => {
+        recorder.arm(takeId, streamId);
+        resolve();
+      });
+    });
+    desk.takeStart(takeId);
+    await started;
+
+    // 3.0s pushed in dribbles; the take stays OPEN (no finish yet).
+    const audio = sine(3.0);
+    for (let off = 0; off < audio.length; off += 4_800) {
+      recorder.pushAudio(audio.subarray(off, Math.min(off + 4_800, audio.length)));
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    await pollUntil(
+      () => takeSummary(server.baseUrl, sessionId, takeId),
+      (s) => (s[0]?.chunkCount ?? 0) >= 2,
+      "some chunks archived mid-take",
+    );
+
+    // Mid-take partial serve: the header advertises exactly what THIS file
+    // holds — some positive number of full 4096-sample blocks (finish alone
+    // may flush a short block), never more than was pushed.
+    const partialRes = await fetch(`${server.baseUrl}/api/streams/${streamId}/flac?partial=1`);
+    expect(partialRes.status).toBe(200);
+    const partial = new Uint8Array(await partialRes.arrayBuffer());
+    const partialSamples = readTotalSamples(partial);
+    expect(partialSamples).toBeGreaterThan(0);
+    expect(partialSamples % 4_096).toBe(0);
+    expect(partialSamples).toBeLessThanOrEqual(audio.length);
+
+    const finalSeq = recorder.finish(takeId, streamId);
+    desk.takeStop(takeId);
+    await recorder.waitDrained();
+    await pollUntil(
+      () => takeSummary(server.baseUrl, sessionId, takeId),
+      (s) => s.length === 1 && (s[0]?.complete ?? false),
+      "archive complete",
+    );
+
+    // Complete serve: exactly the pushed samples — the ffprobe-equivalent
+    // duration falls out of the same math (samples / rate).
+    const fullRes = await fetch(`${server.baseUrl}/api/streams/${streamId}/flac`);
+    expect(fullRes.status).toBe(200);
+    const full = new Uint8Array(await fullRes.arrayBuffer());
+    expect(readTotalSamples(full)).toBe(audio.length);
+    expect(readTotalSamples(full) / 48_000).toBeCloseTo(3.0, 6);
+    // The patch touched ONLY the total-samples field: magic verified above,
+    // the first audio frame still syncs right after the 42-byte bootstrap.
+    expect(full[42]).toBe(0xff);
+
+    // A partial serve of a now-complete stream holds everything: both
+    // serving paths finalize to the served sum.
+    const partial2Res = await fetch(`${server.baseUrl}/api/streams/${streamId}/flac?partial=1`);
+    const partial2 = new Uint8Array(await partial2Res.arrayBuffer());
+    expect(readTotalSamples(partial2)).toBe(audio.length);
+
+    // NEVER mutate stored chunk blobs (§13): the seq-0 blob on disk still
+    // says total-samples unknown — only the assembled output copy is
+    // finalized.
+    const seq0Blob = new Uint8Array(await readFile(join(blobRoot, takeId, streamId, "0")));
+    const storedBootstrap = extract_codec_header(extract_chunk_payload(seq0Blob));
+    expect(readTotalSamples(storedBootstrap)).toBe(0);
+    expect(finalSeq).toBeGreaterThan(0);
+
+    await recorder.close();
     desk.close();
   }, 60_000);
 

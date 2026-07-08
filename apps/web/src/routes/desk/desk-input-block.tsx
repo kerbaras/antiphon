@@ -111,7 +111,13 @@ export function DeskInputBlock({
         <Avatar
           initials={initialsOf(input.laneLabel ?? undefined) ?? "RM"}
           color={color ?? "var(--color-accent)"}
-          dot={input.recording ? "var(--color-rec)" : "var(--color-ok)"}
+          dot={
+            input.unplugged
+              ? "var(--color-warn)"
+              : input.recording
+                ? "var(--color-rec)"
+                : "var(--color-ok)"
+          }
         />
         <div className="min-w-0 flex-1">
           <div className="truncate text-[11.5px] font-semibold text-text-strong">
@@ -122,8 +128,11 @@ export function DeskInputBlock({
             {input.sampleRate ? ` · ${(input.sampleRate / 1000).toFixed(1)} kHz` : ""}
           </div>
         </div>
-        <StatusPill tone={input.recording ? "rec" : "ok"}>
-          {input.recording ? "recording" : "ready"}
+        {/* The chip tells the hardware truth: an unplugged input is never
+            "ready" (QA low) — and while a take rolls it records silence,
+            which the warning line below spells out. */}
+        <StatusPill tone={input.unplugged ? "warn" : input.recording ? "rec" : "ok"}>
+          {input.unplugged ? "unplugged" : input.recording ? "recording" : "ready"}
         </StatusPill>
       </div>
       <VUMeter level={input.peak} />

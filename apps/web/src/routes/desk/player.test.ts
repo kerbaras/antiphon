@@ -1,4 +1,5 @@
-// TakePlayer transport regressions (QA F12 / sweep QA-2 B1+B2).
+// TakePlayer transport regressions (QA F12 / sweep QA-2 B1+B2) and the
+// F7 alignment surfaces (outcome derivation, verdict restore parity).
 //
 // The engine under test is pure transport bookkeeping (startPos /
 // startCtxTime / playing / notify), so the Web Audio graph is faked with
@@ -6,9 +7,38 @@
 // by flushing a stubbed requestAnimationFrame queue. Invariant pinned here:
 // the LAST notified snapshot (what the desk UI renders) and the live
 // engine (`position()`) must never disagree about where the playhead is.
+// The wasm module is mocked so align() runs deterministically in node.
 
+import { find_chirp_offset, init as initWasm } from "@antiphon/core-wasm";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { type PlayerSnapshot, TakePlayer } from "./player";
+import { type PlayerSnapshot, type StoredTrackAlignment, TakePlayer } from "./player";
+
+vi.mock("@antiphon/core-wasm", () => ({
+  init: vi.fn(() => Promise.resolve()),
+  // Default: a measurable but low-confidence hit → align() declines.
+  find_chirp_offset: vi.fn(() => JSON.stringify({ lagSamples: 120, confidence: 0.3 })),
+  DriftEstimator: class {
+    next_request_json(): string | null {
+      return null; // no windows: estimate immediately
+    }
+    push_window(): void {
+      // unused when next_request_json returns null
+    }
+    estimate_json(): string {
+      return JSON.stringify({
+        ratio: 1,
+        ppm: 0,
+        initialOffsetSamples: 0,
+        confidence: 0,
+        windowsUsed: 0,
+        windowsTotal: 0,
+      });
+    }
+    free(): void {
+      // nothing to free in the mock
+    }
+  },
+}));
 
 // ---- minimal Web Audio fakes -------------------------------------------------
 
@@ -138,12 +168,12 @@ interface Loaded {
   snaps: PlayerSnapshot[];
 }
 
-async function loadedPlayer(durationSec = 1): Promise<Loaded> {
+async function loadedPlayer(durationSec = 1, streamIds: string[] = ["s1"]): Promise<Loaded> {
   FakeAudioContext.nextBuffer = fakeBuffer(durationSec);
   const player = new TakePlayer();
   const snaps: PlayerSnapshot[] = [];
   player.subscribe((s) => snaps.push(s));
-  const ok = await player.load("take-1", ["s1"], () => Promise.resolve(new ArrayBuffer(4)));
+  const ok = await player.load("take-1", streamIds, () => Promise.resolve(new ArrayBuffer(4)));
   expect(ok).toBe(true);
   const ctx = FakeAudioContext.instances.at(-1);
   if (!ctx) throw new Error("player built no AudioContext");
@@ -225,5 +255,144 @@ describe("rapid play/pause", () => {
     expect(player.position()).toBeCloseTo(0.5, 6);
     ctx.currentTime += 0.1; // now rolling: 0.06 pre-roll consumed, 0.06 played
     expect(player.position()).toBeCloseTo(0.56, 6);
+  });
+});
+
+// ---- F7a: honest alignment outcome ---------------------------------------------
+
+/** A confident, applied verdict pair (s2 lags s1 by 4800 samples = 0.1 s). */
+function appliedEntries(): Record<string, StoredTrackAlignment> {
+  return {
+    s1: {
+      alignment: { lagSamples: 0, confidence: 5, applied: true },
+      drift: {
+        ratio: 1,
+        ppm: 0,
+        initialOffsetSamples: 0,
+        confidence: 1,
+        windowsUsed: 0,
+        applied: false,
+        isReference: true,
+      },
+    },
+    s2: {
+      alignment: { lagSamples: 4_800, confidence: 5, applied: true },
+      drift: {
+        ratio: 1.0001,
+        ppm: 100,
+        initialOffsetSamples: 48,
+        confidence: 2,
+        windowsUsed: 10,
+        applied: true,
+        isReference: false,
+      },
+    },
+  };
+}
+
+describe("alignment outcome (F7a)", () => {
+  it("reads null before any run — never-ran is distinct", async () => {
+    const { player } = await loadedPlayer(1, ["s1", "s2"]);
+    expect(player.snapshot().alignmentOutcome).toBeNull();
+  });
+
+  it("declines visibly with the best measured confidence", async () => {
+    const { player } = await loadedPlayer(1, ["s1", "s2"]);
+    await player.align(true);
+    const outcome = player.snapshot().alignmentOutcome;
+    expect(outcome).toEqual({ kind: "declined", confidence: 0.3 });
+    // Declined ≠ applied: no head-trim deltas are in force.
+    expect(player.alignDeltas().size).toBe(0);
+  });
+
+  it("reports aligned with track count and the drift reference", async () => {
+    const { player } = await loadedPlayer(1, ["s1", "s2"]);
+    expect(player.restoreAlignment("take-1", appliedEntries())).toBe(true);
+    expect(player.snapshot().alignmentOutcome).toEqual({
+      kind: "aligned",
+      trackCount: 2,
+      referenceStreamId: "s1",
+    });
+  });
+
+  it("surfaces an align() crash as a failed outcome (not 'never ran')", async () => {
+    const { player } = await loadedPlayer(1, ["s1", "s2"]);
+    vi.mocked(find_chirp_offset).mockImplementationOnce(() => {
+      throw new Error("wasm exploded");
+    });
+    await player.align(true); // must not reject — the queue stays alive
+    expect(player.snapshot().alignmentOutcome).toEqual({
+      kind: "failed",
+      message: "wasm exploded",
+    });
+    expect(player.snapshot().aligning).toBe(false);
+  });
+});
+
+// ---- F7b: verdict restore — schedule parity --------------------------------------
+
+describe("alignment restore (F7b)", () => {
+  it("reapplies persisted verdicts into the exact schedule math", async () => {
+    const { player } = await loadedPlayer(2, ["s1", "s2"]);
+    expect(player.restoreAlignment("take-1", appliedEntries())).toBe(true);
+
+    // Head-trim deltas match a live align() of the same lags.
+    expect([...player.alignDeltas().entries()].sort()).toEqual([
+      ["s1", 0],
+      ["s2", 4_800],
+    ]);
+
+    // renderModel timing (the SAME TrackTiming playback schedules with —
+    // planSource parity by construction): chirp trim + drift residual.
+    const model = player.renderModel();
+    const t1 = model?.tracks.find((t) => t.streamId === "s1");
+    const t2 = model?.tracks.find((t) => t.streamId === "s2");
+    expect(t1?.timing.headSec).toBeCloseTo(0, 9);
+    expect(t1?.timing.ratio).toBe(1);
+    expect(t2?.timing.headSec).toBeCloseTo((4_800 + 48) / 48_000, 9);
+    expect(t2?.timing.ratio).toBeCloseTo(1.0001, 9);
+
+    // Duration reflects the trimmed head of the later-lag track.
+    expect(player.duration()).toBeCloseTo(2, 6);
+  });
+
+  it("is idempotent — an equal restore changes nothing", async () => {
+    const { player } = await loadedPlayer(2, ["s1", "s2"]);
+    expect(player.restoreAlignment("take-1", appliedEntries())).toBe(true);
+    expect(player.restoreAlignment("take-1", appliedEntries())).toBe(false);
+  });
+
+  it("ignores verdicts for a different take", async () => {
+    const { player } = await loadedPlayer(2, ["s1", "s2"]);
+    expect(player.restoreAlignment("other-take", appliedEntries())).toBe(false);
+    expect(player.snapshot().alignmentOutcome).toBeNull();
+  });
+
+  it("re-schedules a rolling transport from the same position", async () => {
+    const { player, ctx } = await loadedPlayer(2, ["s1", "s2"]);
+    player.play(0.5);
+    ctx.currentTime += 0.2;
+    const before = player.snapshot().scheduleCount;
+    expect(player.restoreAlignment("take-1", appliedEntries())).toBe(true);
+    expect(player.snapshot().playing).toBe(true);
+    expect(player.snapshot().scheduleCount).toBe(before + 1);
+    // Restored tracks satisfy align()'s idempotence: no re-measure.
+    vi.mocked(find_chirp_offset).mockClear();
+    await player.align();
+    expect(find_chirp_offset).not.toHaveBeenCalled();
+  });
+
+  it("satisfies align() idempotence after a declined restore too", async () => {
+    const { player } = await loadedPlayer(1, ["s1", "s2"]);
+    const declined: Record<string, StoredTrackAlignment> = {
+      s1: { alignment: { lagSamples: 120, confidence: 0.3, applied: false }, drift: null },
+      s2: { alignment: { lagSamples: 120, confidence: 0.3, applied: false }, drift: null },
+    };
+    expect(player.restoreAlignment("take-1", declined)).toBe(true);
+    expect(player.snapshot().alignmentOutcome).toEqual({ kind: "declined", confidence: 0.3 });
+    vi.mocked(find_chirp_offset).mockClear();
+    await player.align(); // non-force: the restored verdict stands
+    expect(find_chirp_offset).not.toHaveBeenCalled();
+    expect(initWasm).toBeDefined(); // mock module wired (sanity)
   });
 });

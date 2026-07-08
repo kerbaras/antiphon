@@ -220,6 +220,49 @@ test.describe("phone reload mid-take", () => {
     const all = await serverTakeStreams(desk, sessionId, takeId);
     expect(all.map((s) => s.streamId).sort()).toEqual([oldStreamId, newStreamId].sort());
 
+    // --- F9 presentation: the orphan is presented HONESTLY ------------------
+    // Clip status: a TERMINAL "incomplete" (after the 5 s verdict debounce),
+    // not "syncing" forever — while the fresh sibling reads converged. These
+    // short clips sit near the badge min-width, so accept either form the
+    // presentation LOW allows (worded badge on wide clips, warn status dot
+    // below 72 px); the clip title must carry the verdict in words either way.
+    const orphanClip = desk.locator(`[data-clip="${oldStreamId}"]`);
+    await expect(
+      orphanClip.locator('[data-badge="incomplete"], [data-status-dot="incomplete"]'),
+    ).toBeVisible({ timeout: 20_000 });
+    await expect(orphanClip).toHaveAttribute("title", /incomplete \(truncated mid-take/);
+    const freshClip = desk.locator(`[data-clip="${newStreamId}"]`);
+    await expect(
+      freshClip.locator('[data-badge="converged"], [data-status-dot="converged"]'),
+    ).toBeVisible({ timeout: 20_000 });
+    await expect(freshClip).toHaveAttribute("title", /— converged/);
+
+    // Sinks tab: the orphan stays LISTED — labeled with its lane name and a
+    // short stream id (no bare UUID), marked incomplete, with the A6 story
+    // spelled out. It must never quietly vanish from the diagnostics.
+    await desk.getByRole("button", { name: /sinks/i }).click();
+    const orphanCard = desk.locator(`[data-sink-stream="${oldStreamId}"]`);
+    await expect(orphanCard).toBeVisible();
+    await expect(orphanCard.getByText("incomplete")).toBeVisible({ timeout: 20_000 });
+    await expect(orphanCard.getByText(oldStreamId.slice(0, 8), { exact: true })).toBeVisible();
+    await expect(orphanCard.getByText(/truncated mid-take/)).toBeVisible();
+    // The lane label on the card matches the phone's lane (QA low: sinks
+    // cards were raw-UUID-labeled; both streams belong to the same lane).
+    const lanes = await desk.evaluate(() => {
+      const hook = (
+        globalThis as unknown as {
+          __antiphonDesk?: { ui(): { lanes: Array<{ key: string; name: string }> } | null };
+        }
+      ).__antiphonDesk;
+      return hook?.ui()?.lanes ?? [];
+    });
+    expect(lanes).toHaveLength(1);
+    const laneName = (lanes[0] as { name: string }).name;
+    await expect(orphanCard.getByText(laneName, { exact: true })).toBeVisible();
+    // The fresh stream's card converged normally alongside.
+    const freshCard = desk.locator(`[data-sink-stream="${newStreamId}"]`);
+    await expect(freshCard.getByText("⇥ converged")).toBeVisible({ timeout: 20_000 });
+
     await phone.close();
     await desk.close();
   });

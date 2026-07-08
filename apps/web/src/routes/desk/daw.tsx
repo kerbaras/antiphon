@@ -16,6 +16,7 @@ import {
   midHzToNorm,
   normToMidHz,
 } from "./eq";
+import { waveformGainChip, waveformViewGain } from "./waveform-view";
 
 export const TRACK_HEADER_W = 232;
 export const TRACK_ROW_H = 66;
@@ -296,7 +297,9 @@ export interface ClipModel {
   width: number;
   durationSec: number;
   live: boolean;
-  badge: "rec" | "converged" | "syncing" | "aligned" | null;
+  /** "incomplete" (F9) is TERMINAL: an A6-truncated stream that will never
+   * finish syncing — distinct from the transient "syncing". */
+  badge: "rec" | "converged" | "syncing" | "aligned" | "incomplete" | null;
   /** Waveform samples 0..1: true decoded peaks for loaded takes, encoded
    * signal-complexity proxy otherwise. */
   energy: number[];
@@ -326,6 +329,25 @@ function resampleBars(src: number[], n: number): number[] {
   return out;
 }
 
+/** Below this clip width the status badge yields (LOW: min-width clips):
+ * the longest badge ("⇥ converged") plus header padding needs ~66px — on a
+ * narrower clip it would render half-clipped mid-word. The status stays in
+ * the header strip as a 4px status DOT (the kit's avatar status-dot
+ * pattern, same tones as the badges) and in the button's title tooltip,
+ * which always carries it in words. */
+const CLIP_BADGE_MIN_W = 72;
+
+const BADGE_LABEL: Record<NonNullable<ClipModel["badge"]>, string> = {
+  rec: "recording",
+  aligned: "aligned",
+  converged: "converged",
+  syncing: "syncing",
+  // Terminal verdict (F9): the words ride the clip title in BOTH badge
+  // and dot form — a 4px dot alone must never be the whole story.
+  incomplete:
+    "incomplete (truncated mid-take: recorder reloaded — audio preserved, no end marker ever arrived)",
+};
+
 export function ClipCard({ clip }: { clip: ClipModel }) {
   const edge = clip.live
     ? "var(--color-rec)"
@@ -334,15 +356,27 @@ export function ClipCard({ clip }: { clip: ClipModel }) {
       : hexA(clip.color, 0.55);
   const head = clip.live ? "var(--color-rec)" : clip.color;
   const widthPx = Math.max(clip.width, 26);
+  const showBadge = clip.badge !== null && widthPx >= CLIP_BADGE_MIN_W;
   // One 2px bar per 3px of AUDIO-holding width (prototype density), spread
   // over the recorded fraction of the clip.
   const audioWidth = Math.max(0, (widthPx - 10) * Math.min(1, clip.fillFraction));
+  // F18 — decoded peaks draw peak-normalized per clip, declared by the ×N
+  // chip when the view gain is significant (see waveform-view.ts). The live
+  // proxy is already self-scaled and has no amplitude axis: gain 1, no chip.
+  const viewGain = clip.live ? 1 : waveformViewGain(clip.energy);
+  const gainChip = clip.live ? null : waveformGainChip(viewGain);
   const bars = resampleBars(clip.energy, Math.floor(audioWidth / 3));
+  const status = clip.badge !== null ? BADGE_LABEL[clip.badge] : null;
+  const title = `${clip.name}${status ? ` — ${status}` : ""}${
+    gainChip !== null ? ` · waveform drawn ×${gainChip}` : ""
+  }`;
   return (
     <button
       type="button"
       aria-label={`Select ${clip.name}`}
+      title={title}
       data-clip={clip.id}
+      data-selected={clip.selected ?? false}
       onPointerDown={clip.onPointerDown}
       onDoubleClick={clip.onDoubleClick}
       className={cx(
@@ -364,37 +398,88 @@ export function ClipCard({ clip }: { clip: ClipModel }) {
         style={{ background: head }}
       >
         <span className="truncate text-[8.5px] font-semibold text-void">{clip.name}</span>
-        {clip.badge === "rec" && (
-          <span className="ml-auto flex flex-none items-center gap-[3px] rounded-[3px] bg-rec px-[5px] font-mono text-[7px] font-bold text-white uppercase animate-recpulse">
+        {showBadge && clip.badge === "rec" && (
+          <span
+            data-badge="rec"
+            className="ml-auto flex flex-none items-center gap-[3px] rounded-[3px] bg-rec px-[5px] font-mono text-[7px] font-bold text-white uppercase animate-recpulse"
+          >
             ● rec
           </span>
         )}
-        {clip.badge === "aligned" && (
-          <span className="ml-auto flex-none rounded-[3px] bg-white/40 px-1 font-mono text-[7px] font-bold text-void uppercase">
+        {showBadge && clip.badge === "aligned" && (
+          <span
+            data-badge="aligned"
+            className="ml-auto flex-none rounded-[3px] bg-white/40 px-1 font-mono text-[7px] font-bold text-void uppercase"
+          >
             ⇥ aligned
           </span>
         )}
-        {clip.badge === "converged" && (
-          <span className="ml-auto flex-none rounded-[3px] bg-white/40 px-1 font-mono text-[7px] font-bold text-void uppercase">
+        {showBadge && clip.badge === "converged" && (
+          <span
+            data-badge="converged"
+            className="ml-auto flex-none rounded-[3px] bg-white/40 px-1 font-mono text-[7px] font-bold text-void uppercase"
+          >
             ⇥ converged
           </span>
         )}
-        {clip.badge === "syncing" && (
-          <span className="ml-auto flex-none rounded-[3px] bg-void/25 px-1 font-mono text-[7px] font-bold text-warn uppercase">
+        {showBadge && clip.badge === "syncing" && (
+          <span
+            data-badge="syncing"
+            className="ml-auto flex-none rounded-[3px] bg-void/25 px-1 font-mono text-[7px] font-bold text-warn uppercase"
+          >
             syncing
           </span>
         )}
+        {/* Solid amber, dark text: reads as a settled verdict (F9), not
+            the translucent in-flight look of "syncing". */}
+        {showBadge && clip.badge === "incomplete" && (
+          <span
+            data-badge="incomplete"
+            title="Truncated mid-take (recorder reloaded) — the captured audio is preserved, but the stream never received its end marker"
+            className="ml-auto flex-none rounded-[3px] bg-warn px-1 font-mono text-[7px] font-bold text-void uppercase"
+          >
+            ⚠ incomplete
+          </span>
+        )}
+        {/* Too narrow for words: a status dot in the badge's tones (rec
+            pulses, syncing AND the terminal incomplete warn amber — the
+            dot vocabulary can't split them, the title's words do; settled
+            states read white like their badges). */}
+        {!showBadge && clip.badge !== null && (
+          <span
+            data-status-dot={clip.badge}
+            className={cx(
+              "ml-auto size-[4px] flex-none rounded-full",
+              clip.badge === "rec" && "bg-rec animate-recpulse",
+              (clip.badge === "syncing" || clip.badge === "incomplete") && "bg-warn",
+              (clip.badge === "converged" || clip.badge === "aligned") && "bg-white/70",
+            )}
+          />
+        )}
       </div>
-      <div className="absolute inset-x-0 top-[14px] bottom-0 flex items-center gap-px overflow-hidden px-[5px]">
+      <div
+        data-wave
+        className="absolute inset-x-0 top-[14px] bottom-0 flex items-center gap-px overflow-hidden px-[5px]"
+      >
         {bars.map((v, i) => (
           <div
             // biome-ignore lint/suspicious/noArrayIndexKey: bars are positional
             key={i}
             className="w-[2px] flex-none rounded-[1px] bg-white/50"
-            style={{ height: `${Math.max(4, Math.min(1, v) * 92)}%` }}
+            style={{ height: `${Math.max(4, Math.min(1, v * viewGain) * 92)}%` }}
           />
         ))}
       </div>
+      {/* View-gain declaration (F18): dim mono chip, bottom-right — quiet
+          audio drawn readable must SAY it is drawn boosted. */}
+      {gainChip !== null && (
+        <span
+          data-wave-gain={gainChip}
+          className="pointer-events-none absolute right-[3px] bottom-[2px] rounded-[3px] bg-void/45 px-[3px] font-mono text-[7px] font-semibold text-text-faint"
+        >
+          ×{gainChip}
+        </span>
+      )}
     </button>
   );
 }
@@ -450,7 +535,12 @@ export function laneGridStyle(pxPerSec: number): React.CSSProperties {
   };
 }
 
-/** 18×18 M/S/arm buttons in a track header (M/S inert until mixdown). */
+/** 18×18 M/S/arm buttons in a track header (M/S inert until mixdown).
+ * The arm variant (an `armed` state) is a toggle like the others, so it
+ * carries aria-pressed too, plus the sticky-disarm honesty title: arm
+ * changes never interrupt a rolling take — they apply between takes
+ * (deliberate product semantics; the QA "mid-take disarm silently inert"
+ * low is answered by SAYING so, not by changing the behavior). */
 export function TrackMiniButton({
   label,
   armed,
@@ -481,7 +571,8 @@ export function TrackMiniButton({
       <button
         type="button"
         aria-label={ariaLabel ?? label}
-        aria-pressed={active}
+        aria-pressed={armed ?? active}
+        {...(armed !== undefined ? { title: "arm changes apply between takes" } : {})}
         onClick={onClick}
         className={className}
       >

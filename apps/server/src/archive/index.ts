@@ -9,6 +9,7 @@ import { and, asc, eq, inArray, lt } from "drizzle-orm";
 import { type BlobStore, chunkBlobKey } from "../blob/index.ts";
 import type { Db } from "../db/index.ts";
 import { schema } from "../db/index.ts";
+import { withTotalSamples } from "../flac-streaminfo.ts";
 import { createLogger } from "../logger.ts";
 
 export interface ChunkMetaRecord {
@@ -437,23 +438,35 @@ export class Archive {
     return result;
   }
 
-  /** Peer nickname behind a stream (streams.peerId → peers.label) for
-   * human-readable download filenames (F14). Null when the stream has no
-   * peer attribution or the peer never set a label. */
-  async streamLabel(streamId: string): Promise<string | null> {
+  /** Peer identity behind a stream (streams.peerId → peers) for
+   * human-readable download filenames (F14): the nickname when set, plus
+   * the userAgent for the device-family fallback name. Null when the
+   * stream has no peer attribution at all — only then does the download
+   * keep the historical full-uuid name. */
+  async streamPeer(streamId: string): Promise<{ label: string | null; userAgent: string } | null> {
     const [row] = await this.db
-      .select({ label: schema.peers.label })
+      .select({ label: schema.peers.label, userAgent: schema.peers.userAgent })
       .from(schema.streams)
       .innerJoin(schema.peers, eq(schema.streams.peerId, schema.peers.id))
       .where(eq(schema.streams.id, streamId));
-    return row?.label ?? null;
+    return row ?? null;
   }
 
   /** Reassemble a playable .flac: seq0 codec header ++ payloads 1..=final.
    * Refuses when incomplete unless `allowPartial` (never lie about audio).
    * Failures are discriminated: "not-found" means the stream row does not
    * exist (never did, or was hard-deleted — gone forever), "incomplete"
-   * means the stream is known but cannot honestly be served yet. */
+   * means the stream is known but cannot honestly be served yet.
+   *
+   * The assembled copy's STREAMINFO is finalized with the SERVED sample
+   * count (QA #27): the streamed bootstrap says total-samples unknown, but
+   * once assembly happens the sum of the served chunks' sampleCounts is
+   * exactly what a decoder will get out of this file — for a complete
+   * stream the full take, for a `?partial=1` serve the held subset. Both
+   * get the honest number: total-samples describes THIS file, not the
+   * platonic take, and "unknown" would leave players durationless for a
+   * length we know precisely. Stored blobs are never touched — see
+   * flac-streaminfo.ts for the §13 no-transcode reasoning. */
   async reconstructFlac(
     streamId: string,
     allowPartial = false,
@@ -483,11 +496,17 @@ export class Archive {
         return { ok: false, code: "incomplete", reason: `holds ${rows.length}/${expected} chunks` };
       }
     }
+    // Sum over the rows actually served (seq 0 carries sampleCount 0), so
+    // partial serves advertise the partial length. Chunk rows are the
+    // metadata source of truth — no decode needed.
+    const servedSamples = rows.reduce((n, row) => n + row.sampleCount, 0);
     const parts: Uint8Array[] = [];
     for (const row of rows) {
       const frame = await this.blobs.get(row.blobKey);
       if (row.seq === 0) {
-        parts.push(extract_codec_header(extract_chunk_payload(frame)));
+        parts.push(
+          withTotalSamples(extract_codec_header(extract_chunk_payload(frame)), servedSamples),
+        );
       } else {
         parts.push(extract_chunk_payload(frame));
       }

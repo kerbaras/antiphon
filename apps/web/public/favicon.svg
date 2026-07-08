@@ -1,0 +1,12 @@
+<!-- Antiphon favicon: the wordmark's rounded-square "A" tile (kit.tsx
+     Wordmark / StyledQr badge). Static asset — theme tokens can't reach it,
+     so the accent (#2E8BFF) and white are written directly (docs/
+     design-system.md "Color"). Corner radius keeps the wordmark tile's
+     6/22 ratio; the A is stroke-drawn (SVG favicons can't load webfonts)
+     with a weight tuned to stay crisp at 16–32 px. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <title>Antiphon</title>
+  <rect width="64" height="64" rx="17" fill="#2E8BFF"/>
+  <path d="M18 47.5 32 16.5 46 47.5" fill="none" stroke="#fff" stroke-width="7.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M25.5 38.5h13" fill="none" stroke="#fff" stroke-width="7" stroke-linecap="round"/>
+</svg>

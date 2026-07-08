@@ -6,7 +6,7 @@
 import { useEffect, useState } from "react";
 import { useParams } from "react-router";
 import { randomId } from "../../audio/capture-controller";
-import { getNickname } from "../../net/device-identity";
+import { getNickname, NICKNAME_MAX_LENGTH, normalizeNickname } from "../../net/device-identity";
 import {
   Badge,
   Button,
@@ -19,6 +19,7 @@ import {
   VUMeter,
   Wordmark,
 } from "../../ui/kit";
+import { useSessionExistence } from "./session-existence";
 import { formatClock } from "./timecode";
 import {
   getCaptureController,
@@ -34,6 +35,15 @@ export function JoinRoute() {
   const snap = useCaptureSnapshot();
   const sessionState = useRecorderSessionState();
   const [busy, setBusy] = useState(false);
+
+  // F19: probe session existence on load. Once joined, the live roster
+  // beats the HTTP probe — a desk in the room (or a rolling take) confirms
+  // the session and latches the verdict.
+  const deskSeen =
+    sessionState !== null &&
+    sessionState.fatal === null &&
+    (sessionState.deskLink !== "absent" || sessionState.activeTakeId !== null);
+  const existence = useSessionExistence(uuid ?? null, deskSeen);
 
   const state = snap.stats?.state ?? "idle";
   const capturing = snap.contextSampleRate !== null;
@@ -147,6 +157,11 @@ export function JoinRoute() {
 
       {/* Non-fatal errors: dismissible, self-expiring (F3 strip hygiene) */}
       <TransientError message={snap.error} />
+
+      {/* F19: honest existence state — warn, never gate. The probe keeps
+          rechecking gently, so a desk opening the link moments later
+          clears this on its own. */}
+      {uuid && existence === "absent" && <SessionNotFound sessionId={uuid} />}
 
       {/* Performer identity: the name the desk sees on this lane */}
       <PerformerPanel deskLabel={sessionState?.label ?? null} />
@@ -364,6 +379,33 @@ export function JoinRoute() {
   );
 }
 
+/** F19: the join page used to render normally for a made-up session id and
+ * let you enable the mic into a void. This panel is the honest state: the
+ * probe found no trace of the session (no desk ever opened it, no takes).
+ * Deliberately NOT a gate — the desk may create it moments later (the
+ * probe keeps polling), and capture never depends on the network. */
+function SessionNotFound({ sessionId }: { sessionId: string }) {
+  return (
+    <Panel className="p-4">
+      <div className="flex items-center justify-between">
+        <SectionLabel>Session</SectionLabel>
+        <StatusPill tone="warn">not found</StatusPill>
+      </div>
+      <p role="status" className="mt-3 text-[13px] leading-relaxed text-text-body">
+        This session doesn't exist (yet) — check the invite link.
+      </p>
+      <InsetDisplay className="mt-3 px-3 py-1.5">
+        <span className="font-mono text-[10px] break-all text-text-mute">{sessionId}</span>
+      </InsetDisplay>
+      <p className="mt-2 text-[10px] leading-relaxed text-text-faint">
+        If the desk is being set up right now, this clears by itself in a few seconds — we keep
+        checking. You can still enable the microphone and wait; nothing records until the desk
+        starts a take.
+      </p>
+    </Panel>
+  );
+}
+
 /** Nickname display + edit (A13). Persisted on the phone, prefilled on
  * return visits, sent on hello, live-renameable while connected. A desk
  * rename lands here too (`deskLabel` mirrors the session's view of us). */
@@ -379,7 +421,9 @@ function PerformerPanel({ deskLabel }: { deskLabel: string | null }) {
 
   function commit() {
     if (draft === null) return;
-    const trimmed = draft.trim();
+    // Commit-time cap (QA LOW): the input's maxLength is decorative for
+    // paste/programmatic writes — the model normalizes (trim + 48).
+    const trimmed = normalizeNickname(draft);
     renameSelf(trimmed);
     setName(trimmed);
     setDraft(null);
@@ -405,7 +449,7 @@ function PerformerPanel({ deskLabel }: { deskLabel: string | null }) {
             // biome-ignore lint/a11y/noAutofocus: user explicitly opened the editor
             autoFocus
             value={draft}
-            maxLength={48}
+            maxLength={NICKNAME_MAX_LENGTH}
             placeholder="Your name"
             onChange={(e) => setDraft(e.target.value)}
             onKeyDown={(e) => {

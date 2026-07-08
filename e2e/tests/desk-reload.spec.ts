@@ -95,10 +95,17 @@ test.describe("desk reload", () => {
     });
 
     // F1 (A1): status polling rebuilt from the archive — the historical
-    // clip reaches its CONVERGED badge instead of sticking at "syncing".
+    // clip reaches CONVERGED instead of sticking at "syncing". (The ~2.5 s
+    // clip is narrower than the badge word, so the status rides the title
+    // tooltip + header status dot — the LOW min-width-clip presentation.)
+    await expect(desk.locator(`[data-clip="${take1Stream.streamId}"]`)).toHaveAttribute(
+      "title",
+      /— converged/,
+      { timeout: 20_000 },
+    );
     await expect(
-      desk.locator(`[data-clip="${take1Stream.streamId}"]`).getByText("converged"),
-    ).toBeVisible({ timeout: 20_000 });
+      desk.locator(`[data-clip="${take1Stream.streamId}"] [data-status-dot="converged"]`),
+    ).toBeVisible();
 
     // F1 (A3): the lane carries the persisted nickname, not "Stream N".
     await expect(desk.getByText("Maria").first()).toBeVisible({ timeout: 15_000 });

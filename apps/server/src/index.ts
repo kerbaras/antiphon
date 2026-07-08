@@ -165,11 +165,13 @@ export async function createServer(config: ServerConfig = loadConfig()) {
       return c.json({ error: result.reason }, result.code === "not-found" ? 404 : 409);
     }
     // F14: the disposition header beats the desk's `a.download` in Chromium,
-    // so it must carry the same nickname naming as every other export.
-    const label = await archive.streamLabel(streamId);
+    // so it must carry the same nickname naming as every other export —
+    // falling back to the desk's device-family lane title for unlabeled
+    // peers (full uuid only when the stream has no peer attribution).
+    const peer = await archive.streamPeer(streamId);
     return c.body(result.bytes.buffer as ArrayBuffer, 200, {
       "content-type": "audio/flac",
-      "content-disposition": flacContentDisposition(streamId, label),
+      "content-disposition": flacContentDisposition(streamId, peer),
     });
   });
 
