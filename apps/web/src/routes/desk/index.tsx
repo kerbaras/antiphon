@@ -14,13 +14,13 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useParams } from "react-router";
 import type { DeskStreamStatus } from "../../audio/sink-worker-protocol";
-import { deleteArrangeKeys } from "../../net/collab-doc";
+import { type ClipRegion, deleteArrangeKeys } from "../../net/collab-doc";
 import { recordRecentSession } from "../home/recent-sessions";
 import { planAlignScopes, runAlignFlow } from "./align-flow";
 import { orderTakeIds } from "./attribution";
 import { loadAuthorPref, saveAuthorPref } from "./comments";
 import { type CommentLane, CommentsPanel } from "./comments-panel";
-import type { ClipModel } from "./daw";
+import type { ClipModel, DeskTool } from "./daw";
 import { RULER_H, TRACK_HEADER_W, TRACK_ROW_H } from "./daw";
 import { DeleteConfirm, type DeleteSummaryTake } from "./delete-confirm";
 import type { ExportJob, ExportMenuProps } from "./export-menu";
@@ -31,6 +31,7 @@ import type { MidiLaneModel } from "./midi-lane";
 import { MixerDock } from "./mixer-dock";
 import { PerformersPanel } from "./performers-panel";
 import type { DriftResult } from "./player";
+import { regionsValid, seedRegion, selectionStreamIds, splitRegion } from "./regions";
 import { type RailTab, RailTabs } from "./right-rail";
 import { SinksPanel } from "./sinks-panel";
 import { SongsPanel } from "./songs-panel";
@@ -56,7 +57,12 @@ import {
   useTick,
   withPositionalSongNames,
 } from "./track-model";
-import { useCollabArrange, useCollabLaneOrder, useCollabPresence } from "./use-collab";
+import {
+  useCollabArrange,
+  useCollabLaneOrder,
+  useCollabPresence,
+  useCollabRegions,
+} from "./use-collab";
 import {
   ensureWaveform,
   exportAbletonProject,
@@ -128,6 +134,15 @@ function Desk({ sessionId }: { sessionId: string }) {
 
   const recording = state.activeTakeId !== null;
   useTick(recording, 100);
+  // ---- editing tool (W7-B) ---------------------------------------------------
+  // Select ↔ Split, desk-local UI state (a tool is a cursor, not project
+  // state). C activates Split, V returns to Select, Escape exits too; a
+  // take starting auto-reverts — the blade has no meaning over a rolling
+  // take (the toolbar button and the C shortcut are disabled alongside).
+  const [tool, setTool] = useState<DeskTool>("select");
+  useEffect(() => {
+    if (recording && tool === "split") setTool("select");
+  }, [recording, tool]);
   const recorders = (state.session?.peers ?? []).filter((p) => p.role === "recorder");
   // The desk's own input joins as a recorder peer (W2-D); it gets a lane
   // like everyone else but is not a "phone" anywhere the copy says so.
@@ -480,6 +495,23 @@ function Desk({ sessionId }: { sessionId: string }) {
   // editing state) because the take-local↔session conversions below need
   // the selected take's base during render (W6-B).
   const [clipStartOverrides, setClipStartOverrides] = useCollabArrange(collab);
+  // Split regions (W7-B): streamId → doc-held piece list. A stream absent
+  // here is never-split — its ONE implicit region derives from the legacy
+  // arrange override / take slot (collab-doc.ts compat stance), and its
+  // drags keep writing `arrange` so the pre-split wire shape never churns.
+  const [docRegions, writeStreamRegionsMap] = useCollabRegions(collab);
+
+  /** A stream's arrangement start: leftmost region for split streams, the
+   * legacy override ?? take slot otherwise. The one "where does this
+   * stream's audio begin" rule every consumer below shares. */
+  const streamStartSec = useCallback(
+    (streamId: string, takeId: string): number => {
+      const regions = docRegions[streamId];
+      if (regions && regions.length > 0) return Math.min(...regions.map((r) => r.startSec));
+      return clipStartOverrides[streamId] ?? takes.get(takeId)?.offsetSec ?? 0;
+    },
+    [docRegions, clipStartOverrides, takes],
+  );
 
   /** The selected take's ARRANGEMENT base: leftmost of its clips in the
    * audio-domain (un-shifted) positions — the zero the take-local domains
@@ -489,9 +521,9 @@ function Desk({ sessionId }: { sessionId: string }) {
     if (!selectedTakeId) return 0;
     const starts = state.deskStatus
       .filter((s) => s.takeId === selectedTakeId)
-      .map((s) => clipStartOverrides[s.streamId] ?? takes.get(selectedTakeId)?.offsetSec ?? 0);
+      .map((s) => streamStartSec(s.streamId, selectedTakeId));
     return starts.length > 0 ? Math.min(...starts) : 0;
-  }, [selectedTakeId, state.deskStatus, clipStartOverrides, takes]);
+  }, [selectedTakeId, state.deskStatus, streamStartSec]);
   // ---- THE W6-B × W6-C composition invariant (W7-A: every take) --------------
   // The SESSION clock (player position/seek/duration) is ANCHOR-FREE:
   // every take's aligned audio starts at its clips' arrangement positions
@@ -719,11 +751,67 @@ function Desk({ sessionId }: { sessionId: string }) {
   }
   const timelineRef = useRef<HTMLDivElement | null>(null);
 
-  /** Arrangement position of a clip: user override, else its take slot. */
+  /** Arrangement position of a clip: user override, else its take slot —
+   * the LEGACY (never-split) rule; split streams read their regions
+   * (streamStartSec above composes the two). */
   const clipStartSec = (streamId: string, takeId: string): number =>
     clipStartOverrides[streamId] ?? takes.get(takeId)?.offsetSec ?? 0;
 
-  /** Per-row clip models with geometry + interaction handlers. */
+  /** A non-live stream's editable regions (W7-B): the doc list when split,
+   * else the implicit whole-stream seed (id == streamId — the pre-region
+   * identity every selection/spec key rests on). */
+  interface StreamRegions {
+    regions: ClipRegion[];
+    split: boolean;
+    streamDurationSec: number;
+  }
+  const streamRegionsOf = (stream: DeskStreamStatus): StreamRegions => {
+    const streamDurationSec = Math.max(stream.totalSamples / SAMPLE_RATE, 1);
+    const doc = docRegions[stream.streamId];
+    if (doc && doc.length > 0) return { regions: doc, split: true, streamDurationSec };
+    return {
+      regions: [
+        seedRegion(
+          stream.streamId,
+          clipStartSec(stream.streamId, stream.takeId),
+          streamDurationSec,
+        ),
+      ],
+      split: false,
+      streamDurationSec,
+    };
+  };
+
+  /** Every editable (non-live) region on the timeline, by region id — the
+   * shared lookup for drags, the blade, and Delete's region→stream
+   * resolution. Rebuilt per render like rowClips (same inputs). */
+  interface RegionEntry extends StreamRegions {
+    region: ClipRegion;
+    streamId: string;
+    takeId: string;
+    /** Complete, not an F9 orphan, not the rolling take: cuttable. */
+    splittable: boolean;
+  }
+  const regionIndex = new Map<string, RegionEntry>();
+  for (const stream of state.deskStatus) {
+    const slot = takes.get(stream.takeId);
+    if (!slot || slot.live) continue;
+    const streamRegions = streamRegionsOf(stream);
+    const splittable = stream.complete && !orphanedStreams.has(stream.streamId);
+    for (const region of streamRegions.regions) {
+      regionIndex.set(region.id, {
+        ...streamRegions,
+        region,
+        streamId: stream.streamId,
+        takeId: stream.takeId,
+        splittable,
+      });
+    }
+  }
+
+  /** Per-row clip models with geometry + interaction handlers: one box per
+   * REGION (W7-B) — a never-split stream renders its single implicit
+   * region with the exact pre-region geometry. */
   const rowClips: ClipModel[][] = rows.map((row) =>
     row.streams.flatMap((stream) => {
       const slot = takes.get(stream.takeId);
@@ -732,56 +820,72 @@ function Desk({ sessionId }: { sessionId: string }) {
       const converged =
         stream.complete && (server?.complete ?? false) && stream.digest === server?.digest;
       const aligned = alignmentByStream.get(stream.streamId) ?? false;
-      const durationSec = Math.max(
-        stream.totalSamples / SAMPLE_RATE,
-        slot.live ? slot.durationSec : 1,
-      );
       const takeNumber = [...takes.keys()].indexOf(stream.takeId) + 1;
-      // Box position = arrangement position + the alignment shift (W6-C):
-      // the box moves so aligned waveforms line up; the waveform itself
-      // (and the stored audio it draws) never changes.
-      const startSec =
-        clipStartSec(stream.streamId, stream.takeId) + clipShiftSec(stream.streamId, stream.takeId);
       // Completed streams ALWAYS draw the true decoded waveform (background
       // cache); the encoded-complexity proxy only covers the live take
       // still growing under the record head.
       const waveform = getCachedWaveform(stream.streamId) ?? stream.energy;
       const recordedSec = stream.totalSamples / SAMPLE_RATE;
-      return [
-        {
-          id: stream.streamId,
+      // Box position = arrangement position + the alignment shift (W6-C):
+      // the box moves so aligned waveforms line up; the waveform itself
+      // (and the stored audio it draws) never changes.
+      const shiftSec = clipShiftSec(stream.streamId, stream.takeId);
+      if (slot.live) {
+        const durationSec = Math.max(recordedSec, slot.durationSec);
+        return [
+          {
+            id: stream.streamId,
+            streamId: stream.streamId,
+            takeId: stream.takeId,
+            name: "Incoming take",
+            color: row.color,
+            x: (clipStartSec(stream.streamId, stream.takeId) + shiftSec) * pxPerSec,
+            width: durationSec * pxPerSec - 3,
+            durationSec,
+            live: true,
+            badge: "rec" as const,
+            energy: waveform,
+            fillFraction: durationSec > 0 ? Math.min(1, recordedSec / durationSec) : 1,
+            selected: false,
+          },
+        ];
+      }
+      const { regions, split, streamDurationSec } = streamRegionsOf(stream);
+      // An orphaned stream (F9) can never align or converge — its
+      // terminal "incomplete" outranks the transient "syncing".
+      const badge = orphanedStreams.has(stream.streamId)
+        ? ("incomplete" as const)
+        : aligned
+          ? ("aligned" as const)
+          : converged
+            ? ("converged" as const)
+            : ("syncing" as const);
+      return regions.map(
+        (region): ClipModel => ({
+          id: region.id,
+          streamId: stream.streamId,
           takeId: stream.takeId,
-          name: slot.live ? "Incoming take" : `Take ${takeNumber}`,
+          name: `Take ${takeNumber}`,
           color: row.color,
-          x: startSec * pxPerSec,
-          width: durationSec * pxPerSec - 3,
-          durationSec,
-          live: slot.live,
-          // An orphaned stream (F9) can never align or converge — its
-          // terminal "incomplete" outranks the transient "syncing".
-          badge: slot.live
-            ? ("rec" as const)
-            : orphanedStreams.has(stream.streamId)
-              ? ("incomplete" as const)
-              : aligned
-                ? ("aligned" as const)
-                : converged
-                  ? ("converged" as const)
-                  : ("syncing" as const),
-          energy: waveform,
-          fillFraction: slot.live && durationSec > 0 ? Math.min(1, recordedSec / durationSec) : 1,
-          selected: selection.includes(stream.streamId) && !slot.live,
-          ...(slot.live
-            ? {}
-            : {
-                onPointerDown: (e: React.PointerEvent) => onClipPointerDown(e, stream.streamId),
-                // Loading a take is an EXPLICIT action (QA E3): selection
-                // (click/marquee) must not switch what the player has
-                // loaded — double-click does.
-                onDoubleClick: () => setPickedTakeId(stream.takeId),
-              }),
-        },
-      ];
+          x: (region.startSec + shiftSec) * pxPerSec,
+          width: region.durationSec * pxPerSec - 3,
+          durationSec: region.durationSec,
+          live: false,
+          splitting: tool === "split",
+          badge,
+          // Split pieces draw their SLICE of the stream waveform; the
+          // unsplit seed keeps the verbatim array (zero-change parity).
+          energy: split ? sliceEnergy(waveform, region, streamDurationSec) : waveform,
+          fillFraction: 1,
+          selected: selection.includes(region.id),
+          onPointerDown: (e: React.PointerEvent) => onClipPointerDown(e, region.id),
+          // Loading a take is an EXPLICIT action (QA E3): selection
+          // (click/marquee) must not switch what the player has loaded —
+          // double-click does. The blade suspends it: a split's two
+          // clicks must never double up into a take switch.
+          ...(tool === "split" ? {} : { onDoubleClick: () => setPickedTakeId(stream.takeId) }),
+        }),
+      );
     }),
   );
 
@@ -827,52 +931,149 @@ function Desk({ sessionId }: { sessionId: string }) {
         takeId,
         streams: state.deskStatus
           .filter((s) => s.takeId === takeId && s.complete)
-          .map((s) => ({
-            streamId: s.streamId,
-            channelKey: peerByStream.get(s.streamId) ?? s.streamId,
-            clipStartSec: clipStartOverrides[s.streamId] ?? takes.get(takeId)?.offsetSec ?? 0,
-            declaredDurationSec: s.totalSamples / SAMPLE_RATE,
-          })),
+          .map((s) => {
+            // Split streams (W7-B) hand the engine their region list; the
+            // clip start collapses to the leftmost piece. Never-split
+            // streams keep the exact pre-region plan shape (no `regions`
+            // key), so the engine's verbatim whole-stream path runs.
+            const regions = docRegions[s.streamId];
+            return {
+              streamId: s.streamId,
+              channelKey: peerByStream.get(s.streamId) ?? s.streamId,
+              clipStartSec:
+                regions && regions.length > 0
+                  ? Math.min(...regions.map((r) => r.startSec))
+                  : (clipStartOverrides[s.streamId] ?? takes.get(takeId)?.offsetSec ?? 0),
+              declaredDurationSec: s.totalSamples / SAMPLE_RATE,
+              ...(regions ? { regions } : {}),
+            };
+          }),
       }));
     getPlayer().setSessionPlan(plan);
-  }, [state.activeTakeId, clipStartOverrides, state.deskStatus, takes, peerByStream]);
+  }, [state.activeTakeId, clipStartOverrides, docRegions, state.deskStatus, takes, peerByStream]);
 
-  /** Clip drag: pressing an unselected clip selects it; dragging moves every
-   * selected clip together. A press without movement is just selection —
-   * it deliberately does NOT switch the loaded take (QA E3); double-click
-   * is the explicit load action.
+  /** Apply the blade to one stream (W7-B): seed the implicit region on the
+   * first cut, split, validate, write ONE whole-list doc update. Rejected
+   * cuts — live/incomplete/orphan streams, or a cut within 100 ms of a
+   * region edge — are a SILENT no-op by design (the blade misses; no error
+   * spam for a near-edge click). */
+  function cutStream(
+    streamId: string,
+    takeId: string,
+    cuts: Array<{ regionId: string; atSourceSec: number }>,
+  ): void {
+    const stream = state.deskStatus.find((s) => s.streamId === streamId);
+    if (!stream?.complete || stream.takeId === state.activeTakeId) return;
+    if (orphanedStreams.has(streamId)) return; // F9: terminally incomplete
+    const streamDurationSec = Math.max(stream.totalSamples / SAMPLE_RATE, 1);
+    let list = docRegions[streamId] ?? [
+      seedRegion(streamId, clipStartSec(streamId, takeId), streamDurationSec),
+    ];
+    let changed = false;
+    for (const cut of cuts) {
+      const next = splitRegion(list, cut.regionId, cut.atSourceSec);
+      if (next && regionsValid(next, streamDurationSec)) {
+        list = next;
+        changed = true;
+      }
+    }
+    if (changed) writeStreamRegionsMap(streamId, list);
+  }
+
+  /** The ruler / bare-surface blade (W7-B): cut EVERY region (across all
+   * lanes) whose drawn box crosses content-second x. The geometry honors
+   * the align-shift visual composition exactly like click-to-seek — the
+   * cut lands where the operator sees the hairline over each waveform. */
+  function splitAllAt(contentSec: number): void {
+    const byStream = new Map<
+      string,
+      { takeId: string; cuts: Array<{ regionId: string; atSourceSec: number }> }
+    >();
+    for (const [regionId, entry] of regionIndex) {
+      if (!entry.splittable) continue;
+      const drawnLeft = entry.region.startSec + clipShiftSec(entry.streamId, entry.takeId);
+      const within = contentSec - drawnLeft;
+      if (within <= 0 || within >= entry.region.durationSec) continue;
+      const bucket = byStream.get(entry.streamId) ?? { takeId: entry.takeId, cuts: [] };
+      bucket.cuts.push({ regionId, atSourceSec: entry.region.sourceOffsetSec + within });
+      byStream.set(entry.streamId, bucket);
+    }
+    for (const [streamId, { takeId, cuts }] of byStream) cutStream(streamId, takeId, cuts);
+  }
+
+  /** Clip press. SPLIT tool (W7-B): the press is the blade — cut this
+   * region where the pointer sits on its drawn waveform (the box's own
+   * rect already carries the align-shift composition, so the cut lands
+   * exactly under the visible hairline). SELECT tool: pressing an
+   * unselected clip selects it; dragging moves every selected region
+   * together. A press without movement is just selection — it deliberately
+   * does NOT switch the loaded take (QA E3); double-click is the explicit
+   * load action.
    *
-   * F17 — additive selection: shift/cmd/ctrl-press TOGGLES the clip in or
-   * out of the current selection and never starts a drag (a toggle is a
+   * F17 — additive selection: shift/cmd/ctrl-press TOGGLES the region in
+   * or out of the current selection and never starts a drag (a toggle is a
    * selection edit, not a grab — dragging still works from a plain press). */
-  function onClipPointerDown(e: React.PointerEvent, streamId: string) {
+  function onClipPointerDown(e: React.PointerEvent, regionId: string) {
     if (e.button !== 0) return;
     e.stopPropagation();
+    const entry = regionIndex.get(regionId);
+    if (!entry) return;
+    if (tool === "split") {
+      const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+      const atSourceSec = entry.region.sourceOffsetSec + (e.clientX - rect.left) / pxPerSec;
+      cutStream(entry.streamId, entry.takeId, [{ regionId, atSourceSec }]);
+      return;
+    }
     if (e.shiftKey || e.metaKey || e.ctrlKey) {
       setSelection((prev) =>
-        prev.includes(streamId) ? prev.filter((id) => id !== streamId) : [...prev, streamId],
+        prev.includes(regionId) ? prev.filter((id) => id !== regionId) : [...prev, regionId],
       );
       return;
     }
-    const dragIds = selection.includes(streamId) ? selection : [streamId];
-    if (!selection.includes(streamId)) setSelection([streamId]);
+    const dragIds = selection.includes(regionId) ? selection : [regionId];
+    if (!selection.includes(regionId)) setSelection([regionId]);
     const originX = e.clientX;
-    const startPositions = new Map(
-      dragIds.map((id) => {
-        const stream = state.deskStatus.find((s) => s.streamId === id);
-        return [id, stream ? clipStartSec(id, stream.takeId) : 0];
-      }),
-    );
+    // Snapshot the down-state: legacy starts for never-split streams (the
+    // arrange write path, wire-compat), whole region lists for split ones
+    // (the regions write path). Moves derive from this snapshot — never
+    // accumulated — so a drag is exact regardless of doc echo timing.
+    const dragged = new Set(dragIds);
+    const unsplitStarts = new Map<string, number>();
+    const splitBase = new Map<string, ClipRegion[]>();
+    for (const id of dragIds) {
+      const en = regionIndex.get(id);
+      if (!en) continue;
+      if (en.split) {
+        if (!splitBase.has(en.streamId)) splitBase.set(en.streamId, docRegions[en.streamId] ?? []);
+      } else {
+        unsplitStarts.set(en.streamId, en.region.startSec);
+      }
+    }
     const move = (ev: PointerEvent) => {
       const dxSec = (ev.clientX - originX) / pxPerSec;
       if (Math.abs(ev.clientX - originX) < 4) return;
-      setClipStartOverrides((prev) => {
-        const next = { ...prev };
-        for (const [id, start] of startPositions) {
-          next[id] = Math.max(0, start + dxSec);
-        }
-        return next;
-      });
+      if (unsplitStarts.size > 0) {
+        setClipStartOverrides((prev) => {
+          const next = { ...prev };
+          for (const [streamId, start] of unsplitStarts) {
+            next[streamId] = Math.max(0, start + dxSec);
+          }
+          return next;
+        });
+      }
+      // Regions drag INDIVIDUALLY: only the grabbed/selected pieces move;
+      // their siblings hold their spots (one whole-list write per stream).
+      // Pieces MAY be stacked over each other — both sound (mixed), the
+      // same behavior whole clips dragged onto each other have always had
+      // (regions.ts regionsValid: source disjointness is the only rule).
+      for (const [streamId, base] of splitBase) {
+        writeStreamRegionsMap(
+          streamId,
+          base.map((r) =>
+            dragged.has(r.id) ? { ...r, startSec: Math.max(0, r.startSec + dxSec) } : r,
+          ),
+        );
+      }
     };
     const up = () => {
       window.removeEventListener("pointermove", move);
@@ -912,6 +1113,13 @@ function Desk({ sessionId }: { sessionId: string }) {
     const vp = viewport.getBoundingClientRect();
     if (e.clientX - vp.left < TRACK_HEADER_W || e.clientY - vp.top < RULER_H) return;
     const rect = container.getBoundingClientRect();
+    // Split tool (W7-B): a bare-surface press IS the blade across all
+    // lanes — the timeline is one time axis, so any y works, exactly like
+    // click-to-seek. Marquee/seek stay Select-tool behaviors.
+    if (tool === "split") {
+      splitAllAt((e.clientX - rect.left - TRACK_HEADER_W) / pxPerSec);
+      return;
+    }
     const x0 = e.clientX - rect.left;
     const y0 = e.clientY - rect.top;
     let moved = false;
@@ -988,6 +1196,12 @@ function Desk({ sessionId }: { sessionId: string }) {
           ? selectedLaneKey
           : null;
       if (e.key === "Escape") {
+        // Escape exits the Split tool first (W7-B) — the blade is the
+        // most-modal thing on screen; a second Escape clears the lane.
+        if (tool === "split") {
+          setTool("select");
+          return;
+        }
         setSelectedLaneKey(null);
         return;
       }
@@ -1016,8 +1230,21 @@ function Desk({ sessionId }: { sessionId: string }) {
         if (playerLoaded && !recording) takeMarkers.addAt(takeLocalPlayhead());
         return;
       }
-      // C: open the comments composer focused at the playhead (W2-F).
+      // C: activate the SPLIT tool (W7-B — the operator's ask owns this
+      // key now; the comments composer moved to N). Inert while recording,
+      // matching the toolbar button's honest disable.
       if (e.code === "KeyC" && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        if (!recording) setTool("split");
+        return;
+      }
+      // V: back to the Select tool (W7-B).
+      if (e.code === "KeyV" && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        setTool("select");
+        return;
+      }
+      // N: open the comments composer focused at the playhead (W2-F;
+      // moved from C when the Split tool claimed it — W7-B).
+      if (e.code === "KeyN" && !e.metaKey && !e.ctrlKey && !e.altKey) {
         if (playerLoaded && !recording) {
           e.preventDefault();
           setTab("comments");
@@ -1027,8 +1254,13 @@ function Desk({ sessionId }: { sessionId: string }) {
       }
       if ((e.code === "Delete" || e.code === "Backspace") && selection.length > 0) {
         e.preventDefault();
+        // Selection holds REGION ids (W7-B); deletion stays STREAM-level —
+        // any selected piece stages its whole stream (the confirm dialog
+        // says so when a split stream is among them). The same resolver
+        // scopes selection-aware auto-align (W7-A × W7-B).
+        const streamIds = new Set(selectionStreamIds(selection, docRegions));
         const refs = state.deskStatus
-          .filter((s) => selection.includes(s.streamId) && s.takeId !== state.activeTakeId)
+          .filter((s) => streamIds.has(s.streamId) && s.takeId !== state.activeTakeId)
           .map((s) => ({ takeId: s.takeId, streamId: s.streamId }));
         if (refs.length === 0) return;
         setPendingDelete(refs);
@@ -1046,6 +1278,8 @@ function Desk({ sessionId }: { sessionId: string }) {
     pendingDelete,
     laneMenu,
     menuRow,
+    tool,
+    docRegions,
     state.deskStatus,
     state.activeTakeId,
     takeMarkers.addAt,
@@ -1066,6 +1300,14 @@ function Desk({ sessionId }: { sessionId: string }) {
     });
     setPendingDelete(null);
   }
+
+  /** Any staged stream is split into regions (W7-B): the dialog carries
+   * the whole-lane honesty line — deletion is stream-level, a piece can't
+   * be destroyed without its siblings. */
+  const deleteSplitWhole = useMemo(
+    () => (pendingDelete ?? []).some((ref) => (docRegions[ref.streamId]?.length ?? 0) > 1),
+    [pendingDelete, docRegions],
+  );
 
   /** What the staged deletion would destroy, spelled out for the dialog:
    * clip counts per take, in timeline take order. */
@@ -1129,10 +1371,14 @@ function Desk({ sessionId }: { sessionId: string }) {
 
   function autoAlign() {
     if (alignFlow !== null || playerSnap.aligning || recording || !selectedTakeId) return;
+    // Selection holds REGION ids (W7-B); the align scope is per-STREAM —
+    // head-trims are properties of the capture, shared by all its pieces —
+    // so selecting ANY piece of a split stream puts that whole stream in
+    // scope (selectionStreamIds dedupes; unsplit ids pass verbatim).
     const scopes =
       selection.length > 0
         ? planAlignScopes(
-            selection,
+            selectionStreamIds(selection, docRegions),
             state.deskStatus.map((s) => ({
               streamId: s.streamId,
               takeId: s.takeId,
@@ -1156,9 +1402,21 @@ function Desk({ sessionId }: { sessionId: string }) {
     // intended). A mid-flow cancel can leave a scope reset-but-not-
     // remeasured, and that is SAFE: the persisted verdict still draws AND
     // plays those clips aligned (align-flow.ts header).
+    //
+    // SPLIT streams are exempt from the reset — PM decision (W7-A × W7-B):
+    // a split is deliberate arrangement work, and its region layout is the
+    // operator's edit, not a "manual move" re-align exists to undo. Their
+    // region structure (source windows AND positions) is preserved; their
+    // frozen legacy `arrange` key is preserved too (it is the OLD desks'
+    // pre-split view — deleting it would move the clip on old desks only).
+    // Realignment still fully applies to them: head-trims are schedule/
+    // drawing compositions OVER the regions, never region mutations. Only
+    // never-split streams get the override reset, and only those count in
+    // the chip note.
     const scopedIds = scopes.flatMap((s) => s.streamIds);
-    const resetCount = scopedIds.filter((id) => clipStartOverrides[id] !== undefined).length;
-    deleteArrangeKeys(collab.doc, scopedIds, collab.origin);
+    const resetIds = scopedIds.filter((id) => docRegions[id] === undefined);
+    const resetCount = resetIds.filter((id) => clipStartOverrides[id] !== undefined).length;
+    deleteArrangeKeys(collab.doc, resetIds, collab.origin);
     noteAlign(
       resetCount > 0
         ? `manual offsets reset · ${resetCount} clip${resetCount === 1 ? "" : "s"}`
@@ -1334,8 +1592,18 @@ function Desk({ sessionId }: { sessionId: string }) {
       if (!persisted || persisted.anchorSec === 0) continue;
       const streams = state.deskStatus.filter((s) => s.takeId === takeId);
       if (streams.length === 0) continue;
-      const starts = streams.map((s) => clipStartOverrides[s.streamId] ?? slot.offsetSec);
-      const ends = streams.map((s, i) => (starts[i] as number) + s.totalSamples / SAMPLE_RATE);
+      // Split streams (W7-B) span their region layout — leftmost piece to
+      // the last piece's end — through the same rule every other consumer
+      // uses (streamStartSec); never-split streams keep the legacy
+      // override/slot + declared-length yardstick.
+      const starts = streams.map((s) => streamStartSec(s.streamId, takeId));
+      const ends = streams.map((s, i) => {
+        const regions = docRegions[s.streamId];
+        if (regions && regions.length > 0) {
+          return Math.max(...regions.map((r) => r.startSec + r.durationSec));
+        }
+        return (starts[i] as number) + s.totalSamples / SAMPLE_RATE;
+      });
       spans.push({
         startSec: Math.min(...starts),
         endSec: Math.max(...ends),
@@ -1343,7 +1611,7 @@ function Desk({ sessionId }: { sessionId: string }) {
       });
     }
     return spans;
-  }, [takes, selectedTakeId, persistedShiftsByTake, state.deskStatus, clipStartOverrides]);
+  }, [takes, selectedTakeId, persistedShiftsByTake, state.deskStatus, streamStartSec, docRegions]);
   const playheadSec = recording
     ? state.activeTakeId && takes.has(state.activeTakeId)
       ? (takes.get(state.activeTakeId) as TakeSlot).offsetSec + elapsed
@@ -1409,6 +1677,8 @@ function Desk({ sessionId }: { sessionId: string }) {
     publishUiMirror({
       selection,
       clipStarts: clipStartOverrides,
+      regions: docRegions,
+      tool,
       playheadSec,
       selectedTakeId,
       liveMasterLevel,
@@ -1610,6 +1880,8 @@ function Desk({ sessionId }: { sessionId: string }) {
         playerLoaded={playerLoaded}
         playerSnap={playerSnap}
         markersUsable={markersUsable}
+        tool={tool}
+        onTool={setTool}
         lastChirpAt={state.lastChirpAt}
         errors={state.errors}
         exportError={exportError}
@@ -1642,6 +1914,8 @@ function Desk({ sessionId }: { sessionId: string }) {
           disarmedPeers={state.disarmedPeers}
           recording={recording}
           markersUsable={markersUsable}
+          tool={tool}
+          onSplitAt={splitAllAt}
           activeSong={activeSong}
           durationSec={playerSnap.takeDurationSec}
           timelineBaseSec={timelineBaseSec}
@@ -1779,6 +2053,7 @@ function Desk({ sessionId }: { sessionId: string }) {
         <DeleteConfirm
           takes={deleteSummary}
           clipCount={pendingDelete.length}
+          splitWhole={deleteSplitWhole}
           onConfirm={confirmDelete}
           onCancel={() => setPendingDelete(null)}
         />
@@ -1794,4 +2069,18 @@ function Desk({ sessionId }: { sessionId: string }) {
       )}
     </main>
   );
+}
+
+/** A region's slice of its stream's waveform array (W7-B): a proportional
+ * index window over the full source, so a split's pieces visually CONTINUE
+ * the original drawing — same peaks at the same source positions, each box
+ * re-bucketed by ClipCard's own density rule over the same px-per-second
+ * geometry the boxes share. */
+function sliceEnergy(energy: number[], region: ClipRegion, streamDurationSec: number): number[] {
+  if (energy.length === 0 || streamDurationSec <= 0) return energy;
+  const from = Math.round((region.sourceOffsetSec / streamDurationSec) * energy.length);
+  const to = Math.round(
+    ((region.sourceOffsetSec + region.durationSec) / streamDurationSec) * energy.length,
+  );
+  return energy.slice(Math.max(0, from), Math.max(from + 1, Math.min(energy.length, to)));
 }

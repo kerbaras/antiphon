@@ -7,14 +7,17 @@
 import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
 import type { CollabClient, CollabSnapshot } from "../../net/collab";
 import {
+  type ClipRegion,
   MASTER_KEY,
   type MixStripState,
   readArrange,
   readLaneOrder,
   readMix,
+  readRegions,
   writeArrange,
   writeLaneOrder,
   writeMixIfChanged,
+  writeStreamRegions,
 } from "../../net/collab-doc";
 import type { ChannelStrip, SessionPlayer } from "./player";
 
@@ -148,6 +151,33 @@ export function useCollabArrange(
     [collab],
   );
   return [overrides, update];
+}
+
+/** Clip regions (W7-B) through the doc: streamId → split pieces. Local
+ * splits/region drags write one stream's WHOLE list; remote desks' edits
+ * land in the returned record live. Streams absent from the record are
+ * never-split — the caller derives their implicit region and keeps the
+ * legacy `arrange` wire shape for them (collab-doc.ts compat stance). */
+export function useCollabRegions(
+  collab: CollabClient,
+): [Record<string, ClipRegion[]>, (streamId: string, regions: ClipRegion[]) => void] {
+  const [regions, setRegions] = useState<Record<string, ClipRegion[]>>(() =>
+    readRegions(collab.doc),
+  );
+  useEffect(() => {
+    const map = collab.doc.getMap<ClipRegion[]>("regions");
+    const refresh = () => setRegions(readRegions(collab.doc));
+    refresh();
+    map.observe(refresh);
+    return () => map.unobserve(refresh);
+  }, [collab]);
+  const write = useCallback(
+    (streamId: string, next: ClipRegion[]) => {
+      writeStreamRegions(collab.doc, streamId, next, collab.origin);
+    },
+    [collab],
+  );
+  return [regions, write];
 }
 
 /** Deliberate lane order (W4-E) through the doc: a Move up/down writes the

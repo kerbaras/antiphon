@@ -126,7 +126,8 @@ test.describe("ruler hit targets (F11)", () => {
     await expect
       .poll(async () => Math.abs((await playerPosition(desk)) - (TAKE_BASE_SEC + 2)))
       .toBeLessThan(0.1);
-    await desk.keyboard.press("c");
+    // N opens the composer (moved from C — the Split tool owns C, W7-B).
+    await desk.keyboard.press("n");
     const composer = desk.getByLabel("Comment text");
     await expect(composer).toBeFocused();
     await composer.fill("tick under the flag footprint");

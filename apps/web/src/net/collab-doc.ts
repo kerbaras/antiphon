@@ -5,6 +5,7 @@
 // One Y.Doc per session:
 //   getMap('mix')       channelKey (lane peerId | 'master') → MixStripState
 //   getMap('arrange')   streamId → clip start seconds on the arrangement
+//   getMap('regions')   streamId → ClipRegion[] (W7-B split pieces; see below)
 //   getMap('laneOrder') laneKey → display ordinal (W4-E deliberate moves)
 //   getMap('markers')   takeId → Y.Array<Marker>       (W2-B plain objects)
 //   getMap('comments')  takeId → Y.Array<TakeComment>  (W2-F plain objects)
@@ -159,6 +160,122 @@ export function writeLaneOrder(doc: Y.Doc, next: Record<string, number>, origin:
 
 export function deleteArrangeKeys(doc: Y.Doc, keys: string[], origin: unknown): void {
   const map = doc.getMap<number>("arrange");
+  const present = keys.filter((k) => map.has(k));
+  if (present.length === 0) return;
+  doc.transact(() => {
+    for (const key of present) map.delete(key);
+  }, origin);
+}
+
+// ---- clip regions (W7-B) ----------------------------------------------------------
+// The Split tool's data model: streamId → ordered region list, each region a
+// window of the stream's SOURCE audio placed on the arrangement. Stored as a
+// whole plain array per stream key (LWW per stream under concurrency, like
+// every Y.Map here) — a split or a region drag rewrites one stream's list in
+// one transaction, and two desks splitting the same stream concurrently
+// converge on one desk's whole list (accepted bound: a lost split is one
+// re-click; audio is never touched).
+//
+// COMPAT STANCE (wire-shape rules, deliberate):
+//   · A never-split stream has NO entry here. Its one implicit region is
+//     derived by the reader — id = streamId, sourceOffsetSec = 0, duration =
+//     the stream's length, startSec = the legacy `arrange` override (or the
+//     take slot). Unsplit streams therefore keep the EXACT pre-W7-B wire
+//     behavior: drags keep writing `arrange`, and nothing in this map churns.
+//   · The FIRST split seeds the stream's list from that implicit region (the
+//     current `arrange` value baked into region startSecs). From then on the
+//     regions list is authoritative for new desks; the stream's `arrange`
+//     key is left as-is, frozen at its split-time value.
+//   · Old desks ignore this map entirely and keep reading `arrange`: they
+//     see the pre-split view (the whole clip at its last pre-split position)
+//     and can still play/export it — degraded to yesterday's truth, never a
+//     wrong or torn state. Their `arrange` drags still sync (new desks
+//     ignore `arrange` for split streams, so the two maps cannot fight).
+
+/** One split piece of a stream, placed on the arrangement.
+ * Invariants (enforced by the desk's split math, not by this transport
+ * layer): regions of one stream are ordered and non-overlapping in the
+ * SOURCE domain, sourceOffsetSec ≥ 0, sourceOffsetSec + durationSec ≤ the
+ * stream's length, and every region is ≥ 100 ms (closer splits are
+ * rejected at the tool). `startSec` lives in the same audio-domain
+ * arrangement axis as the `arrange` map — visual align shifts compose on
+ * top at draw time (W6-C), never here. */
+export interface ClipRegion {
+  /** Stable region identity. The first (seeded) region KEEPS the streamId
+   * as its id, so selection/specs built on "region id == streamId for
+   * unsplit streams" survive the first split unchanged. */
+  id: string;
+  /** Arrangement position of the region (audio domain, ≥ 0). */
+  startSec: number;
+  /** Where in the stream's source audio this region begins (raw buffer
+   * seconds from sample 0 — alignment head-trims stay schedule-time). */
+  sourceOffsetSec: number;
+  /** Region length in source seconds. */
+  durationSec: number;
+}
+
+/** THE hostile-data boundary for the regions map (QA W7-B nit): the doc is
+ * writable by any desk build, so a foreign/buggy value must never reach a
+ * consumer — a non-array crashed .map()s, a garbage region defeated
+ * planRegionSource's guards via NaN comparisons (source.start(NaN)
+ * throws), an empty list scheduled zero sources (silent stream). The rule
+ * is whole-list-or-nothing: any invalid piece invalidates the LIST, and an
+ * invalid/empty list reads as ABSENT — the stream degrades to its
+ * never-split view (all audio at the legacy arrange position, the same
+ * yesterday's-truth degradation old desks live on). Never a partial subset:
+ * dropping one garbage piece would silently lose its audio window. */
+function validRegionList(value: unknown): ClipRegion[] | null {
+  if (!Array.isArray(value) || value.length === 0) return null;
+  for (const region of value) {
+    if (typeof region !== "object" || region === null) return null;
+    const { id, startSec, sourceOffsetSec, durationSec } = region as Record<string, unknown>;
+    if (typeof id !== "string" || id.length === 0) return null;
+    if (
+      !Number.isFinite(startSec) ||
+      !Number.isFinite(sourceOffsetSec) ||
+      !Number.isFinite(durationSec)
+    ) {
+      return null;
+    }
+    if ((startSec as number) < 0 || (sourceOffsetSec as number) < 0) return null;
+    if ((durationSec as number) <= 0) return null;
+  }
+  return value as ClipRegion[];
+}
+
+/** Read every stream's region list — VALIDATED (see validRegionList):
+ * every list this returns is a non-empty array of well-formed regions, so
+ * no consumer needs its own defensive checks. */
+export function readRegions(doc: Y.Doc): Record<string, ClipRegion[]> {
+  const out: Record<string, ClipRegion[]> = {};
+  doc.getMap<unknown>("regions").forEach((value, key) => {
+    const regions = validRegionList(value);
+    if (regions) out[key] = regions;
+  });
+  return out;
+}
+
+/** Replace one stream's whole region list (split, region drag). Equal
+ * content is a no-op — doc echoes and re-derived writes never churn the
+ * wire. Returns true when a write happened. */
+export function writeStreamRegions(
+  doc: Y.Doc,
+  streamId: string,
+  regions: ClipRegion[],
+  origin: unknown,
+): boolean {
+  const map = doc.getMap<ClipRegion[]>("regions");
+  if (JSON.stringify(map.get(streamId)) === JSON.stringify(regions)) return false;
+  doc.transact(() => {
+    map.set(streamId, regions);
+  }, origin);
+  return true;
+}
+
+/** Drop deleted streams' region lists (the deleteArrangeKeys twin — both
+ * run on the server-confirmed streams-deleted fanout). */
+export function deleteRegionKeys(doc: Y.Doc, keys: string[], origin: unknown): void {
+  const map = doc.getMap<ClipRegion[]>("regions");
   const present = keys.filter((k) => map.has(k));
   if (present.length === 0) return;
   doc.transact(() => {

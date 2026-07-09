@@ -15,7 +15,14 @@
 // device rate, so exports are device-independent.
 
 import { createEqChain, type EqState } from "./eq";
-import { planSource, type RenderRange, resolveRange, type TrackTiming } from "./timeline-math";
+import {
+  planRegionSource,
+  planSource,
+  type RegionSpan,
+  type RenderRange,
+  resolveRange,
+  type TrackTiming,
+} from "./timeline-math";
 
 export const RENDER_SAMPLE_RATE = 48_000;
 
@@ -27,6 +34,10 @@ export interface RenderTrackModel {
   buffer: AudioBuffer;
   /** Alignment/drift/arrangement timing, straight from the player. */
   timing: TrackTiming;
+  /** Split regions (W7-B), rebased to the model's take-local timeline by
+   * the player. Absent = never split (the whole-stream schedule path —
+   * zero-split renders stay byte-identical to pre-region output). */
+  regions?: RegionSpan[];
   /** Resolved audible strip gain (linear; mute/solo already folded to 0). */
   gain: number;
   /** Strip pan, −1 (L) .. +1 (R). */
@@ -107,7 +118,14 @@ export async function renderMaster(model: RenderModel, range?: RenderRange): Pro
  * baked — that is what makes lanes line up and cannot be reproduced
  * downstream. Strip gain/pan/mute/solo/EQ are NOT baked: stems are source
  * material, and mixer moves (EQ included) stay editable in the importing
- * DAW (the mix itself ships as the master WAV). */
+ * DAW (the mix itself ships as the master WAV).
+ *
+ * SPLIT REGIONS (W7-B) ARE NOT BAKED EITHER, by the same pre-mix
+ * philosophy: a split is an arrangement/mix decision, and cutting the
+ * stem would destroy source material the importing DAW could still use
+ * (the trimmed-away take intro, the breath before the cut). Stems stay
+ * WHOLE-STREAM — the full capture at the stream's clip position (its
+ * first region's placement) — while the master mix carries the splits. */
 export async function renderStems(model: RenderModel, range?: RenderRange): Promise<Stem[]> {
   const { startSec, endSec } = resolveRange(model.durationSec, range);
   const length = Math.max(1, Math.round((endSec - startSec) * RENDER_SAMPLE_RATE));
@@ -115,7 +133,9 @@ export async function renderStems(model: RenderModel, range?: RenderRange): Prom
   for (const track of model.tracks) {
     // OfflineAudioContext.startRendering is one-shot: one context per stem.
     const ctx = new OfflineAudioContext(1, length, RENDER_SAMPLE_RATE);
-    startSource(ctx, track, startSec, ctx.destination);
+    // Whole-stream on purpose (regions dropped) — see the docstring.
+    const { regions: _dropped, ...whole } = track;
+    startSource(ctx, whole, startSec, ctx.destination);
     stems.push({
       streamId: track.streamId,
       channelKey: track.channelKey,
@@ -212,13 +232,28 @@ export async function renderSessionMaster(
 }
 
 /** Schedule one track into an offline graph — the same plan live playback
- * uses, with the context origin standing in for `currentTime + lead`. */
+ * uses, with the context origin standing in for `currentTime + lead`.
+ * Split tracks (W7-B) fan out one source per region through the shared
+ * planRegionSource, each stopped at its region's end by the duration arg —
+ * playback/render parity by construction, exactly like planSource. */
 function startSource(
   ctx: OfflineAudioContext,
   track: RenderTrackModel,
   fromSec: number,
   destination: AudioNode,
 ): void {
+  if (track.regions) {
+    for (const region of track.regions) {
+      const plan = planRegionSource(track.timing, region, fromSec);
+      if (!plan) continue;
+      const source = ctx.createBufferSource();
+      source.buffer = track.buffer;
+      source.playbackRate.value = track.timing.ratio;
+      source.connect(destination);
+      source.start(plan.whenSec, plan.offsetSec, plan.playSec);
+    }
+    return;
+  }
   const plan = planSource(track.timing, fromSec);
   if (!plan) return;
   const source = ctx.createBufferSource();

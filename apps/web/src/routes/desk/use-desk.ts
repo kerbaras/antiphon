@@ -6,7 +6,9 @@ import { DEFAULT_CHIRP_SPEC } from "@antiphon/protocol";
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { type CollabClient, getCollab } from "../../net/collab";
 import {
+  type ClipRegion,
   deleteArrangeKeys,
+  deleteRegionKeys,
   displayTakeList,
   hasTakeList,
   type ListKind,
@@ -84,8 +86,13 @@ let player: SessionPlayer | null = null;
 let playerSnap: PlayerSnapshot | null = null;
 
 export interface DeskUiMirror {
+  /** Selected REGION ids (W7-B) — the streamId for never-split streams. */
   selection: string[];
   clipStarts: Record<string, number>;
+  /** Split streams' doc-held region lists (W7-B); never-split absent. */
+  regions: Record<string, ClipRegion[]>;
+  /** Active editing tool (W7-B). */
+  tool: "select" | "split";
   playheadSec: number | null;
   selectedTakeId: string | null;
   /** Recording-time master bus estimate (sum of live track peaks). */
@@ -122,12 +129,14 @@ export function getDeskSession(sessionId: string): DeskSession {
     });
     // Server-confirmed deletions: evict every local trace outside the
     // sink store (the session already told the worker), including the
-    // shared doc's arrangement overrides for the removed clips.
+    // shared doc's arrangement overrides and split regions (W7-B) for the
+    // removed clips.
     session.onStreamsDeleted((streamIds) => {
       for (const id of streamIds) waveformCache.delete(id);
       getPlayer().removeTracks(streamIds);
       const collab = getDeskCollab(sessionId);
       deleteArrangeKeys(collab.doc, streamIds, collab.origin);
+      deleteRegionKeys(collab.doc, streamIds, collab.origin);
     });
     session.start();
     (globalThis as Record<string, unknown>).__antiphonDesk = {

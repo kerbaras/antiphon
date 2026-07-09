@@ -12,7 +12,10 @@
 // the page scrolls instead of exploding. The toolbar's tiers are governed by
 // the alignment verdict chip — the row's one flexible child, whose longest
 // live string (declined, ~178px) must render whole at every width ≥ 700 (QA
-// F2): view tabs return at 860, snap/grid at 1200, inert tools at 1380.
+// F2): view tabs return at 860, the live tools' key hints at 900 (W7-B —
+// Split joining the always-on group cost ~55px; the sweep caught the chip
+// short at 700-715 and again right at the view-tabs return), snap/grid at
+// 1200, inert tools at 1380.
 //
 // Guard the contract: from 1280 down to 560 the title block, the transport
 // cluster and the right-hand controls never intersect, everything stays

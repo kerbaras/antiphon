@@ -17,6 +17,7 @@ import {
   midHzToNorm,
   normToMidHz,
 } from "./eq";
+import { SPLIT_CURSOR } from "./split-cursor";
 import { waveformGainChip, waveformViewGain } from "./waveform-view";
 
 export const TRACK_HEADER_W = 232;
@@ -165,15 +166,22 @@ function SoonChip() {
 
 const INERT_TOOLS: Array<{ name: string; key: string }> = [
   { name: "Trim", key: "T" },
-  { name: "Split", key: "S" },
   { name: "Stretch", key: "R" },
   { name: "Fade", key: "F" },
   { name: "Align", key: "A" },
 ];
 
-/** Editing tool group. Select is the one live tool (clip click / marquee /
- * drag on the timeline); the rest keep the prototype's layout but read
- * unmistakably disabled — dimmed, cursor-blocked, tagged "soon".
+/** The desk's active editing tool (W7-B): Select is the pointer contract
+ * everything was built on (clip click / marquee / drag / seek); Split
+ * turns the pointer into the blade. */
+export type DeskTool = "select" | "split";
+
+/** Editing tool group. Select and Split are LIVE now (W7-B) — real tool
+ * state, prototype styling verbatim: the active tool wears the accent with
+ * white text/key hint, the inactive one sits transparent in #a5a7aa
+ * (text-mute). The rest keep the prototype's layout but read unmistakably
+ * disabled — dimmed, cursor-blocked, tagged "soon". Split's key hint is C
+ * (the operator's ask; the prototype's S belongs to lane-solo).
  *
  * Narrow widths (W5-B): the inert placeholders are the toolbar's
  * lowest-priority tier. The governing budget (QA F2) is the alignment
@@ -184,14 +192,67 @@ const INERT_TOOLS: Array<{ name: string; key: string }> = [
  * topbar.spec.ts — arithmetic alone was wrong twice (a wholesale return
  * at 1200 re-squashed the chip across 1200-1345; the sweep then caught a
  * 1360 return still 10px short): view tabs at 860, snap/grid at 1200,
- * these inert tools last at 1380. Select always stays. */
-export function ToolGroup() {
+ * these inert tools last at 1380. Select and Split always stay — live
+ * tools never shed — but their KEY HINTS (decoration; the title attr and
+ * the shortcuts themselves carry the keys) yield below 900: Split's
+ * ~55px of new always-on width left the chip ~15px short across 700-715
+ * AND ~11px short right at the view-tabs return (860-871), and the hints
+ * are the pair's lowest-information pixels. 900 clears the second squeeze
+ * with margin (the sweep caught BOTH — third and fourth time the
+ * arithmetic lied). */
+export function ToolGroup({
+  tool,
+  onTool,
+  splitDisabled,
+}: {
+  tool: DeskTool;
+  onTool: (tool: DeskTool) => void;
+  /** Recording: the blade is meaningless over a rolling take — honest
+   * disable (the C shortcut is inert too, and take-start auto-reverts). */
+  splitDisabled?: boolean;
+}) {
+  const LIVE_TOOLS: Array<{ id: DeskTool; name: string; key: string; title: string }> = [
+    { id: "select", name: "Select", key: "V", title: "Select tool (V) — click, marquee, drag" },
+    {
+      id: "split",
+      name: "Split",
+      key: "C",
+      title: splitDisabled
+        ? "Split is unavailable while recording"
+        : "Split tool (C) — click a clip to cut it there; click the ruler or bare timeline to cut every lane. V or Escape returns to Select.",
+    },
+  ];
   return (
     <div className="flex items-center gap-0.5 rounded-md border border-edge bg-bg p-[2px]">
-      <span className="flex items-center gap-1.5 rounded bg-edge px-2.5 py-1 text-[11px] font-semibold text-text-mute">
-        Select
-        <span className="font-mono text-[9px] opacity-70">V</span>
-      </span>
+      {LIVE_TOOLS.map((t) => {
+        const active = tool === t.id;
+        return (
+          <button
+            key={t.id}
+            type="button"
+            data-tool={t.id}
+            aria-pressed={active}
+            title={t.title}
+            disabled={t.id === "split" && (splitDisabled ?? false)}
+            onClick={() => onTool(t.id)}
+            className={cx(
+              "flex items-center gap-1.5 rounded px-2.5 py-1 text-[11px] font-semibold transition-colors",
+              active ? "bg-accent text-white" : "bg-transparent text-text-mute hover:text-text",
+              "disabled:cursor-not-allowed disabled:opacity-40",
+            )}
+          >
+            {t.name}
+            <span
+              className={cx(
+                "hidden font-mono text-[9px] min-[900px]:inline",
+                active ? "text-white/80" : "opacity-70",
+              )}
+            >
+              {t.key}
+            </span>
+          </button>
+        );
+      })}
       <span
         aria-disabled="true"
         title="Coming soon — editing tools arrive with the timeline milestone"
@@ -322,7 +383,12 @@ export function VUVertical({
 // ---- timeline --------------------------------------------------------------
 
 export interface ClipModel {
+  /** Region identity (W7-B): the streamId for a never-split stream (and
+   * for the first piece of a split one), a minted uuid for later pieces.
+   * Selection and marquee collect THESE ids. */
   id: string;
+  /** The owning stream — what delete staging and split writes resolve to. */
+  streamId: string;
   takeId: string;
   name: string;
   color: string;
@@ -330,6 +396,9 @@ export interface ClipModel {
   width: number;
   durationSec: number;
   live: boolean;
+  /** Split tool active (W7-B): the box wears the blade cursor (grab
+   * suppressed) and a press means "cut here", not select/drag. */
+  splitting?: boolean;
   /** "incomplete" (F9) is TERMINAL: an A6-truncated stream that will never
    * finish syncing — distinct from the transient "syncing". */
   badge: "rec" | "converged" | "syncing" | "aligned" | "incomplete" | null;
@@ -403,6 +472,16 @@ export function ClipCard({ clip }: { clip: ClipModel }) {
   const title = `${clip.name}${status ? ` — ${status}` : ""}${
     gainChip !== null ? ` · waveform drawn ×${gainChip}` : ""
   }`;
+  // Split mode (W7-B): the blade cursor replaces grab on splittable boxes —
+  // an F9 orphan is honestly not-allowed (unsplittable, like the tool's
+  // click guard); the style attr wins over any cursor class, exactly the
+  // precedence the surface's own blade cursor relies on.
+  const splitCursor =
+    clip.splitting === true
+      ? clip.badge === "incomplete"
+        ? { cursor: "not-allowed" }
+        : { cursor: SPLIT_CURSOR }
+      : {};
   return (
     <button
       type="button"
@@ -424,7 +503,10 @@ export function ClipCard({ clip }: { clip: ClipModel }) {
         // under all timeline overlays (marker guides/ghosts z-[3],
         // playhead z-[4], marquee/headers z-[5]).
         clip.badge === "incomplete" ? "z-0" : "z-[1]",
-        clip.onPointerDown ? "cursor-grab active:cursor-grabbing" : "cursor-default",
+        // Split mode (W7-B) suppresses grab — the blade style below rules.
+        clip.onPointerDown && clip.splitting !== true
+          ? "cursor-grab active:cursor-grabbing"
+          : "cursor-default",
         clip.selected && "shadow-[0_0_0_1px_var(--color-accent)]",
       )}
       style={{
@@ -432,6 +514,7 @@ export function ClipCard({ clip }: { clip: ClipModel }) {
         width: widthPx,
         background: hexA(clip.color, clip.live ? 0.16 : 0.24),
         borderColor: edge,
+        ...splitCursor,
       }}
     >
       {/* Header strip pinned to the top: buttons vertically center their
@@ -531,15 +614,20 @@ export function ClipCard({ clip }: { clip: ClipModel }) {
 }
 
 /** Time ruler with second labels — the prototype's bar ruler, in seconds
- * (Antiphon has no tempo; the session clock is the grid). Click to seek. */
+ * (Antiphon has no tempo; the session clock is the grid). Click to seek —
+ * or, with the Split tool active (W7-B), to cut every lane at the clicked
+ * x: `cursor` then overrides the pointer with the blade. */
 export function LaneRuler({
   pxPerSec,
   widthPx,
   onSeek,
+  cursor,
 }: {
   pxPerSec: number;
   widthPx: number;
   onSeek?: (sec: number) => void;
+  /** CSS cursor override (the split blade); default is the seek pointer. */
+  cursor?: string;
 }) {
   const step = pxPerSec >= 36 ? 2 : pxPerSec >= 18 ? 5 : 10;
   const marks: number[] = [];
@@ -548,10 +636,14 @@ export function LaneRuler({
     // biome-ignore lint/a11y/noStaticElementInteractions: seek surface; transport buttons are the keyboard path
     // biome-ignore lint/a11y/useKeyWithClickEvents: same
     <div
-      className={cx("relative border-b border-divider bg-raised", onSeek && "cursor-pointer")}
+      className={cx(
+        "relative border-b border-divider bg-raised",
+        onSeek && cursor === undefined && "cursor-pointer",
+      )}
       style={{
         height: RULER_H,
         width: widthPx,
+        ...(cursor !== undefined ? { cursor } : {}),
         backgroundImage: `repeating-linear-gradient(90deg, var(--color-edge-inset) 0 1px, transparent 1px ${
           step * pxPerSec
         }px)`,

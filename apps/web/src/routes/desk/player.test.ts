@@ -83,10 +83,17 @@ class FakeAnalyserNode extends FakeNode {
 }
 
 class FakeBufferSource extends FakeNode {
+  /** Every start() call's args, in schedule order — the W7-B region tests
+   * pin the exact (when, offset, duration) triples the engine issues. */
+  static started: Array<{ when: number; offset: number; duration?: number }> = [];
   buffer: unknown = null;
   playbackRate = new FakeParam();
-  start(): void {
-    // scheduling side effects are not under test
+  start(when = 0, offset = 0, duration?: number): void {
+    FakeBufferSource.started.push({
+      when,
+      offset,
+      ...(duration !== undefined ? { duration } : {}),
+    });
   }
   stop(): void {
     // see start()
@@ -150,6 +157,7 @@ function tickFrame(): void {
 
 beforeEach(() => {
   FakeAudioContext.instances = [];
+  FakeBufferSource.started = [];
   frames = [];
   vi.stubGlobal("AudioContext", FakeAudioContext);
   vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback): number => frames.push(cb));
@@ -1000,6 +1008,114 @@ describe("session transport (W6-B)", () => {
     player.setSessionPlan(movedPlan);
     expect(player.snapshot().scheduleCount).toBe(scheduled + 1);
     expect(player.duration()).toBeCloseTo(5, 6);
+  });
+});
+
+// ---- W7-B: clip regions — schedule fan-out, stops, plan edits ---------------------
+
+describe("clip regions (W7-B)", () => {
+  /** twoTakePlan with take-1's one stream split at source 0.4 s. */
+  function splitPlan() {
+    const plan = twoTakePlan();
+    (plan[0] as { streams: Array<Record<string, unknown>> }).streams[0] = {
+      streamId: "s1",
+      channelKey: "lane-a",
+      clipStartSec: 1,
+      declaredDurationSec: 1,
+      regions: [
+        { id: "s1", startSec: 1, sourceOffsetSec: 0, durationSec: 0.4 },
+        { id: "r2", startSec: 1.4, sourceOffsetSec: 0.4, durationSec: 0.6 },
+      ],
+    };
+    return plan;
+  }
+
+  it("zero splits: the schedule issues the verbatim 2-arg start (parity pin)", async () => {
+    FakeAudioContext.nextBuffer = fakeBuffer(1);
+    const player = new SessionPlayer();
+    player.setSessionPlan(twoTakePlan());
+    await player.load("take-1", ["s1"], () => Promise.resolve(new ArrayBuffer(4)));
+    player.play(1);
+    expect(FakeBufferSource.started).toEqual([{ when: 0.06, offset: 0 }]);
+    expect(player.snapshot().scheduleCount).toBe(1);
+  });
+
+  it("a split stream fans out one source per region, stopped at each region's end", async () => {
+    FakeAudioContext.nextBuffer = fakeBuffer(1);
+    const player = new SessionPlayer();
+    player.setSessionPlan(splitPlan());
+    await player.load("take-1", ["s1"], () => Promise.resolve(new ArrayBuffer(4)));
+    player.play(1);
+    // ONE schedule pass covers both pieces; the duration args stop each
+    // source exactly at its region's boundary, and the second piece starts
+    // on the same clock grid at the sample the first stopped on.
+    expect(player.snapshot().scheduleCount).toBe(1);
+    expect(FakeBufferSource.started).toEqual([
+      { when: 0.06, offset: 0, duration: expect.closeTo(0.4, 9) },
+      {
+        when: expect.closeTo(0.46, 9),
+        offset: expect.closeTo(0.4, 9),
+        duration: expect.closeTo(0.6, 9),
+      },
+    ]);
+    // The abutting split leaves the take's extent exactly as uncut.
+    expect(player.snapshot().takeDurationSec).toBeCloseTo(1, 9);
+    expect(player.duration()).toBeCloseTo(5, 9);
+  });
+
+  it("mid-region seek plays the remainder of the piece, then the next", async () => {
+    FakeAudioContext.nextBuffer = fakeBuffer(1);
+    const player = new SessionPlayer();
+    player.setSessionPlan(splitPlan());
+    await player.load("take-1", ["s1"], () => Promise.resolve(new ArrayBuffer(4)));
+    player.play(1.2); // 0.2 s into the left piece
+    expect(FakeBufferSource.started).toEqual([
+      { when: 0.06, offset: expect.closeTo(0.2, 9), duration: expect.closeTo(0.2, 9) },
+      {
+        when: expect.closeTo(0.26, 9),
+        offset: expect.closeTo(0.4, 9),
+        duration: expect.closeTo(0.6, 9),
+      },
+    ]);
+  });
+
+  it("a region edit (split/drag) on the mounted take re-schedules a rolling transport; dragged pieces stretch the session", async () => {
+    FakeAudioContext.nextBuffer = fakeBuffer(1);
+    const player = new SessionPlayer();
+    player.setSessionPlan(twoTakePlan());
+    await player.load("take-1", ["s1"], () => Promise.resolve(new ArrayBuffer(4)));
+    player.play(1);
+    const before = player.snapshot().scheduleCount;
+    // The desk writes a split to the doc → the plan republishes with
+    // regions: the audible consequence lands NOW, like clip moves.
+    player.setSessionPlan(splitPlan());
+    expect(player.snapshot().scheduleCount).toBe(before + 1);
+    // Dragging the right piece past the session end stretches duration().
+    const dragged = splitPlan();
+    const s1 = (dragged[0] as { streams: Array<{ regions?: Array<{ startSec: number }> }> })
+      .streams[0] as { regions: Array<{ startSec: number }> };
+    (s1.regions[1] as { startSec: number }).startSec = 9;
+    player.setSessionPlan(dragged);
+    expect(player.duration()).toBeCloseTo(9.6, 9);
+    // Equal region content re-published is a strict no-op.
+    const count = player.snapshot().scheduleCount;
+    player.setSessionPlan(dragged.map((p) => ({ ...p, streams: [...p.streams] })));
+    expect(player.snapshot().scheduleCount).toBe(count);
+  });
+
+  it("renderModel rebases regions onto the take-local timeline", async () => {
+    FakeAudioContext.nextBuffer = fakeBuffer(1);
+    const player = new SessionPlayer();
+    player.setSessionPlan(splitPlan());
+    await player.load("take-1", ["s1"], () => Promise.resolve(new ArrayBuffer(4)));
+    const model = player.renderModel();
+    expect(model?.tracks[0]?.regions).toEqual([
+      { id: "s1", startSec: 0, sourceOffsetSec: 0, durationSec: 0.4 },
+      { id: "r2", startSec: expect.closeTo(0.4, 9), sourceOffsetSec: 0.4, durationSec: 0.6 },
+    ]);
+    // An unsplit model keeps regions absent — the whole-stream render path.
+    player.setSessionPlan(twoTakePlan());
+    expect(player.renderModel()?.tracks[0]?.regions).toBeUndefined();
   });
 });
 

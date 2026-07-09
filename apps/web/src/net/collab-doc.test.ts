@@ -8,6 +8,7 @@ import {
   dedupeById,
   defaultMixStripState,
   deleteArrangeKeys,
+  deleteRegionKeys,
   displayTakeList,
   HEAL_ORIGIN,
   hasTakeList,
@@ -16,11 +17,13 @@ import {
   readArrange,
   readLaneOrder,
   readMix,
+  readRegions,
   readTakeList,
   seedTakeListOnce,
   writeArrange,
   writeLaneOrder,
   writeMixIfChanged,
+  writeStreamRegions,
   writeTakeList,
 } from "./collab-doc";
 
@@ -96,6 +99,104 @@ describe("arrange map", () => {
 
     deleteArrangeKeys(b, ["stream-2", "never-there"], LOCAL);
     expect(readArrange(a)).toEqual({ "stream-1": 3.5 });
+  });
+});
+
+describe("regions map (W7-B)", () => {
+  const region = (id: string, startSec: number, sourceOffsetSec: number, durationSec: number) => ({
+    id,
+    startSec,
+    sourceOffsetSec,
+    durationSec,
+  });
+
+  it("syncs whole per-stream lists; equal content never re-writes", () => {
+    const a = new Y.Doc();
+    const b = new Y.Doc();
+    const wire = connect(a, b);
+
+    const pieces = [region("stream-1", 1, 0, 4), region("r2", 5, 4, 6)];
+    expect(writeStreamRegions(a, "stream-1", pieces, LOCAL)).toBe(true);
+    expect(readRegions(b)).toEqual({ "stream-1": pieces });
+    // Doc echo / re-derived identical write: no transaction, no wire churn.
+    expect(writeStreamRegions(a, "stream-1", [...pieces], LOCAL)).toBe(false);
+    expect(wire.aSent()).toBe(1);
+  });
+
+  it("never-split streams have no entry — the pre-split wire shape is untouched", () => {
+    const doc = new Y.Doc();
+    writeArrange(doc, { "stream-1": 3.5 }, LOCAL);
+    expect(readRegions(doc)).toEqual({});
+    // The arrange map is a separate Y.Map: splitting one stream leaves
+    // every other stream's legacy shape (and this stream's frozen
+    // `arrange` value — the old-desk view) alone.
+    writeStreamRegions(doc, "stream-1", [region("stream-1", 3.5, 0, 4)], LOCAL);
+    expect(readArrange(doc)).toEqual({ "stream-1": 3.5 });
+  });
+
+  it("deleteRegionKeys drops deleted streams' lists (streams-deleted fanout)", () => {
+    const a = new Y.Doc();
+    const b = new Y.Doc();
+    connect(a, b);
+    writeStreamRegions(a, "stream-1", [region("stream-1", 1, 0, 4)], LOCAL);
+    writeStreamRegions(a, "stream-2", [region("stream-2", 9, 0, 4)], LOCAL);
+    deleteRegionKeys(b, ["stream-2", "never-there"], LOCAL);
+    expect(Object.keys(readRegions(a))).toEqual(["stream-1"]);
+  });
+
+  it("hostile doc data degrades to the never-split view, never a crash (QA probes)", () => {
+    const doc = new Y.Doc();
+    const map = doc.getMap<unknown>("regions");
+    const good = [region("stream-ok", 1, 0, 4), region("r2", 5, 4, 6)];
+    doc.transact(() => {
+      map.set("stream-ok", good);
+      // (a) non-array values — would TypeError every .map() downstream.
+      map.set("stream-num", 42);
+      map.set("stream-obj", { id: "x" });
+      map.set("stream-null", null);
+      // (b) garbage region objects — NaN comparisons defeat the region
+      // planner's guards and reach source.start(NaN).
+      map.set("stream-empty-obj", [{}]);
+      map.set("stream-nan", [
+        { id: "a", startSec: Number.NaN, sourceOffsetSec: 0, durationSec: 1 },
+      ]);
+      map.set("stream-inf", [
+        { id: "a", startSec: 0, sourceOffsetSec: Number.POSITIVE_INFINITY, durationSec: 1 },
+      ]);
+      map.set("stream-zero-dur", [{ id: "a", startSec: 0, sourceOffsetSec: 0, durationSec: 0 }]);
+      map.set("stream-neg", [{ id: "a", startSec: -1, sourceOffsetSec: 0, durationSec: 1 }]);
+      map.set("stream-bad-id", [{ id: 7, startSec: 0, sourceOffsetSec: 0, durationSec: 1 }]);
+      // (c) an empty list — zero source planners, a silently muted stream.
+      map.set("stream-empty", []);
+      // Whole-list-or-nothing: one garbage piece invalidates the LIST
+      // (a partial subset would silently lose that piece's audio window).
+      map.set("stream-mixed", [region("stream-mixed", 1, 0, 4), {}]);
+    }, LOCAL);
+    // Only the well-formed list survives; every probe reads as ABSENT —
+    // those streams degrade to their never-split (whole-clip) view.
+    expect(readRegions(doc)).toEqual({ "stream-ok": good });
+  });
+
+  it("LWW per stream: concurrent splits converge on one whole list", () => {
+    const a = new Y.Doc();
+    const b = new Y.Doc();
+    const seed = [region("stream-1", 1, 0, 10)];
+    writeStreamRegions(a, "stream-1", seed, LOCAL);
+    Y.applyUpdate(b, Y.encodeStateAsUpdate(a), REMOTE);
+
+    // OFFLINE from each other: both desks split the same stream.
+    writeStreamRegions(a, "stream-1", [region("stream-1", 1, 0, 4), region("rA", 5, 4, 6)], LOCAL);
+    writeStreamRegions(b, "stream-1", [region("stream-1", 1, 0, 7), region("rB", 8, 7, 3)], LOCAL);
+    Y.applyUpdate(b, Y.encodeStateAsUpdate(a, Y.encodeStateVector(b)), REMOTE);
+    Y.applyUpdate(a, Y.encodeStateAsUpdate(b, Y.encodeStateVector(a)), REMOTE);
+
+    // One desk's WHOLE list wins (the documented bound) — never a merge of
+    // pieces from both, which could overlap in the source domain.
+    const winner = readRegions(a)["stream-1"];
+    expect(readRegions(b)["stream-1"]).toEqual(winner);
+    expect([JSON.stringify(["stream-1", "rA"]), JSON.stringify(["stream-1", "rB"])]).toContain(
+      JSON.stringify(winner?.map((r) => r.id)),
+    );
   });
 });
 

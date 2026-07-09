@@ -347,9 +347,10 @@ test.describe("session playback & render (W6-B)", () => {
         };
       });
     expect((await uiState()).positionSec).toBeGreaterThan(base1 + dur1); // beyond take 1
-    // M-1: C-composed comment clamps to the take end — never minted beyond
+    // M-1: a composed comment clamps to the take end — never minted beyond
     // the span into the shared doc, never drawn over the neighbor take.
-    await desk.keyboard.press("c");
+    // (N opens the composer now — the Split tool owns C, W7-B.)
+    await desk.keyboard.press("n");
     const composer = desk.getByLabel("Comment text");
     await expect(composer).toBeFocused();
     await composer.fill("clamped to the take edge");

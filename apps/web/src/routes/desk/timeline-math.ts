@@ -50,6 +50,105 @@ export function trackEndSec(t: TrackTiming): number {
   return t.clipDelaySec + (t.bufferDurationSec - t.headSec) / t.ratio;
 }
 
+// ---- clip regions (W7-B) -----------------------------------------------------------
+// A split stream plays as a list of REGIONS: windows of its source buffer,
+// each placed on the arrangement. The mapping rule is the whole-stream one
+// TRANSLATED per region — buffer time b plays at room time
+//   t = (startSec − sourceOffsetSec) + (b − headSec)/ratio
+// so a fresh split (regions abutting in both domains, startSec −
+// sourceOffsetSec identical on both pieces) reproduces the uncut stream's
+// mapping EXACTLY: playback across the fresh boundary is seamless by
+// construction, and alignment head-trims / drift ratios keep their one
+// meaning (they are properties of the capture, not of a piece). A dragged
+// region just translates its own copy of that mapping.
+//
+// Shared by live playback (player.schedule) and the offline render
+// (render.startSource) exactly like planSource — the parity contract.
+// UNSPLIT streams do not come through here at all: they keep the verbatim
+// planSource path, so a zero-split session schedules byte-identically to
+// the pre-region engine.
+
+/** One region as the schedule math consumes it (the doc's ClipRegion minus
+ * identity — net/collab-doc.ts owns the wire shape). */
+export interface RegionSpan {
+  /** Arrangement position of the region (audio domain, like clipDelaySec). */
+  startSec: number;
+  /** Source-buffer seconds where the region's material begins (raw buffer
+   * domain — alignment trims stay schedule-time, never stored). */
+  sourceOffsetSec: number;
+  /** Region length in source seconds. */
+  durationSec: number;
+}
+
+/** The stream-level schedule parameters a region plan needs — TrackTiming
+ * without clipDelaySec (a split stream has no single clip position). */
+export type RegionStreamTiming = Omit<TrackTiming, "clipDelaySec">;
+
+export interface RegionPlan {
+  /** Context-time delay before the source starts (≥ 0). */
+  whenSec: number;
+  /** Buffer offset to start playing from. */
+  offsetSec: number;
+  /** SOURCE seconds to play — AudioBufferSourceNode.start()'s duration
+   * argument (buffer-domain per the Web Audio spec, so the stop lands
+   * sample-accurately at the region's end regardless of playbackRate). */
+  playSec: number;
+}
+
+/** The audible window of a region in buffer seconds: never before the
+ * alignment head-trim (that material is what alignment trims — it never
+ * plays, split or not), never past the buffer or the region end. */
+function regionWindow(t: RegionStreamTiming, r: RegionSpan): { lo: number; hi: number } {
+  return {
+    lo: Math.max(r.sourceOffsetSec, t.headSec),
+    hi: Math.min(r.sourceOffsetSec + r.durationSec, t.bufferDurationSec),
+  };
+}
+
+/** Room-timeline span of a region's audible audio. Empty regions (fully
+ * inside the trimmed head, or windows past the buffer) report a zero-length
+ * span at their would-be start. */
+export function regionSpanSec(
+  t: RegionStreamTiming,
+  r: RegionSpan,
+): { startSec: number; endSec: number } {
+  const { lo, hi } = regionWindow(t, r);
+  const delay = r.startSec - r.sourceOffsetSec;
+  const startSec = delay + (lo - t.headSec) / t.ratio;
+  return { startSec, endSec: Math.max(startSec, delay + (hi - t.headSec) / t.ratio) };
+}
+
+/** Plan one region's AudioBufferSourceNode for room-timeline position
+ * `fromSec` — planSource's region twin, with the extra stop: the source
+ * must play EXACTLY the region's window and no further (the next region,
+ * or silence, owns what follows). Null when the region holds no audio at
+ * or after `fromSec`. */
+export function planRegionSource(
+  t: RegionStreamTiming,
+  r: RegionSpan,
+  fromSec: number,
+): RegionPlan | null {
+  const { lo, hi } = regionWindow(t, r);
+  if (hi <= lo) return null; // nothing audible (trimmed away / out of buffer)
+  const delay = r.startSec - r.sourceOffsetSec;
+  const startSec = delay + (lo - t.headSec) / t.ratio;
+  const endSec = delay + (hi - t.headSec) / t.ratio;
+  if (fromSec >= endSec) return null;
+  if (fromSec >= startSec) {
+    const offsetSec = t.headSec + (fromSec - delay) * t.ratio;
+    return { whenSec: 0, offsetSec, playSec: hi - offsetSec };
+  }
+  // Region begins later on the timeline: schedule its future start.
+  return { whenSec: startSec - fromSec, offsetSec: lo, playSec: hi - lo };
+}
+
+/** Room-timeline end of a region list (the split analogue of trackEndSec). */
+export function regionsEndSec(t: RegionStreamTiming, regions: readonly RegionSpan[]): number {
+  let end = 0;
+  for (const r of regions) end = Math.max(end, regionSpanSec(t, r).endSec);
+  return end;
+}
+
 /** How a track's alignment lag was measured (W4-B): `chirp` = the §10
  * calibration sweep located in the stream; `content` = cross-correlation
  * of the recorded content itself against a reference stream, expressed in

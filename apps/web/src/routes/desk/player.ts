@@ -28,6 +28,7 @@ import {
   init as initWasm,
 } from "@antiphon/core-wasm";
 import { DEFAULT_CHIRP_SPEC } from "@antiphon/protocol";
+import type { ClipRegion } from "../../net/collab-doc";
 import {
   applyEqPatch,
   createEqChain,
@@ -45,7 +46,10 @@ import {
   type AlignShifts,
   alignShifts,
   normalizeAlignDeltas,
+  planRegionSource,
   planSource,
+  type RegionStreamTiming,
+  regionsEndSec,
   type SessionTakeSpan,
   sessionEndSec,
   type TrackTiming,
@@ -226,10 +230,15 @@ export interface SessionStreamPlan {
   streamId: string;
   /** Mixer lane (performer) the stream plays through. */
   channelKey: string;
-  /** Absolute arrangement position of the clip (override or take slot). */
+  /** Absolute arrangement position of the clip (override or take slot).
+   * For a SPLIT stream: the first region's start (regions carry the rest). */
   clipStartSec: number;
   /** Declared stream length: totalSamples / sample rate. */
   declaredDurationSec: number;
+  /** Split regions (W7-B), source-ordered, from the shared doc. ABSENT for
+   * never-split streams — those keep the verbatim whole-stream schedule
+   * path, so a zero-split session is schedule-identical to pre-W7-B. */
+  regions?: ClipRegion[];
 }
 
 /** One take of the session plan — only COMPLETE streams belong here (the
@@ -254,6 +263,9 @@ interface Track {
   channelKey: string;
   /** Absolute arrangement position of the clip (session plan). */
   clipStartSec: number;
+  /** Split regions (W7-B, session plan). Null = never split: the track
+   * schedules through the verbatim whole-stream path. */
+  regions: ClipRegion[] | null;
   buffer: AudioBuffer;
   /** Stable node sources connect to; feeds `eq` or (bypassed) `gain`. */
   input: GainNode;
@@ -484,27 +496,46 @@ export class SessionPlayer {
   }
 
   /** A take's base on the arrangement: its leftmost clip start — mounted
-   * tracks first (exact), else the plan, else 0 (pre-plan unit paths). */
+   * tracks first (exact), else the plan, else 0 (pre-plan unit paths).
+   * Split streams contribute their leftmost REGION start (clipStartSec is
+   * derived as exactly that by the desk; regions rule if they disagree). */
   private takeBaseSec(takeId: string | null): number {
     if (takeId === null) return 0;
+    const startOf = (clipStartSec: number, regions: ClipRegion[] | null | undefined): number =>
+      regions && regions.length > 0 ? Math.min(...regions.map((r) => r.startSec)) : clipStartSec;
     const mounted = this.takeTracks(takeId);
-    if (mounted.length > 0) return Math.min(...mounted.map((t) => t.clipStartSec));
+    if (mounted.length > 0) {
+      return Math.min(...mounted.map((t) => startOf(t.clipStartSec, t.regions)));
+    }
     const planned = this.plan.find((p) => p.takeId === takeId);
     if (planned && planned.streams.length > 0) {
-      return Math.min(...planned.streams.map((s) => s.clipStartSec));
+      return Math.min(...planned.streams.map((s) => startOf(s.clipStartSec, s.regions)));
     }
     return 0;
   }
 
-  /** A take's end on the arrangement: aligned (mounted) or declared. */
+  /** A take's end on the arrangement: aligned (mounted) or declared. A
+   * split stream ends at its LAST region's end (regions may be dragged
+   * beyond the uncut extent; declared math approximates ratio = 1 exactly
+   * like the whole-stream declared end always has). */
   private takeEndSec(takeId: string): number {
     const mounted = this.takeTracks(takeId);
     if (mounted.length > 0) {
-      return Math.max(...mounted.map((t) => trackEndSec(this.timing(t))));
+      return Math.max(
+        ...mounted.map((t) =>
+          t.regions ? regionsEndSec(this.streamTiming(t), t.regions) : trackEndSec(this.timing(t)),
+        ),
+      );
     }
     const planned = this.plan.find((p) => p.takeId === takeId);
     if (planned && planned.streams.length > 0) {
-      return Math.max(...planned.streams.map((s) => s.clipStartSec + s.declaredDurationSec));
+      return Math.max(
+        ...planned.streams.map((s) =>
+          s.regions && s.regions.length > 0
+            ? Math.max(...s.regions.map((r) => r.startSec + r.durationSec))
+            : s.clipStartSec + s.declaredDurationSec,
+        ),
+      );
     }
     return 0;
   }
@@ -559,8 +590,9 @@ export class SessionPlayer {
     for (const takeId of this.mountedTakeIds()) {
       if (!known.has(takeId) && takeId !== this.loadedTakeId) this.unmountTake(takeId);
     }
-    // Re-point mounted tracks at their plan entries: clip moves re-schedule
-    // (audible), lane re-keys re-route (parameter-only, like remapChannels).
+    // Re-point mounted tracks at their plan entries: clip moves and region
+    // edits (splits, region drags — W7-B) re-schedule (audible), lane
+    // re-keys re-route (parameter-only, like remapChannels).
     let moved = false;
     for (const p of next) {
       for (const s of p.streams) {
@@ -568,6 +600,10 @@ export class SessionPlayer {
         if (!track || track.takeId !== p.takeId) continue;
         if (Math.abs(track.clipStartSec - s.clipStartSec) > 1e-4) {
           track.clipStartSec = s.clipStartSec;
+          moved = true;
+        }
+        if (JSON.stringify(track.regions) !== JSON.stringify(s.regions ?? null)) {
+          track.regions = s.regions ?? null;
           moved = true;
         }
         if (track.channelKey !== s.channelKey) {
@@ -601,7 +637,10 @@ export class SessionPlayer {
           sa.streamId !== sb.streamId ||
           sa.channelKey !== sb.channelKey ||
           Math.abs(sa.clipStartSec - sb.clipStartSec) > 1e-4 ||
-          Math.abs(sa.declaredDurationSec - sb.declaredDurationSec) > 1e-4
+          Math.abs(sa.declaredDurationSec - sb.declaredDurationSec) > 1e-4 ||
+          // Regions come from the doc verbatim (discrete splits/drags, no
+          // per-poll jitter) — structural equality is the honest diff.
+          JSON.stringify(sa.regions ?? null) !== JSON.stringify(sb.regions ?? null)
         ) {
           return false;
         }
@@ -704,11 +743,13 @@ export class SessionPlayer {
     panner.connect(analyser);
     // Meters tap AFTER the whole strip — post-EQ/gain/pan by construction.
     analyser.connect(this.masterBus as GainNode);
+    const planned = this.planStream(takeId, streamId);
     const track: Track = {
       streamId,
       takeId,
       channelKey,
-      clipStartSec: this.planClipStart(takeId, streamId),
+      clipStartSec: planned?.clipStartSec ?? 0,
+      regions: planned?.regions ?? null,
       buffer,
       input,
       eq,
@@ -724,9 +765,9 @@ export class SessionPlayer {
     return track;
   }
 
-  private planClipStart(takeId: string, streamId: string): number {
+  private planStream(takeId: string, streamId: string): SessionStreamPlan | undefined {
     const planned = this.plan.find((p) => p.takeId === takeId);
-    return planned?.streams.find((s) => s.streamId === streamId)?.clipStartSec ?? 0;
+    return planned?.streams.find((s) => s.streamId === streamId);
   }
 
   private disconnectTrack(track: Track): void {
@@ -1296,9 +1337,19 @@ export class SessionPlayer {
    * clock for every mounted take. */
   private timing(track: Track): TrackTiming {
     return {
+      ...this.streamTiming(track),
+      clipDelaySec: track.clipStartSec,
+    };
+  }
+
+  /** The stream-level half of timing() — what region plans consume (a
+   * split stream has no single clip position; each region carries its
+   * own). Head-trim and drift stay per-STREAM: they are properties of the
+   * capture, identical across its pieces. */
+  private streamTiming(track: Track): RegionStreamTiming {
+    return {
       headSec: this.headSec(track),
       ratio: this.driftRatio(track),
-      clipDelaySec: track.clipStartSec,
       bufferDurationSec: track.buffer.duration,
     };
   }
@@ -1346,6 +1397,11 @@ export class SessionPlayer {
           channelKey: track.channelKey,
           buffer: track.buffer,
           timing: { ...this.timing(track), clipDelaySec: track.clipStartSec - base },
+          // Split regions rebased onto the take-local render timeline —
+          // the same −base translation the clip delay gets (W7-B).
+          ...(track.regions
+            ? { regions: track.regions.map((r) => ({ ...r, startSec: r.startSec - base })) }
+            : {}),
           gain: audible ? dbToLinear(strip.gainDb) : 0,
           pan: strip.pan,
           eq: { ...strip.eq },
@@ -1399,7 +1455,13 @@ export class SessionPlayer {
         })),
       (spec.durationMs + spec.gapMs) / 1_000,
     );
-    const base = Math.min(...decoded.map(({ plan }) => plan.clipStartSec));
+    const base = Math.min(
+      ...decoded.map(({ plan }) =>
+        plan.regions && plan.regions.length > 0
+          ? Math.min(...plan.regions.map((r) => r.startSec))
+          : plan.clipStartSec,
+      ),
+    );
     const anySolo = [...this.channels.values()].some((c) => c.soloed);
     const tracks: RenderTrackModel[] = decoded.map(({ plan, buffer }) => {
       const drift = entries[plan.streamId]?.drift;
@@ -1416,6 +1478,12 @@ export class SessionPlayer {
           clipDelaySec: plan.clipStartSec - base,
           bufferDurationSec: buffer.duration,
         },
+        // Split regions from the plan, rebased like the clip delay (W7-B):
+        // the un-mounted render path consumes them through the SAME
+        // planRegionSource as playback and the mounted render.
+        ...(plan.regions
+          ? { regions: plan.regions.map((r) => ({ ...r, startSec: r.startSec - base })) }
+          : {}),
         gain: audible ? dbToLinear(strip.gainDb) : 0,
         pan: strip.pan,
         eq: { ...strip.eq },
@@ -1423,7 +1491,11 @@ export class SessionPlayer {
     });
     return {
       takeId,
-      durationSec: Math.max(...tracks.map((t) => trackEndSec(t.timing))),
+      durationSec: Math.max(
+        ...tracks.map((t) =>
+          t.regions ? regionsEndSec(t.timing, t.regions) : trackEndSec(t.timing),
+        ),
+      ),
       masterGain: dbToLinear(this.masterDb),
       masterPan: this.masterPan,
       masterEq: { ...this.masterEq },
@@ -1457,24 +1529,53 @@ export class SessionPlayer {
     this.ensureLookahead();
   }
 
+  /** One planner per SOURCE NODE a track needs: the verbatim whole-stream
+   * planSource for never-split tracks (zero-split parity by construction —
+   * this is literally the pre-W7-B path), or one region planner per split
+   * piece. Region plans carry `playSec`, the source.start duration arg that
+   * stops the node sample-accurately at the region's end; whole-stream
+   * plans deliberately DON'T (the node plays out its buffer, byte-identical
+   * to the old two-arg start). */
+  private sourcePlanners(
+    track: Track,
+  ): Array<(fromSec: number) => { whenSec: number; offsetSec: number; playSec?: number } | null> {
+    if (track.regions) {
+      const t = this.streamTiming(track);
+      return track.regions.map(
+        (region) => (fromSec: number) => planRegionSource(t, region, fromSec),
+      );
+    }
+    return [(fromSec: number) => planSource(this.timing(track), fromSec)];
+  }
+
   private schedule(fromSec: number): void {
     const ctx = this.ensureGraph();
     const when = ctx.currentTime + 0.06;
     for (const track of this.tracks.values()) {
       // Timeline→buffer mapping (head trim, drift ratio, clip delay) is the
-      // shared planSource — identical for playback and export by design.
-      // Every MOUNTED take schedules here: future takes get future starts
-      // (planSource's whenSec), passed ones plan null — one pass covers
-      // whatever the mount window holds.
-      const timing = this.timing(track);
-      const plan = planSource(timing, fromSec);
-      if (!plan) continue;
-      const source = ctx.createBufferSource();
-      source.buffer = track.buffer;
-      source.playbackRate.value = timing.ratio;
-      source.connect(track.input);
-      source.start(when + plan.whenSec, plan.offsetSec);
-      this.sources.push({ node: source, takeId: track.takeId });
+      // shared planSource/planRegionSource — identical for playback and
+      // export by design. Every MOUNTED take schedules here: future takes
+      // (and future regions) get future starts, passed ones plan null —
+      // ONE pass covers whatever the mount window holds, split or not, so
+      // the scheduleCount discipline is untouched by regions.
+      const ratio = this.driftRatio(track);
+      for (const planAt of this.sourcePlanners(track)) {
+        const plan = planAt(fromSec);
+        if (!plan) continue;
+        const source = ctx.createBufferSource();
+        source.buffer = track.buffer;
+        source.playbackRate.value = ratio;
+        source.connect(track.input);
+        // Region sources stop at their region's end via the duration arg
+        // (buffer-domain seconds — sample-accurate in the engine, same
+        // clock grid as the start, so abutting pieces hand off seamlessly).
+        if (plan.playSec !== undefined) {
+          source.start(when + plan.whenSec, plan.offsetSec, plan.playSec);
+        } else {
+          source.start(when + plan.whenSec, plan.offsetSec);
+        }
+        this.sources.push({ node: source, takeId: track.takeId });
+      }
     }
     this.startCtxTime = when;
     this.startPos = fromSec;
@@ -1494,28 +1595,35 @@ export class SessionPlayer {
     const ctx = this.ensureGraph();
     let scheduled = false;
     for (const track of this.takeTracks(takeId)) {
-      const timing = this.timing(track);
-      let plan = planSource(timing, this.startPos);
-      if (!plan) continue;
-      let when = this.startCtxTime + plan.whenSec;
-      if (when < ctx.currentTime + 0.02) {
-        // The decode landed after the take's start passed (late mount —
-        // machine load, a seek straight into the take): start NOW at the
-        // current session position instead of replaying from its head.
-        const now = ctx.currentTime + 0.02;
-        const posNow = this.startPos + (now - this.startCtxTime);
-        const late = planSource(timing, posNow);
-        if (!late) continue;
-        plan = late;
-        when = now + late.whenSec;
+      const ratio = this.driftRatio(track);
+      for (const planAt of this.sourcePlanners(track)) {
+        let plan = planAt(this.startPos);
+        if (!plan) continue;
+        let when = this.startCtxTime + plan.whenSec;
+        if (when < ctx.currentTime + 0.02) {
+          // The decode landed after the take's (or region's) start passed
+          // (late mount — machine load, a seek straight into the take):
+          // start NOW at the current session position instead of replaying
+          // from its head.
+          const now = ctx.currentTime + 0.02;
+          const posNow = this.startPos + (now - this.startCtxTime);
+          const late = planAt(posNow);
+          if (!late) continue;
+          plan = late;
+          when = now + late.whenSec;
+        }
+        const source = ctx.createBufferSource();
+        source.buffer = track.buffer;
+        source.playbackRate.value = ratio;
+        source.connect(track.input);
+        if (plan.playSec !== undefined) {
+          source.start(when, plan.offsetSec, plan.playSec);
+        } else {
+          source.start(when, plan.offsetSec);
+        }
+        this.sources.push({ node: source, takeId });
+        scheduled = true;
       }
-      const source = ctx.createBufferSource();
-      source.buffer = track.buffer;
-      source.playbackRate.value = timing.ratio;
-      source.connect(track.input);
-      source.start(when, plan.offsetSec);
-      this.sources.push({ node: source, takeId });
-      scheduled = true;
     }
     if (!scheduled) return;
     this.scheduleCount += 1;

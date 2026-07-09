@@ -4,7 +4,10 @@ import {
   anchorAtSec,
   normalizeAlignDeltas,
   persistedAlignShifts,
+  planRegionSource,
   planSource,
+  regionSpanSec,
+  regionsEndSec,
   resolveRange,
   type SessionTakeSpan,
   sessionEndSec,
@@ -74,6 +77,109 @@ describe("planSource", () => {
     expect(end).toBeGreaterThan(3 + (42 - 0.75));
     // planSource at `end` would need offset = head + (end − delay)·ratio = dur.
     expect(t.headSec + (end - t.clipDelaySec) * t.ratio).toBeCloseTo(t.bufferDurationSec, 12);
+  });
+});
+
+describe("planRegionSource (W7-B)", () => {
+  const stream = { headSec: 0, ratio: 1, bufferDurationSec: 10 };
+  const seed = { startSec: 1, sourceOffsetSec: 0, durationSec: 10 };
+
+  it("a whole-stream region plans exactly like planSource (parity)", () => {
+    const whole: TrackTiming = { ...stream, clipDelaySec: 1 };
+    for (const fromSec of [0, 0.5, 1, 4.5, 10.999]) {
+      const legacy = planSource(whole, fromSec);
+      const region = planRegionSource(stream, seed, fromSec);
+      expect(region?.whenSec).toBe(legacy?.whenSec);
+      expect(region?.offsetSec).toBe(legacy?.offsetSec);
+    }
+    expect(planRegionSource(stream, seed, 11)).toBeNull();
+    expect(planSource(whole, 11)).toBeNull();
+  });
+
+  it("a fresh split reproduces the uncut mapping and abuts sample-exactly", () => {
+    // Split at source 4 s with a real head-trim and drift ratio in force.
+    const t = { headSec: 0.25, ratio: 1.0002, bufferDurationSec: 10 };
+    const left = { startSec: 1, sourceOffsetSec: 0, durationSec: 4 };
+    const right = { startSec: 5, sourceOffsetSec: 4, durationSec: 6 };
+    const whole: TrackTiming = { ...t, clipDelaySec: 1 };
+
+    // Left piece from the take head: same start, same offset as uncut…
+    const uncut = planSource(whole, 1) as { whenSec: number; offsetSec: number };
+    const l = planRegionSource(t, left, 1) as {
+      whenSec: number;
+      offsetSec: number;
+      playSec: number;
+    };
+    expect(l.whenSec).toBe(uncut.whenSec);
+    expect(l.offsetSec).toBe(uncut.offsetSec);
+    // …but stopping exactly at the cut (source 4 s).
+    expect(l.offsetSec + l.playSec).toBeCloseTo(4, 12);
+
+    // The right piece starts, in the SOURCE domain, at the exact sample the
+    // left piece stopped on — and its room start is where the uncut stream
+    // would have played source 4 s (seamless by construction).
+    const r = planRegionSource(t, right, 1) as {
+      whenSec: number;
+      offsetSec: number;
+      playSec: number;
+    };
+    expect(r.offsetSec).toBeCloseTo(l.offsetSec + l.playSec, 12);
+    const roomOfCut = whole.clipDelaySec + (4 - t.headSec) / t.ratio;
+    expect(1 + r.whenSec).toBeCloseTo(roomOfCut, 12);
+    // And it plays to the buffer end, exactly like the uncut tail.
+    expect(r.offsetSec + r.playSec).toBeCloseTo(t.bufferDurationSec, 12);
+
+    // Mid-region start inside the right piece: identical offset to uncut.
+    const mid = roomOfCut + 1.5;
+    const uncutMid = planSource(whole, mid) as { offsetSec: number };
+    const rMid = planRegionSource(t, right, mid) as { offsetSec: number };
+    expect(rMid.offsetSec).toBeCloseTo(uncutMid.offsetSec, 12);
+  });
+
+  it("a dragged region translates its window without touching the trim math", () => {
+    const t = { headSec: 0.5, ratio: 1, bufferDurationSec: 10 };
+    const dragged = { startSec: 20, sourceOffsetSec: 4, durationSec: 6 };
+    const plan = planRegionSource(t, dragged, 0) as {
+      whenSec: number;
+      offsetSec: number;
+      playSec: number;
+    };
+    // Audio begins at source 4 s, LEADING the stored startSec by the head
+    // trim — the same composition as unsplit clips, whose audio starts at
+    // the arrangement position while the BOX draws shifted right by the
+    // trim (W6-C): region audio always plays where its drawn waveform sits.
+    expect(plan.whenSec).toBe(19.5);
+    expect(plan.offsetSec).toBe(4);
+    expect(plan.playSec).toBe(6);
+    const span = regionSpanSec(t, dragged);
+    expect(span.startSec).toBe(19.5);
+    expect(span.endSec).toBe(25.5);
+  });
+
+  it("a region fully inside the trimmed head is silent (null plan, empty span)", () => {
+    const t = { headSec: 2, ratio: 1, bufferDurationSec: 10 };
+    const buried = { startSec: 1, sourceOffsetSec: 0, durationSec: 1.5 };
+    expect(planRegionSource(t, buried, 0)).toBeNull();
+    const span = regionSpanSec(t, buried);
+    expect(span.endSec).toBe(span.startSec);
+    // A region STRADDLING the trim plays only its audible tail: buffer 2 s
+    // (the trim) at room 1 s — exactly where the uncut stream plays it.
+    const straddling = { startSec: 1, sourceOffsetSec: 0, durationSec: 4 };
+    const plan = planRegionSource(t, straddling, 0) as { whenSec: number; offsetSec: number };
+    expect(plan.offsetSec).toBe(2); // never before the head-trim
+    expect(plan.whenSec).toBe(1);
+  });
+
+  it("regionsEndSec is the last audible end across pieces", () => {
+    const t = { headSec: 0, ratio: 1, bufferDurationSec: 10 };
+    expect(
+      regionsEndSec(t, [
+        { startSec: 1, sourceOffsetSec: 0, durationSec: 4 },
+        { startSec: 12, sourceOffsetSec: 4, durationSec: 6 },
+      ]),
+    ).toBe(18);
+    // Windows clamp at the buffer end (declared duration can overshoot).
+    expect(regionsEndSec(t, [{ startSec: 1, sourceOffsetSec: 8, durationSec: 5 }])).toBe(3);
   });
 });
 

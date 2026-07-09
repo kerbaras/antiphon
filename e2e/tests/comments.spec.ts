@@ -1,10 +1,11 @@
 // W2-F — comments with mark-as-done.
 //
 // One phone records a short take; once it converges and auto-loads, the
-// reviewer annotates it: C opens the composer focused, a take-wide note
-// lands at the playhead, a lane-pinned note lands mid-take after a ruler
-// seek. Panel rows carry author + seekable timecode (+ lane chip when
-// pinned); the ruler grows one amber tick per comment. Resolving drops the
+// reviewer annotates it: N opens the composer focused (moved from C in
+// W7-B — the Split tool owns C now), a take-wide note lands at the
+// playhead, a lane-pinned note lands mid-take after a ruler seek. Panel
+// rows carry author + seekable timecode (+ lane chip when pinned); the
+// ruler grows one amber tick per comment. Resolving drops the
 // tab's open-count badge, dims the tick, and the Open filter hides the row.
 // Comments persist in localStorage per (session, take) — they must survive
 // a desk reload alongside the OPFS archive rebuild — and delete removes
@@ -104,11 +105,12 @@ test.describe("comments with mark-as-done (W2-F)", () => {
     await expectTakeLoaded(desk, takeId, 1);
     const streamId = (await deskStatus(desk)).find((s) => s.takeId === takeId)?.streamId as string;
 
-    // --- C opens the composer focused; toolbar pill unlocks too --------------
+    // --- N opens the composer focused (C belongs to the Split tool now —
+    // W7-B); toolbar pill unlocks too ------------------------------------------
     await expect(desk.getByRole("button", { name: "Add comment at playhead" })).toBeEnabled({
       timeout: 15_000,
     });
-    await desk.keyboard.press("c");
+    await desk.keyboard.press("n");
     const composer = desk.getByLabel("Comment text");
     await expect(composer).toBeFocused();
 
@@ -131,7 +133,7 @@ test.describe("comments with mark-as-done (W2-F)", () => {
     await expect
       .poll(async () => Math.abs((await playerPosition(desk)) - (TAKE_BASE_SEC + 2)))
       .toBeLessThan(0.1);
-    await desk.keyboard.press("c");
+    await desk.keyboard.press("n");
     await expect(composer).toBeFocused();
     await desk.getByLabel("Pin comment to lane").selectOption({ index: 1 });
     await composer.fill("tenor entry late here");

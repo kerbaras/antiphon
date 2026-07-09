@@ -5,7 +5,7 @@
 
 import type { FatalSignalingError } from "../../net/signaling-client";
 import { Button, MonoReadout, Panel, SectionLabel, StatusPill } from "../../ui/kit";
-import { SnapGrid, ToolGroup, ViewTabs, ZoomControl } from "./daw";
+import { type DeskTool, SnapGrid, ToolGroup, ViewTabs, ZoomControl } from "./daw";
 import type { PlayerSnapshot } from "./player";
 
 /** Auto-align control state (F7a) — also the e2e observation surface. */
@@ -32,6 +32,7 @@ export function DeskToolbar({
   playerLoaded,
   playerSnap,
   markersUsable,
+  tool,
   lastChirpAt,
   errors,
   exportError,
@@ -40,6 +41,7 @@ export function DeskToolbar({
   alignFlow,
   alignNote,
   laneNameOf,
+  onTool,
   onZoom,
   onAutoAlign,
   onAddMarker,
@@ -50,6 +52,8 @@ export function DeskToolbar({
   playerLoaded: boolean;
   playerSnap: PlayerSnapshot;
   markersUsable: boolean;
+  /** Active editing tool (W7-B): Select ↔ Split, owned by the desk. */
+  tool: DeskTool;
   lastChirpAt: number | null;
   errors: string[];
   exportError: string | null;
@@ -62,6 +66,7 @@ export function DeskToolbar({
   alignNote: string | null;
   /** Mixer-lane display name (nickname when set) for the align readout. */
   laneNameOf: (channelKey: string) => string;
+  onTool: (tool: DeskTool) => void;
   onZoom: (zoom: number) => void;
   /** Selection-aware auto-align (W7-A) — index.tsx owns the flow. */
   onAutoAlign: () => void;
@@ -103,19 +108,22 @@ export function DeskToolbar({
   return (
     <div className="flex items-center justify-between border-b border-divider bg-raised px-3.5">
       <div className="flex min-w-0 items-center gap-3.5">
-        <ToolGroup />
+        <ToolGroup tool={tool} onTool={onTool} splitDisabled={recording} />
         {/* Divider belongs to SnapGrid — it sheds on the same tier (W5-B). */}
         <div className="hidden h-[18px] w-px bg-edge min-[1200px]:block" />
         <SnapGrid />
         <button
           type="button"
           aria-label="Auto-align"
+          // "resets moved clips (split clips keep their cuts)": honest for
+          // every selection shape — the W7-B PM decision preserves split
+          // streams' region layout, so only never-split clips' moves reset.
           title={
             selectionCount > 0
-              ? `Re-align the ${selectionCount} selected clip${selectionCount === 1 ? "" : "s"} by waveform (chirp first when present) — clears their manual moves`
+              ? `Re-align the ${selectionCount} selected clip${selectionCount === 1 ? "" : "s"} by waveform (chirp first when present) — resets moved clips (split clips keep their cuts)`
               : alignState === "idle" && !lastChirpAt
                 ? "Align tracks: chirp correlation, falling back to waveform cross-correlation (run Chirp during a take for best precision)"
-                : "Re-run alignment on the loaded take (chirp, then waveform fallback) — clears manual clip moves"
+                : "Re-run alignment on the loaded take (chirp, then waveform fallback) — resets moved clips (split clips keep their cuts)"
           }
           data-align-state={alignState}
           disabled={!playerLoaded || playerSnap.aligning || recording || alignFlow !== null}
@@ -195,10 +203,11 @@ export function DeskToolbar({
           <span className="text-[8px] text-accent/80">◆</span>
           marker
         </button>
+        {/* N (was C — the Split tool owns C now, W7-B). */}
         <button
           type="button"
           aria-label="Add comment at playhead"
-          title="Comment at playhead (C)"
+          title="Comment at playhead (N)"
           disabled={!markersUsable}
           onClick={onOpenComments}
           className="flex items-center gap-1.5 whitespace-nowrap rounded-full border border-edge-strong px-2.5 py-1 text-[10.5px] font-semibold text-text-mute transition-colors hover:text-text-hi disabled:cursor-not-allowed disabled:opacity-50"

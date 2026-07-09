@@ -191,8 +191,8 @@ test.describe("multi-desk collaboration (W3-A)", () => {
     await addMarker.click();
     await expect(deskA.getByRole("button", { name: "Marker Song 1", exact: true })).toBeVisible();
 
-    // A comment through the composer.
-    await deskA.keyboard.press("c");
+    // A comment through the composer (N — the Split tool owns C, W7-B).
+    await deskA.keyboard.press("n");
     const composer = deskA.getByLabel("Comment text");
     await expect(composer).toBeFocused();
     await composer.fill("alto flat in the second phrase");

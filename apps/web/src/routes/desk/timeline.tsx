@@ -10,6 +10,7 @@ import type { TakeComment } from "./comments";
 import {
   ClipCard,
   type ClipModel,
+  type DeskTool,
   LaneRuler,
   laneGridStyle,
   RenameInput,
@@ -23,6 +24,7 @@ import { formatAt } from "./format";
 import type { Marker, Song } from "./markers";
 import { type MidiLaneModel, MidiLaneRow } from "./midi-lane";
 import type { ChannelStrip } from "./player";
+import { SPLIT_CURSOR } from "./split-cursor";
 import type { TrackRow } from "./track-model";
 import { getDeskSession, getPlayer } from "./use-desk";
 
@@ -46,6 +48,8 @@ export function TimelineSection({
   disarmedPeers,
   recording,
   markersUsable,
+  tool,
+  onSplitAt,
   activeSong,
   durationSec,
   timelineBaseSec,
@@ -75,6 +79,12 @@ export function TimelineSection({
   disarmedPeers: string[];
   recording: boolean;
   markersUsable: boolean;
+  /** Active editing tool (W7-B). Split mode: the whole surface wears the
+   * blade cursor, ruler clicks cut ALL lanes (onSplitAt), and the W4-C
+   * bare-surface press contract is suspended (index.tsx owns that). */
+  tool: DeskTool;
+  /** Split-all at drawn-content second x (Split tool, ruler path). */
+  onSplitAt: (sec: number) => void;
   activeSong: Song | null;
   /** Loaded take duration (marker double-click bounds, song strip end). */
   durationSec: number;
@@ -152,7 +162,14 @@ export function TimelineSection({
       <div
         ref={timelineRef}
         className="relative flex min-h-full min-w-full flex-col"
-        style={{ width: laneWidth + TRACK_HEADER_W }}
+        // Split mode (W7-B): the whole editing surface wears the blade —
+        // bare lanes and gaps inherit it; clips/ruler set their own copy
+        // (their cursor classes would otherwise win), and the sticky
+        // header band's own styles keep normal pointers over the controls.
+        style={{
+          width: laneWidth + TRACK_HEADER_W,
+          ...(tool === "split" && !recording ? { cursor: SPLIT_CURSOR } : {}),
+        }}
         onPointerDown={onLanePointerDown}
         role="presentation"
       >
@@ -181,11 +198,13 @@ export function TimelineSection({
           >
             {/* Ruler seeks park the playhead even with nothing loaded
                 (W4-C click-to-seek); only a rolling take suspends them —
-                the playhead rides the write head. */}
+                the playhead rides the write head. Split mode (W7-B): the
+                same click is the blade across ALL lanes instead. */}
             <LaneRuler
               pxPerSec={pxPerSec}
               widthPx={laneWidth}
-              {...(!recording ? { onSeek: onSeekTimeline } : {})}
+              {...(!recording ? { onSeek: tool === "split" ? onSplitAt : onSeekTimeline } : {})}
+              {...(tool === "split" && !recording ? { cursor: SPLIT_CURSOR } : {})}
             />
             {/* Active-song accent strip (the prototype's ruler range bar) */}
             {markersUsable && activeSong && (

@@ -19,11 +19,15 @@ export interface DeleteSummaryTake {
 export function DeleteConfirm({
   takes,
   clipCount,
+  splitWhole,
   onConfirm,
   onCancel,
 }: {
   takes: DeleteSummaryTake[];
   clipCount: number;
+  /** Any staged stream is SPLIT into regions (W7-B): deletion stays
+   * stream-level, so the dialog must say the whole lane goes. */
+  splitWhole?: boolean;
   onConfirm: () => void;
   onCancel: () => void;
 }) {
@@ -97,6 +101,17 @@ export function DeleteConfirm({
                 value={`${take.clipCount} clip${take.clipCount === 1 ? "" : "s"}`}
               />
             ))}
+            {/* Honesty over a split selection (W7-B): deletion is stream-
+                level — a piece can't be destroyed without its siblings. */}
+            {splitWhole && (
+              <p
+                data-split-whole
+                className="pt-1.5 font-mono text-[9.5px] leading-relaxed text-warn"
+              >
+                A selected clip is a piece of a split recording: this deletes the whole lane's audio
+                for that take, not just the selected part.
+              </p>
+            )}
             <p className="pt-1.5 font-mono text-[9.5px] leading-relaxed text-warn">
               Removes the recordings from every sink — server rows and blobs are deleted durably.
               There is no undo.
