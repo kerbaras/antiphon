@@ -99,6 +99,7 @@ $EDITOR deploy/Caddyfile                # set your domain + Pages hostname
 | `MAX_PEERS_PER_SESSION` / `MAX_ACTIVE_SESSIONS` | `32` / `200` | |
 | `SESSION_TTL_HOURS` | `720` (30 days; idle sessions hard-deleted, blobs + rows) | |
 | `SESSION_SWEEP_INTERVAL_MS` | `600000` | |
+| `COLLAB_IDLE_EVICT_MS` | `900000` (15 min; zero-desk Yjs rooms flushed to Postgres, then dropped from memory — rejoins rebuild transparently) | |
 
 ### 2.3 Run
 
@@ -167,15 +168,29 @@ must be point-in-time copies, not mirrors you prune from.
 
 ## 5 · WEBRTC_PUBLIC_IP (read this before picking a provider)
 
-Ingest currently creates `PeerConnection(..., { iceServers: [] })`
+**Verdict (investigated, W5-A): a public IP bound to the NIC is a hard
+requirement.** Ingest creates `PeerConnection(..., { iceServers: [] })`
 (`apps/server/src/ingest/index.ts`): the only candidates the server offers
 are the **host addresses actually bound to its NICs**. On a Hetzner-style VM
 the public IP is on the interface, so this just works. Behind 1:1 NAT
-(EC2, GCP, most cloud LBs) the server would advertise its private address and
-phones can never reach it. `WEBRTC_PUBLIC_IP` exists in `.env.example` as the
-designated knob for that case but **is not read by the server yet** — treat
-NATed hosts as unsupported until it (or an `iceServers` STUN entry) is wired
-into ingest. Prefer a public-IP-on-NIC VM.
+(EC2, GCP, most cloud LBs) the server advertises its private address and
+phones can never reach it.
+
+`WEBRTC_PUBLIC_IP` **cannot be wired**: the whole stack lacks an
+external-address hint. node-datachannel 0.32.x passes exactly its typed
+`RtcConfig` fields to libdatachannel; libdatachannel v0.24's
+`rtc::Configuration` has no externalAddress / NAT-mapping option; and
+libjuice's ICE-agent config (`juice_config_t`) has none either — only its
+standalone TURN server takes an `external_address`. The server therefore
+treats the var as recognized-but-unsupported: setting it logs a startup
+WARN (so a misconfigured EC2 deploy fails loudly, not mysteriously) and
+changes nothing else. If upstream ever grows the API (the equivalent of
+Pion's `SetNAT1To1IPs` / mediasoup's `announcedIp`), the config plumbing
+and tests are already in place. Until then: **pick a public-IP-on-NIC VM.**
+An `iceServers` STUN entry *is* exposed today and would yield a
+server-reflexive candidate through 1:1 NAT — deliberately not wired: it
+adds a third-party runtime dependency plus gathering latency to every
+connection, for a topology we do not support.
 
 ## 6 · Why not Fly.io
 

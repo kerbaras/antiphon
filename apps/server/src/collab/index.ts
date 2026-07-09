@@ -3,6 +3,10 @@
 // Postgres (collab_docs). The server is a relay + durable replica, not an
 // editor: it never writes doc content. Audio bytes are NEVER in the doc —
 // blobs stay content-addressed in the blob store (ARCHITECTURE §6).
+// Rooms are not process-lifetime residents: once the last desk leaves, the
+// doc is flushed and an idle grace (COLLAB_IDLE_EVICT_MS, default 15 min)
+// starts; an empty room past the grace is evicted from memory and a later
+// join rebuilds it from Postgres — the same path a server restart takes.
 //
 // Wire protocol (binary WS frames, 1-byte tag + payload; both sides speak
 // the same three messages — y-protocols sync semantics, hand-framed so the
@@ -65,11 +69,19 @@ interface CollabRoom {
   dirty: boolean;
   /** Serializes saves so a flush never races the debounced writer. */
   saving: Promise<void>;
+  /** Idle-grace countdown started when the last desk leaves. */
+  evictTimer: NodeJS.Timeout | null;
+  /** Set at the moment the room leaves the maps; a late attach that raced
+   * the eviction sees the flag and rebuilds a fresh room from Postgres. */
+  evicted: boolean;
 }
 
-export interface CollabLimits {
+export interface CollabOptions {
   msgRatePerSec: number;
   msgBurst: number;
+  /** Zero-connection rooms are dropped from memory (doc flushed first)
+   * after this idle grace; a rejoin rebuilds from Postgres. */
+  idleEvictMs: number;
 }
 
 export class CollabHub {
@@ -77,14 +89,24 @@ export class CollabHub {
   private readonly live = new Map<string, CollabRoom>();
   private readonly log = createLogger({ module: "collab" });
   private readonly db: Db;
-  private readonly limits: CollabLimits;
+  private readonly options: CollabOptions;
+  /** Set by close(): the hub refuses new rooms/attaches from then on. A WS
+   * upgrade can race SIGTERM (server.close() doesn't stop sockets already
+   * upgrading), so shutdown must reject latecomers, not serve them. */
+  private closing = false;
 
-  constructor(db: Db, limits: CollabLimits) {
+  constructor(db: Db, options: CollabOptions) {
     this.db = db;
-    this.limits = limits;
+    this.options = options;
+  }
+
+  /** Whether a room is resident in memory (ops/test introspection). */
+  hasLiveRoom(sessionId: string): boolean {
+    return this.live.has(sessionId);
   }
 
   private async getRoom(sessionId: string): Promise<CollabRoom> {
+    if (this.closing) throw new Error("collab hub is shutting down");
     let pending = this.rooms.get(sessionId);
     if (!pending) {
       pending = (async () => {
@@ -104,6 +126,8 @@ export class CollabHub {
           saveTimer: null,
           dirty: false,
           saving: Promise.resolve(),
+          evictTimer: null,
+          evicted: false,
         };
         // Any doc change (from any desk) schedules a debounced merged save
         // and fans out to every other desk.
@@ -128,12 +152,43 @@ export class CollabHub {
             origin,
           );
         });
+        // A load that was in flight when close() ran must not resurrect a
+        // room in the maps close() just vacated — reject like the guard
+        // above would have (the caller's error path closes the socket).
+        if (this.closing) {
+          awareness.destroy();
+          doc.destroy();
+          throw new Error("collab hub is shutting down");
+        }
         this.live.set(sessionId, room);
         return room;
       })();
       this.rooms.set(sessionId, pending);
     }
     return await pending;
+  }
+
+  /** Resolve the room and claim membership, closing the attach↔evict race:
+   * eviction and session-close flag `evicted` and vacate the maps in the
+   * same synchronous block, so a retry's getRoom builds a fresh room from
+   * Postgres; hub shutdown rejects via the getRoom guard instead. The loop
+   * is BOUNDED on purpose: an evicted room that somehow stays resident
+   * would make `continue` re-await the same cached promise forever — a
+   * microtask-only spin that starves timers and deadlocks close() (QA
+   * MAJOR-1, W5-A). Two retries cover every legal interleaving; beyond
+   * that we throw honestly and the caller closes the socket. */
+  private async attachRoom(sessionId: string, conn: CollabConn): Promise<CollabRoom> {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const room = await this.getRoom(sessionId);
+      if (room.evicted) continue; // lost the race — a fresh getRoom rebuilds
+      room.conns.add(conn);
+      if (room.evictTimer) {
+        clearTimeout(room.evictTimer);
+        room.evictTimer = null;
+      }
+      return room;
+    }
+    throw new Error("collab attach kept racing evicted rooms; refusing to spin");
   }
 
   /** Hono WS handlers for one desk connection to /session/:uuid/collab. */
@@ -146,14 +201,13 @@ export class CollabHub {
       // Filled on open; messages before open cannot happen (ws semantics).
       ws: null as unknown as WSContext,
       controlledIds: new Set(),
-      msgBucket: new TokenBucket(this.limits.msgBurst, this.limits.msgRatePerSec),
+      msgBucket: new TokenBucket(this.options.msgBurst, this.options.msgRatePerSec),
     };
     return {
       onOpen: (ws) => {
         conn.ws = ws;
-        void this.getRoom(sessionId)
+        void this.attachRoom(sessionId, conn)
           .then((room) => {
-            room.conns.add(conn);
             // Server speaks first: its step-1 (so the desk sends what the
             // room lacks) plus the room's current presence roster.
             this.send(conn, frame(MSG_SYNC_STEP1, Y.encodeStateVector(room.doc)));
@@ -273,11 +327,12 @@ export class CollabHub {
     }
   }
 
-  /** Last desk left: flush the doc now (don't sit on the debounce). The
-   * room object stays resident — it is tiny, a returning desk reattaches
-   * with zero load races, and rooms are freed by session hard-delete /
-   * expiry (closeSession). Idle-room eviction is a follow-up if long-lived
-   * processes ever accumulate enough sessions for KB-sized docs to matter. */
+  /** Last desk left: flush the doc now (don't sit on the debounce), then
+   * start the idle-grace countdown. The room stays resident through the
+   * grace — a bouncing desk (reload, flaky venue Wi-Fi) reattaches with
+   * zero load races — and only a genuinely idle room is dropped from
+   * memory by evictRoom. Session hard-delete / expiry (closeSession)
+   * remains the other exit. */
   private async releaseRoom(room: CollabRoom): Promise<void> {
     if (room.conns.size > 0) return; // someone rejoined while we scheduled
     if (room.saveTimer) {
@@ -286,6 +341,53 @@ export class CollabHub {
     }
     room.saving = room.saving.then(() => this.save(room));
     await room.saving;
+    if (room.conns.size > 0 || room.evicted) return; // rejoined mid-flush / already gone
+    this.scheduleEvict(room);
+  }
+
+  private scheduleEvict(room: CollabRoom): void {
+    if (room.evictTimer) clearTimeout(room.evictTimer);
+    room.evictTimer = setTimeout(() => {
+      room.evictTimer = null;
+      this.evictRoom(room).catch((error: unknown) => {
+        this.log.warn("collab room eviction failed", { sessionId: room.sessionId, error });
+      });
+    }, this.options.idleEvictMs);
+    room.evictTimer.unref(); // never keep the process alive for housekeeping
+  }
+
+  /** Idle grace expired with the room still empty: force any pending
+   * debounced write, then drop the room from memory. A later join finds no
+   * map entry and getRoom rebuilds the doc from Postgres — the exact path a
+   * server restart takes — so eviction is invisible to desks. */
+  private async evictRoom(room: CollabRoom): Promise<void> {
+    if (room.conns.size > 0 || room.evicted) return;
+    // Belt and braces: releaseRoom flushed when the last desk left, but
+    // force the debounced writer once more so nothing dirty is dropped.
+    if (room.saveTimer) {
+      clearTimeout(room.saveTimer);
+      room.saveTimer = null;
+    }
+    room.saving = room.saving.then(() => this.save(room));
+    await room.saving;
+    if (room.conns.size > 0 || room.evicted) return; // desk attached mid-flush
+    if (room.dirty) {
+      // The flush failed (save() logged why and re-flagged the room).
+      // Never drop unsaved edits — keep the room and retry after another
+      // grace. The session-delete race resolves itself: closeSession clears
+      // the timer and frees the room without saving.
+      this.scheduleEvict(room);
+      return;
+    }
+    room.evicted = true;
+    this.rooms.delete(room.sessionId);
+    this.live.delete(room.sessionId);
+    room.awareness.destroy();
+    room.doc.destroy();
+    this.log.info("idle collab room evicted", {
+      sessionId: room.sessionId,
+      idleMs: this.options.idleEvictMs,
+    });
   }
 
   /** Session hard-delete path: disconnect desks and drop the room WITHOUT
@@ -302,6 +404,11 @@ export class CollabHub {
       clearTimeout(room.saveTimer);
       room.saveTimer = null;
     }
+    if (room.evictTimer) {
+      clearTimeout(room.evictTimer);
+      room.evictTimer = null;
+    }
+    room.evicted = true; // an in-flight evictRoom flush must not double-free
     room.dirty = false;
     for (const conn of room.conns) {
       try {
@@ -315,20 +422,36 @@ export class CollabHub {
     room.doc.destroy();
   }
 
-  /** Graceful shutdown: flush every dirty room. */
+  /** Graceful shutdown: flush every dirty room. The closing flag flips and
+   * the maps are vacated BEFORE the first await — a WS upgrade racing
+   * SIGTERM then gets a clean rejection from the getRoom guard. The first
+   * cut of this method marked rooms evicted while leaving them resident
+   * through the flushes; an attach landing in that window re-resolved the
+   * same cached promise forever — a microtask spin that starved the very
+   * flush it was waiting on AND the 10 s shutdown watchdog (a timer), so
+   * the process hung until SIGKILL with later rooms unflushed (QA
+   * MAJOR-1). Vacate-then-flush makes that interleaving unreachable;
+   * collab-shutdown.test.ts pins it. */
   async close(): Promise<void> {
-    for (const room of this.live.values()) {
+    this.closing = true;
+    const rooms = [...this.live.values()];
+    this.rooms.clear();
+    this.live.clear();
+    for (const room of rooms) {
       if (room.saveTimer) {
         clearTimeout(room.saveTimer);
         room.saveTimer = null;
       }
+      if (room.evictTimer) {
+        clearTimeout(room.evictTimer);
+        room.evictTimer = null;
+      }
+      room.evicted = true; // pending evictions are moot; nothing double-frees
       room.saving = room.saving.then(() => this.save(room));
       await room.saving;
       room.awareness.destroy();
       room.doc.destroy();
     }
-    this.rooms.clear();
-    this.live.clear();
   }
 }
 

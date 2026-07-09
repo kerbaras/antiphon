@@ -231,6 +231,56 @@ suite("collab doc sync (W3-A)", () => {
     expect(await docRow(sessionId)).toBeNull();
   }, 30_000);
 
+  it("idle rooms are evicted after the grace (doc flushed) and rebuilt from Postgres on rejoin", async () => {
+    const evicting = await startTestServer(dbUrl, blobRoot, { collab: { idleEvictMs: 400 } });
+    try {
+      const sessionId = await createSession(evicting.baseUrl);
+      const a = new DocClient();
+      await a.connect(evicting.baseUrl, sessionId);
+      await a.waitSynced();
+      a.doc.getMap("mix").set("lane-1", { gainDb: -3, pan: 0.5, muted: false, soloed: true });
+      await pollUntil(
+        async () => evicting.collab.hasLiveRoom(sessionId),
+        (live) => live,
+        "room resident while a desk is connected",
+        10_000,
+      );
+
+      // Last desk leaves BEFORE the 2 s save debounce fires: the release
+      // flush must make the edit durable, then the 400 ms grace runs out
+      // and the room disappears from the in-memory maps.
+      a.close();
+      await pollUntil(
+        async () => evicting.collab.hasLiveRoom(sessionId),
+        (live) => !live,
+        "room evicted after the idle grace",
+        10_000,
+      );
+      const persisted = await docRow(sessionId);
+      expect(persisted).not.toBeNull();
+
+      // Rejoin after eviction: getRoom finds no entry and rebuilds from the
+      // persisted row (the server-restart path) — the desk sees full state
+      // and never learns an eviction happened.
+      const b = new DocClient();
+      try {
+        await b.connect(evicting.baseUrl, sessionId);
+        await b.waitSynced();
+        await pollUntil(
+          async () => b.doc.getMap("mix").get("lane-1") as { gainDb: number } | undefined,
+          (v) => v?.gainDb === -3,
+          "doc state intact across eviction",
+          10_000,
+        );
+        expect(evicting.collab.hasLiveRoom(sessionId)).toBe(true);
+      } finally {
+        b.close();
+      }
+    } finally {
+      await evicting.stop();
+    }
+  }, 30_000);
+
   it("the join rate limiter guards /session/:id/collab", async () => {
     const limited = await startTestServer(dbUrl, blobRoot, {
       limits: { joinRatePerMin: 30, joinBurst: 3 },

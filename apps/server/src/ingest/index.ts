@@ -164,6 +164,16 @@ export class SessionIngest {
    * answer SDP once available. */
   async handleOffer(peerId: string, sdp: string): Promise<{ sdp: string; type: string }> {
     this.closePeer(peerId);
+    // The empty config is deliberate, not an oversight: the server's host
+    // candidates (the addresses on its NICs) are the whole ICE story. The
+    // WEBRTC_PUBLIC_IP knob CANNOT be wired here — node-datachannel 0.32.x
+    // reads exactly the RtcConfig fields in its type defs (verified against
+    // src/cpp/peer-connection-wrapper.cpp), libdatachannel v0.24's
+    // rtc::Configuration has no externalAddress/1:1-NAT mapping, and
+    // libjuice's agent config (juice_config_t) doesn't either — only its
+    // standalone TURN server does. Until upstream grows that API, a public
+    // IP bound to the NIC is a hard deployment requirement (docs/deploy.md
+    // §5); createServer warns at boot if WEBRTC_PUBLIC_IP is set.
     const pc = new PeerConnection(`antiphon-${peerId.slice(0, 8)}`, { iceServers: [] });
     const link: PeerLink = {
       pc,

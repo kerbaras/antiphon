@@ -42,8 +42,24 @@ export async function createServer(config: ServerConfig = loadConfig()) {
   const collab = new CollabHub(db, {
     msgRatePerSec: config.limits.msgRatePerSec,
     msgBurst: config.limits.msgBurst,
+    idleEvictMs: config.collab.idleEvictMs,
   });
   let ready = false;
+
+  // WEBRTC_PUBLIC_IP is recognized but cannot work: neither node-datachannel
+  // 0.32.x nor libdatachannel/libjuice underneath expose an external-address
+  // (1:1 NAT) hint, so ingest can only ever advertise addresses bound to the
+  // NICs. Warn loudly instead of failing silently in production — the fix is
+  // a VM with the public IP on the interface (docs/deploy.md §5).
+  if (config.webrtcPublicIp) {
+    log.warn(
+      "WEBRTC_PUBLIC_IP is set but unsupported: node-datachannel exposes no " +
+        "external-address hint, so ingest cannot advertise it as an ICE candidate. " +
+        "Behind 1:1 NAT (EC2-style) phone→server WebRTC will fail — deploy on a " +
+        "VM with the public IP bound to its NIC (docs/deploy.md §5).",
+      { webrtcPublicIp: config.webrtcPublicIp },
+    );
+  }
 
   const app = new Hono<Env>();
 

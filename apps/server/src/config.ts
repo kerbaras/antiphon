@@ -27,6 +27,18 @@ export interface ServerConfig {
     sessionTtlHours: number;
     sweepIntervalMs: number;
   };
+  collab: {
+    /** Collab rooms with zero connections are evicted (doc flushed to
+     * Postgres first) after this idle grace. */
+    idleEvictMs: number;
+  };
+  /** Read for honesty, not for function: node-datachannel (libdatachannel/
+   * libjuice underneath) exposes no external-address / 1:1-NAT hint, so the
+   * server cannot advertise this IP as an ICE candidate. Setting it only
+   * produces a startup WARN; NATed hosts stay unsupported (docs/deploy.md
+   * §5). Kept in config so the day upstream grows the API, the plumbing —
+   * and its tests — are already here. */
+  webrtcPublicIp: string | null;
 }
 
 export function loadConfig(): ServerConfig {
@@ -64,8 +76,12 @@ export function loadConfig(): ServerConfig {
     },
     retention: {
       sessionTtlHours: envPositiveNumber("SESSION_TTL_HOURS", 720),
-      sweepIntervalMs: envPositiveNumber("SESSION_SWEEP_INTERVAL_MS", 600_000),
+      sweepIntervalMs: envPositiveNumber("SESSION_SWEEP_INTERVAL_MS", 600_000, MAX_TIMER_MS),
     },
+    collab: {
+      idleEvictMs: envPositiveNumber("COLLAB_IDLE_EVICT_MS", 900_000, MAX_TIMER_MS), // 15 min
+    },
+    webrtcPublicIp: process.env.WEBRTC_PUBLIC_IP?.trim() || null,
   };
 }
 
@@ -99,12 +115,21 @@ function envCorsOrigins(): string[] | null {
   return origins.length > 0 ? origins : null;
 }
 
-function envPositiveNumber(name: string, fallback: number): number {
+/** setTimeout/setInterval take a signed 32-bit ms delay; anything larger
+ * overflows to ~1 ms — a "30-day grace" would evict immediately. Timer-
+ * backed knobs pass this as `max` so a misconfiguration fails loudly at
+ * boot instead of silently inverting its own meaning. ≈ 24.8 days. */
+const MAX_TIMER_MS = 2_147_483_647;
+
+function envPositiveNumber(name: string, fallback: number, max = Number.POSITIVE_INFINITY): number {
   const raw = process.env[name];
   if (raw === undefined || raw === "") return fallback;
   const value = Number(raw);
   if (!Number.isFinite(value) || value <= 0) {
     throw new Error(`${name} must be a positive number, got "${raw}"`);
+  }
+  if (value > max) {
+    throw new Error(`${name} must be ≤ ${max} (32-bit timer ceiling, ~24.8 days), got "${raw}"`);
   }
   return value;
 }

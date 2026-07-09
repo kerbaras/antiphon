@@ -45,17 +45,30 @@ jobs:
           --health-interval 5s
           --health-timeout 3s
           --health-retries 10
-      # bitnami/minio starts standalone with no command override (the
-      # official minio/minio image needs `server /data`, which services
-      # can't pass). Buckets are created by the server's ensureBucket();
-      # the S3 suite self-skips if :9100 is unreachable.
+      # A Bitnami-style MinIO starts standalone with no command override
+      # (the official minio/minio image needs `server /data` args, which
+      # services can't pass). Pin rationale (2026-07): Bitnami's registry
+      # reshuffle DELETED docker.io/bitnami/minio — the frozen archive lives
+      # at docker.io/bitnamilegacy/minio — and MinIO community went
+      # source-only (minio/minio#21647), so no maintained public image
+      # exists; every option is a frozen snapshot. Digest-pinned (multi-arch
+      # manifest list, verified standalone-start + /minio/health/ready) so a
+      # tag reshuffle can never swap bytes under us. Fine for CI: ephemeral
+      # store, throwaway credentials, never exposed. Buckets are created by
+      # the server's ensureBucket(); the health gate below keeps the S3
+      # suite from silently self-skipping when :9100 is unreachable.
       minio:
-        image: bitnami/minio:latest
+        image: bitnamilegacy/minio:2025.7.23-debian-12-r5@sha256:6dabb4a2088c9a79908de3bc05f4586c23ad2182c8908e7e3acbf61c1467fb20
         env:
           MINIO_ROOT_USER: antiphon
           MINIO_ROOT_PASSWORD: antiphon-secret
         ports:
           - "9100:9000"
+        options: >-
+          --health-cmd "curl -f http://localhost:9000/minio/health/ready"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2

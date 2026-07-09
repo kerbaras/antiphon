@@ -21,6 +21,9 @@ export const SERVER_SINK = 0;
 export interface TestServer {
   port: number;
   baseUrl: string;
+  /** The live collab hub — lets suites assert on in-memory room residency
+   * (idle eviction) without widening the HTTP surface. */
+  collab: Awaited<ReturnType<typeof createServer>>["collab"];
   stop(): Promise<void>;
 }
 
@@ -29,6 +32,12 @@ export interface TestServer {
 export type TestConfigOverrides = {
   limits?: Partial<ServerConfig["limits"]>;
   retention?: Partial<ServerConfig["retention"]>;
+  collab?: Partial<ServerConfig["collab"]>;
+  webrtcPublicIp?: string;
+  /** Default "error" keeps suites quiet; NOTE the logger threshold is
+   * process-global (setLogLevel), so a looser level leaks to servers
+   * already running in the same fork — restore it when asserting logs. */
+  logLevel?: ServerConfig["logLevel"];
   /** Full blob config override (e.g. the s3 driver against local MinIO);
    * defaults to the fs driver rooted at `blobRoot`. */
   blob?: ServerConfig["blob"];
@@ -39,11 +48,11 @@ export async function startTestServer(
   blobRoot: string,
   overrides: TestConfigOverrides = {},
 ): Promise<TestServer> {
-  const { app, injectWebSocket, close } = await createServer({
+  const { app, injectWebSocket, collab, close } = await createServer({
     databaseUrl: dbUrl,
     blob: overrides.blob ?? { driver: "fs", root: blobRoot },
     port: 0,
-    logLevel: "error",
+    logLevel: overrides.logLevel ?? "error",
     corsOrigins: null,
     trustProxy: false,
     limits: {
@@ -60,12 +69,18 @@ export async function startTestServer(
       sweepIntervalMs: 600_000,
       ...overrides.retention,
     },
+    collab: {
+      idleEvictMs: 900_000,
+      ...overrides.collab,
+    },
+    webrtcPublicIp: overrides.webrtcPublicIp ?? null,
   });
   return await new Promise((resolve) => {
     const server = serve({ fetch: app.fetch, port: 0 }, (info) => {
       resolve({
         port: info.port,
         baseUrl: `http://localhost:${info.port}`,
+        collab,
         stop: async () => {
           await close();
           // Sever WS upgrade sockets too, or close() waits forever.

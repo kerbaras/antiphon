@@ -10,6 +10,7 @@ import { join } from "node:path";
 import { parseSignalingMessage, type SignalingMessage } from "@antiphon/protocol";
 import postgres from "postgres";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { setLogLevel } from "../src/logger.ts";
 import {
   FakeDesk,
   FakeRecorder,
@@ -141,6 +142,49 @@ suite("server hardening", () => {
     expect(ready.status).toBe(200);
     expect(await ready.json()).toEqual({ ready: true });
   });
+
+  it("WEBRTC_PUBLIC_IP set: boot succeeds and ingest behaves identically (knob only warns)", async () => {
+    // The env var is recognized for the startup WARN only — node-datachannel
+    // exposes no external-address hint (see ingest handleOffer). This pins
+    // the contract that setting it changes nothing observable: the server
+    // boots, and a recorder still completes the full WebRTC handshake.
+    // The WARN itself is asserted by capturing stdout across boot (the
+    // logger writes JSON lines there); logLevel "warn" lets it through and
+    // is restored to the harness default after, since the threshold is
+    // process-global.
+    const lines: string[] = [];
+    const realWrite = process.stdout.write.bind(process.stdout);
+    process.stdout.write = ((chunk: string | Uint8Array) => {
+      lines.push(String(chunk));
+      return realWrite(chunk);
+    }) as typeof process.stdout.write;
+    let natted: TestServer;
+    try {
+      natted = await startTestServer(dbUrl, blobRoot, {
+        webrtcPublicIp: "203.0.113.10",
+        logLevel: "warn",
+      });
+    } finally {
+      process.stdout.write = realWrite;
+      setLogLevel("error");
+    }
+    expect(
+      lines.some(
+        (l) => l.includes("WEBRTC_PUBLIC_IP is set but unsupported") && l.includes("203.0.113.10"),
+      ),
+    ).toBe(true);
+
+    const recorder = new FakeRecorder(natted.baseUrl, await createSession(natted.baseUrl));
+    try {
+      const health = await fetch(`${natted.baseUrl}/health`);
+      expect(health.status).toBe(200);
+      await recorder.join();
+      await recorder.connectDataChannel(); // resolves only when the DC opens
+    } finally {
+      await recorder.close();
+      await natted.stop();
+    }
+  }, 30_000);
 
   it("join rate limit kicks in per IP and recovers (RFC §12)", async () => {
     const limited = await startTestServer(dbUrl, blobRoot, {
