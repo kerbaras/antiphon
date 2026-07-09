@@ -838,6 +838,10 @@ export function useTakeComments(sessionId: string, takeId: string | null): TakeC
 export interface ServerStreamStatus {
   streamId: string;
   takeId: string;
+  /** The stream's seq-0 device/mic description (W4-F carries the picked
+   * mic label in it), as the server archived it. Null for streams recorded
+   * before the header carried one. */
+  deviceDesc: string | null;
   chunkCount: number;
   chwm: number | null;
   holes: Array<[number, number]>;

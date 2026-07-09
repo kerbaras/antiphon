@@ -77,10 +77,15 @@ export function TransportGroup({ children }: { children: ReactNode }) {
 }
 
 /** Timecode display — mono 15px in an inset well. */
-export function Timecode({ seconds }: { seconds: number }) {
+export function Timecode({ seconds, className }: { seconds: number; className?: string }) {
   const pad = (n: number) => String(n).padStart(2, "0");
   return (
-    <div className="rounded-md border border-edge-inset bg-bg px-3 py-1 font-mono text-[15px] font-semibold tracking-[1px] text-text-hi">
+    <div
+      className={cx(
+        "rounded-md border border-edge-inset bg-bg px-3 py-1 font-mono text-[15px] font-semibold tracking-[1px] text-text-hi",
+        className,
+      )}
+    >
       {pad(Math.floor(seconds / 3600))}:{pad(Math.floor((seconds / 60) % 60))}:
       {pad(Math.floor(seconds % 60))}
       <span className="text-text-faint">:{pad(Math.floor((seconds % 1) * 100))}</span>
@@ -116,12 +121,14 @@ export function AvatarStack({
 }) {
   return (
     <div className="flex items-center">
+      {/* Presence avatars are a sub-640px shed tier (W5-B): the performers
+          rail carries the roster; the "+" — THE invite affordance — stays. */}
       {people.map((p, i) => (
         <div
           key={p.id}
           title={p.title}
           className={cx(
-            "grid size-[26px] place-items-center rounded-full border-2 border-panel",
+            "hidden size-[26px] place-items-center rounded-full border-2 border-panel min-[640px]:grid",
             "text-[9.5px] font-bold text-void",
             i > 0 && "-ml-[7px]",
           )}
@@ -137,7 +144,7 @@ export function AvatarStack({
         aria-haspopup="dialog"
         aria-expanded={addExpanded ?? false}
         onClick={onAdd}
-        className="-ml-[7px] grid size-[26px] place-items-center rounded-full border-2 border-panel bg-card-hi text-[11px] text-text-dim hover:text-text"
+        className="grid size-[26px] place-items-center rounded-full border-2 border-panel bg-card-hi text-[11px] text-text-dim hover:text-text min-[640px]:-ml-[7px]"
       >
         +
       </button>
@@ -166,7 +173,18 @@ const INERT_TOOLS: Array<{ name: string; key: string }> = [
 
 /** Editing tool group. Select is the one live tool (clip click / marquee /
  * drag on the timeline); the rest keep the prototype's layout but read
- * unmistakably disabled — dimmed, cursor-blocked, tagged "soon". */
+ * unmistakably disabled — dimmed, cursor-blocked, tagged "soon".
+ *
+ * Narrow widths (W5-B): the inert placeholders are the toolbar's
+ * lowest-priority tier. The governing budget (QA F2) is the alignment
+ * verdict chip — the row's ONE flexible child, whose longest live string
+ * (a declined verdict, ~178px) must render whole at every width ≥ 700.
+ * Tiers are therefore staggered by what each piece costs against that
+ * budget, and the budget is PINNED by a live-verdict width sweep in
+ * topbar.spec.ts — arithmetic alone was wrong twice (a wholesale return
+ * at 1200 re-squashed the chip across 1200-1345; the sweep then caught a
+ * 1360 return still 10px short): view tabs at 860, snap/grid at 1200,
+ * these inert tools last at 1380. Select always stays. */
 export function ToolGroup() {
   return (
     <div className="flex items-center gap-0.5 rounded-md border border-edge bg-bg p-[2px]">
@@ -177,7 +195,7 @@ export function ToolGroup() {
       <span
         aria-disabled="true"
         title="Coming soon — editing tools arrive with the timeline milestone"
-        className="flex cursor-not-allowed items-center gap-0.5 opacity-40"
+        className="hidden cursor-not-allowed items-center gap-0.5 opacity-40 min-[1380px]:flex"
       >
         {INERT_TOOLS.map((tool) => (
           <span
@@ -189,20 +207,21 @@ export function ToolGroup() {
           </span>
         ))}
       </span>
-      <span className="pr-1 pl-0.5">
+      <span className="hidden pr-1 pl-0.5 min-[1380px]:inline">
         <SoonChip />
       </span>
     </div>
   );
 }
 
-/** Snap / Grid inset chips — visibly disabled until editing lands. */
+/** Snap / Grid inset chips — visibly disabled until editing lands.
+ * Inert chrome sheds below 1200px (W5-B) — see ToolGroup. */
 export function SnapGrid() {
   return (
     <div
       aria-disabled="true"
       title="Coming soon — snap and grid land with the editing tools"
-      className="flex cursor-not-allowed items-center gap-2 text-[11px] text-text-faint"
+      className="hidden cursor-not-allowed items-center gap-2 text-[11px] text-text-faint min-[1200px]:flex"
     >
       <span className="flex items-center gap-2 opacity-40">
         <span>Snap</span>
@@ -220,10 +239,14 @@ export function SnapGrid() {
 }
 
 /** Arrange / Session inset tab pair — Session is visibly disabled until
- * the DAW milestone (Arrange is the only real view). */
+ * the DAW milestone (Arrange is the only real view, so the pair carries
+ * no information; it sheds below 860px — W5-B, on the verdict-chip
+ * budget: see ToolGroup. Inert tabs must never be what squashes a real
+ * verdict to a sliver — at 800-859 the pair cost the chip ~25px of its
+ * longest string). */
 export function ViewTabs() {
   return (
-    <div className="flex rounded-md border border-edge bg-bg p-[2px] text-[11px] font-semibold">
+    <div className="hidden rounded-md border border-edge bg-bg p-[2px] text-[11px] font-semibold min-[860px]:flex">
       <span className="rounded bg-accent px-3.5 py-1 text-white">Arrange</span>
       <span
         aria-disabled="true"

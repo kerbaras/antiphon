@@ -110,6 +110,34 @@ test("one transport button: Play → Stop take → Play → Pause across a take"
   expect(await markerCount()).toBe(markersBefore);
   await desk.keyboard.press("Escape");
 
+  // W5-B — Space-vs-loading parity (twice QA-flagged): wedge the player
+  // into a decode that never finishes (an assemble promise that never
+  // resolves), exactly what a slow take load looks like. ▶ disables — and
+  // Space must be a no-op through the same gate (playActionReady). Before
+  // the fix this Space started the OLD take playing behind the disabled
+  // button.
+  await desk.evaluate(() => {
+    (document.activeElement as HTMLElement | null)?.blur?.(); // Esc parked focus on the "+"
+    const hook = (
+      globalThis as unknown as {
+        __antiphonDesk: {
+          player: {
+            load(
+              takeId: string,
+              streamIds: string[],
+              assemble: () => Promise<ArrayBuffer | null>,
+            ): Promise<boolean>;
+          };
+        };
+      }
+    ).__antiphonDesk;
+    void hook.player.load("w5b-wedged-take", ["w5b-wedged-stream"], () => new Promise(() => {}));
+  });
+  await expect(play).toBeDisabled();
+  await desk.keyboard.press("Space");
+  await desk.waitForTimeout(400); // a beat for the would-be toggle to surface
+  expect(await enginePlaying(desk), "Space is a no-op exactly when ▶ is disabled").toBe(false);
+
   await phone.close();
   await desk.close();
 });
@@ -167,3 +195,43 @@ test("the + invite popover: QR + link, copy feedback, Esc/click-away dismiss", a
 
   await desk.close();
 });
+
+// W5-B — the W4-D parked nit: at ≤1000px the open popover stacks straight
+// over the performers tab's wall-poster QR — two loud QRs read as a choice
+// that doesn't exist. The poster now yields while the popover is open
+// (dimmed + desaturated + aria-hidden, geometry stable) and returns when it
+// closes. Guarded at 1000 and at full width — the popover is the primary
+// invite surface everywhere, not just where the two happen to overlap.
+for (const width of [1000, 1280]) {
+  test(`the wall-poster QR yields to the open invite popover at ${width}px`, async ({ page }) => {
+    await page.setViewportSize({ width, height: 800 });
+    const sessionId = crypto.randomUUID();
+    await page.goto(`/session/${sessionId}`);
+    await expect(page.getByRole("button", { name: "Record take" })).toBeVisible();
+    await page.getByRole("button", { name: /^performers/i }).click();
+
+    const poster = page.locator("[data-qr-yielding]");
+    await expect(poster).toHaveAttribute("data-qr-yielding", "false");
+
+    await page.getByRole("button", { name: "Invite performer", exact: true }).click();
+    const dialog = page.getByRole("dialog", { name: "Invite performers" });
+    await expect(dialog.locator('svg[aria-label="Join QR code"]')).toBeVisible();
+    await expect(poster).toHaveAttribute("data-qr-yielding", "true");
+    await expect(poster).toHaveAttribute("aria-hidden", "true");
+    // The dim is real (0.2 after the 150ms transition), not just declared.
+    await expect
+      .poll(async () => await poster.evaluate((el) => getComputedStyle(el).opacity))
+      .toBe("0.2");
+
+    // Evidence screenshot for design review (the QA finding was visual).
+    await page.screenshot({ path: test.info().outputPath(`dual-qr-${width}.png`) });
+
+    // Closing the popover brings the poster back to full strength.
+    await page.keyboard.press("Escape");
+    await expect(dialog).toHaveCount(0);
+    await expect(poster).toHaveAttribute("data-qr-yielding", "false");
+    await expect
+      .poll(async () => await poster.evaluate((el) => getComputedStyle(el).opacity))
+      .toBe("1");
+  });
+}

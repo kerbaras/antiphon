@@ -187,6 +187,71 @@ test.describe("phone mic picker (W4-F)", () => {
     };
     await expect.poll(() => headerDeviceDesc(take1)).toContain("Fake Default Audio Input");
     await expect.poll(() => headerDeviceDesc(take2)).toContain("Fake Audio Input 2");
+
+    // W5-B — the desk SURFACES the archived mic, per take. Take 2 is the
+    // latest complete take, so it auto-loads: the lane header's provenance
+    // chip tooltips take 2's deviceDesc.
+    const chip = desk.locator("[data-take-mic]");
+    await expect(chip).toHaveAttribute("data-take-mic", /Fake Audio Input 2/, {
+      timeout: 30_000,
+    });
+    await expect(chip).toHaveAttribute("title", /Mic on the loaded take/);
+
+    // Loading take 1 (explicit double-click) swaps the claim — the tooltip
+    // is take-scoped truth, not a "latest device" cache.
+    const take1Stream = (await serverTakeStreams(desk, sessionId, take1))[0]?.streamId as string;
+    await desk.locator(`[data-clip="${take1Stream}"]`).dblclick();
+    await expect(chip).toHaveAttribute("data-take-mic", /Fake Default Audio Input/, {
+      timeout: 30_000,
+    });
+
+    // The sinks panel spells the same field out per stream, in words.
+    await desk.getByRole("button", { name: /^sinks/i }).click();
+    await expect(desk.getByText(/browser · Fake Default Audio Input/).first()).toBeVisible();
+    await expect(desk.getByText(/browser · Fake Audio Input 2/).first()).toBeVisible();
+
+    // QA F1 — the orphan case. Take 3 rolls on Input 2; mid-take the phone
+    // reloads with the mic preference cleared (identity preserved — same
+    // localStorage), so the A6 rejoin arms a FRESH stream on the DEFAULT
+    // mic while the truncated orphan carries Input 2. The lane's mic claim
+    // must be the AUDIBLE stream's — the orphan never loads, and worker
+    // enumeration order must never decide whose mic the chip shows.
+    const take3 = await startTake(desk);
+    await expect(phone.getByText("recording", { exact: true })).toBeVisible({ timeout: 15_000 });
+    const orphanStreamId = (await recorderState(phone))?.streamId as string;
+    await phone.waitForTimeout(1_500);
+    await phone.evaluate((key) => window.localStorage.removeItem(key), MIC_PREF_KEY);
+    await phone.reload();
+    await phone.getByRole("button", { name: /enable microphone/i }).click();
+    await expect(phone.getByText("recording", { exact: true })).toBeVisible({ timeout: 15_000 });
+    await expect.poll(() => deviceLabel(phone)).toBe("Fake Default Audio Input");
+    const freshStreamId = (await recorderState(phone))?.streamId as string;
+    expect(freshStreamId).toBeTruthy();
+    expect(freshStreamId).not.toBe(orphanStreamId);
+    await phone.waitForTimeout(1_500);
+    await stopTake(desk);
+    await expectTakeConverged(desk, sessionId, take3, 1, { onlyStreamIds: [freshStreamId] });
+
+    // Server truth: two streams on one lane, two different mics.
+    const take3Streams = await serverTakeStreams(desk, sessionId, take3);
+    expect(take3Streams).toHaveLength(2);
+    expect(take3Streams.find((s) => s.streamId === orphanStreamId)?.deviceDesc).toContain(
+      "Fake Audio Input 2",
+    );
+    expect(take3Streams.find((s) => s.streamId === freshStreamId)?.deviceDesc).toContain(
+      "Fake Default Audio Input",
+    );
+
+    // The orphan keeps take 3 from auto-selecting (it never completes) —
+    // load it the operator's way, double-clicking the audible clip.
+    await desk.locator(`[data-clip="${freshStreamId}"]`).dblclick();
+    await expect(chip).toHaveAttribute("data-take-mic", /Fake Default Audio Input/, {
+      timeout: 30_000,
+    });
+    expect(
+      await chip.getAttribute("data-take-mic"),
+      "the orphan's mic never becomes the lane's claim",
+    ).not.toContain("Fake Audio Input 2");
   });
 
   // QA F1/F2 regression — the races the first review bounced. All three

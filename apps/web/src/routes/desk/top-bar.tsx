@@ -3,7 +3,7 @@
 // as in the prototype.
 
 import type { PeerInfo } from "@antiphon/protocol";
-import { useRef, useState } from "react";
+import { useRef } from "react";
 import type { DeskSessionState } from "../../net/desk-session";
 import { Wordmark } from "../../ui/kit";
 import { AvatarStack, InfoChip, Timecode, TransportButton, TransportGroup } from "./daw";
@@ -12,6 +12,15 @@ import { InvitePopover } from "./invite-popover";
 import type { PlayerSnapshot } from "./player";
 import { deviceName, initialsOf, TRACK_COLORS } from "./track-model";
 import { getDeskSession, getPlayer } from "./use-desk";
+
+/** THE transport button's ▶-face gate, shared with the global Space
+ * shortcut (W5-B): Space must be a no-op exactly when ▶ is disabled.
+ * QA hit the gap twice — while a take decodes (playerSnap.loading) the
+ * button honestly refuses, but Space could still reach toggle() and play
+ * the previous take. One predicate, both callers: parity by construction. */
+export function playActionReady(playerLoaded: boolean, playerSnap: PlayerSnapshot): boolean {
+  return playerLoaded && !playerSnap.loading;
+}
 
 export function DeskTopBar({
   sessionId,
@@ -29,6 +38,8 @@ export function DeskTopBar({
   takeCount,
   streamCount,
   exportMenu,
+  inviteOpen,
+  onInviteOpen,
 }: {
   sessionId: string;
   joinUrl: string;
@@ -46,10 +57,12 @@ export function DeskTopBar({
   takeCount: number;
   streamCount: number;
   exportMenu: ExportMenuProps;
+  /** The "+" on the avatar stack is THE invite affordance (W4-D). State
+   * lives with the desk orchestrator (W5-B): while the popover is open the
+   * performers tab's wall-poster QR yields, so the two QRs never compete. */
+  inviteOpen: boolean;
+  onInviteOpen: (open: boolean) => void;
 }) {
-  // The "+" on the avatar stack is THE invite affordance (W4-D): it took
-  // over the old Share button's clipboard job and the sidebar QR toggle.
-  const [inviteOpen, setInviteOpen] = useState(false);
   const inviteAnchor = useRef<HTMLButtonElement>(null);
 
   return (
@@ -58,9 +71,22 @@ export function DeskTopBar({
     // prototype's absolute centering — but when the viewport narrows the
     // cluster claims its space first (shrink-0) and the session-title block
     // truncates into its own share instead of running underneath (F15).
+    //
+    // Below that, the bar sheds tiers instead of self-overlapping (W5-B —
+    // QA clamped to 430px and watched the right group run over the
+    // transport): stat chips go first (<1200, F15), then the wordmark
+    // lettering (<840 — the mark stays; the session title is the working
+    // identity), then the timecode and the presence avatars (<640 — the
+    // "+" invite affordance survives; the boundary sits where the title
+    // still keeps a legible width WITH those pieces on screen — at the
+    // old 560 the title crushed to ~2 chars right at the tier edge, QA
+    // F5). The right group refuses to shrink below its content
+    // (min-w-fit): overflow claims the flexible title, never the
+    // neighbouring cluster. index.tsx floors the whole desk at 520px —
+    // beyond every tier, the page scrolls rather than explodes.
     <header className="flex items-center gap-4 border-b border-divider bg-panel px-3.5">
       <div className="flex min-w-0 flex-1 items-center gap-3.5">
-        <Wordmark />
+        <Wordmark textClassName="hidden min-[840px]:block" />
         <div className="h-5 w-px shrink-0 bg-edge-btn" />
         <div className="flex min-w-0 flex-col leading-[1.25]">
           <span className="truncate text-[12px] font-semibold text-text-strong">
@@ -98,15 +124,23 @@ export function DeskTopBar({
               the Space shortcut in index.tsx always has. Stop never gates
               on the player or on signaling: a rolling take must stay
               stoppable even mid-server-restart (the recovery e2e relies on
-              it); Play alone waits for a loaded, decoded take. */}
+              it); Play alone waits for a loaded, decoded take
+              (playActionReady — the Space shortcut shares the gate). */}
           <TransportButton
             label={recording ? "Stop take" : playerSnap.playing ? "Pause" : "Play"}
             tone="accent"
             active={!recording && playerSnap.playing}
-            disabled={!recording && (!playerLoaded || playerSnap.loading)}
-            onClick={() =>
-              recording ? getDeskSession(sessionId).stopTake() : getPlayer().toggle()
-            }
+            disabled={!recording && !playActionReady(playerLoaded, playerSnap)}
+            onClick={() => {
+              if (recording) {
+                getDeskSession(sessionId).stopTake();
+                return;
+              }
+              // Re-validated at event time on the live snapshot, exactly
+              // like the Space guard (QA F4): disabled= should make this
+              // unreachable, but both paths run the one predicate.
+              if (playActionReady(playerLoaded, getPlayer().snapshot())) getPlayer().toggle();
+            }}
           >
             {recording ? "■" : playerSnap.playing ? "⏸" : "▶"}
           </TransportButton>
@@ -128,7 +162,10 @@ export function DeskTopBar({
             ♫
           </TransportButton>
         </TransportGroup>
-        <Timecode seconds={recording ? elapsed : playerLoaded ? playerSnap.positionSec : 0} />
+        <Timecode
+          className="hidden min-[640px]:block"
+          seconds={recording ? elapsed : playerLoaded ? playerSnap.positionSec : 0}
+        />
         {/* Stat chips are the lowest-priority tier: they collapse first so
             the session title keeps a legible width at narrow widths. */}
         <div className="hidden gap-1.5 min-[1200px]:flex">
@@ -138,7 +175,7 @@ export function DeskTopBar({
         </div>
       </div>
 
-      <div className="flex flex-1 items-center justify-end gap-3">
+      <div className="flex min-w-fit flex-1 items-center justify-end gap-3">
         <div className="relative">
           <AvatarStack
             people={[
@@ -157,7 +194,7 @@ export function DeskTopBar({
                 title: p.deviceInfo.label?.trim() || deviceName(p.deviceInfo.userAgent),
               })),
             ]}
-            onAdd={() => setInviteOpen((open) => !open)}
+            onAdd={() => onInviteOpen(!inviteOpen)}
             addRef={inviteAnchor}
             addExpanded={inviteOpen}
           />
@@ -165,7 +202,7 @@ export function DeskTopBar({
             <InvitePopover
               joinUrl={joinUrl}
               onClose={(restoreFocus) => {
-                setInviteOpen(false);
+                onInviteOpen(false);
                 if (restoreFocus) inviteAnchor.current?.focus();
               }}
             />

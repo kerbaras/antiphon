@@ -113,6 +113,20 @@ export function SinksPanel({
               }
             />
             {desk.finalSeq !== null && <MonoReadout label="final seq" value={desk.finalSeq} />}
+            {/* The mic behind this stream (W5-B): the seq-0 header's
+                device description, as archived — with W4-F it carries the
+                picked input's label. Absent = the archive holds none
+                (pre-mic-metadata stream), so no line rather than a guess. */}
+            {server?.deviceDesc && (
+              <MonoReadout
+                label="mic"
+                value={
+                  <span className="block max-w-[160px] truncate" title={server.deviceDesc}>
+                    {server.deviceDesc}
+                  </span>
+                }
+              />
+            )}
             {drift && <MonoReadout label="drift" value={driftReadout(drift)} />}
             {incomplete && (
               <p className="font-mono text-[9px] leading-relaxed text-warn">

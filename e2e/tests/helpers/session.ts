@@ -24,6 +24,8 @@ export interface ServerStreamStatus {
   streamId: string;
   takeId: string;
   peerId: string | null;
+  /** Archived seq-0 device/mic description (W4-F/W5-B); null pre-W4-F. */
+  deviceDesc: string | null;
   chunkCount: number;
   chwm: number | null;
   holes: Array<[number, number]>;

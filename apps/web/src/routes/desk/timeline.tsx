@@ -60,6 +60,7 @@ export function TimelineSection({
   onLaneMenu,
   onSeekTimeline,
   onAddMarkerAt,
+  takeMicOf,
 }: {
   sessionId: string;
   timelineRef: RefObject<HTMLDivElement | null>;
@@ -93,6 +94,12 @@ export function TimelineSection({
   onLaneMenu: (key: string, x: number, y: number) => void;
   onSeekTimeline: (sec: number) => void;
   onAddMarkerAt: (atSec: number) => void;
+  /** The archived mic(s) behind this lane's AUDIBLE clips in the loaded
+   * take (W5-B): seq-0 deviceDesc, distinct mics enumerated — orphaned
+   * clips never contribute (QA F1). undefined = no claim (no audible
+   * clip, or the archive hasn't answered yet — QA F3); null = the archive
+   * answered without a description (pre-mic-metadata stream). */
+  takeMicOf: (row: TrackRow) => string | null | undefined;
 }) {
   // LOW — anchored zoom. A zoom change rescales every lane x, so with a raw
   // scrollLeft the content slides under the operator's eye. Correct the
@@ -238,6 +245,7 @@ export function TimelineSection({
             recording={recording}
             armed={recording ? row.armed : !disarmedPeers.includes(row.key)}
             selected={row.key === selectedLaneKey}
+            takeMic={takeMicOf(row)}
             onSelect={() => onSelectLane(row.key)}
             onLaneMenu={(x, y) => onLaneMenu(row.key, x, y)}
             onToggleArm={() => getDeskSession(sessionId).toggleArm(row.key)}
@@ -407,6 +415,7 @@ function TimelineRow({
   recording,
   armed,
   selected,
+  takeMic,
   onSelect,
   onLaneMenu,
   onToggleArm,
@@ -425,6 +434,9 @@ function TimelineRow({
   /** Lane selection (W4-E): press anywhere on the header — same accent
    * ring as the lane's mixer strip; S/M then key on this lane. */
   selected: boolean;
+  /** Archived mic of this lane's clip in the loaded take (see
+   * TimelineSection prop) — tooltips the provenance chip. */
+  takeMic: string | null | undefined;
   onSelect: () => void;
   /** Right-click: the lane context menu at the cursor (W4-E). */
   onLaneMenu: (x: number, y: number) => void;
@@ -479,7 +491,23 @@ function TimelineRow({
               onClick={onToggleArm}
             />
             {row.peerLabel && (
-              <span className="ml-[3px] flex min-w-0 items-center gap-1 rounded-[10px] border border-edge bg-[#17181a] py-px pr-[7px] pl-[2px]">
+              // The provenance chip also answers "which mic?" for the
+              // loaded take (W5-B): the stream's archived seq-0 device
+              // description as a tooltip — honestly absent when the lane
+              // has no clip in that take, honestly unknown when the
+              // archive holds no description for it.
+              <span
+                {...(takeMic !== undefined
+                  ? {
+                      title:
+                        takeMic !== null
+                          ? `Mic on the loaded take — ${takeMic}`
+                          : "Mic on the loaded take — unknown (not in the archive)",
+                      "data-take-mic": takeMic ?? "unknown",
+                    }
+                  : {})}
+                className="ml-[3px] flex min-w-0 items-center gap-1 rounded-[10px] border border-edge bg-[#17181a] py-px pr-[7px] pl-[2px]"
+              >
                 <span
                   className="relative grid size-[14px] flex-none place-items-center rounded-full text-[7px] font-bold text-void"
                   style={{ background: row.color }}

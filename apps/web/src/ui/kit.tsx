@@ -293,14 +293,19 @@ export function StyledQr({ value, className }: { value: string; className?: stri
   );
 }
 
-/** The ANTIPHON wordmark block from the reference top bar. */
-export function Wordmark() {
+/** The ANTIPHON wordmark block from the reference top bar. `textClassName`
+ * lets a dense host degrade gracefully (the desk top bar hides the lettering
+ * at narrow widths and keeps the mark — the session title is the working
+ * identity there). */
+export function Wordmark({ textClassName }: { textClassName?: string }) {
   return (
     <div className="flex items-center gap-2">
-      <div className="grid size-[22px] place-items-center rounded-md bg-accent text-[12px] font-bold text-white">
+      <div className="grid size-[22px] flex-none place-items-center rounded-md bg-accent text-[12px] font-bold text-white">
         A
       </div>
-      <div className="text-[13px] font-bold tracking-[2.5px] text-text-hi">ANTIPHON</div>
+      <div className={cx("text-[13px] font-bold tracking-[2.5px] text-text-hi", textClassName)}>
+        ANTIPHON
+      </div>
     </div>
   );
 }

@@ -35,7 +35,7 @@ import { SongsPanel } from "./songs-panel";
 import { type Marquee, TimelineSection } from "./timeline";
 import type { RenderRange } from "./timeline-math";
 import { DeskFatalPanel, DeskToolbar } from "./toolbar";
-import { DeskTopBar } from "./top-bar";
+import { DeskTopBar, playActionReady } from "./top-bar";
 import {
   applyLaneMoves,
   deviceName,
@@ -120,6 +120,10 @@ function Desk({ sessionId }: { sessionId: string }) {
   const orphanedStreams = useOrphanedStreams(state.deskStatus, serverStatus, state.activeTakeId);
   const [zoom, setZoom] = useState(1);
   const [tab, setTab] = useState<RailTab>("performers");
+  // Invite popover state lives here (W5-B): the top bar's "+" drives it,
+  // and the performers tab's wall-poster QR yields while it is open — one
+  // loud QR at a time (the ≤1000px dual-QR stack read as a choice).
+  const [inviteOpen, setInviteOpen] = useState(false);
   const pxPerSec = 24 * zoom;
 
   const recording = state.activeTakeId !== null;
@@ -477,6 +481,33 @@ function Desk({ sessionId }: { sessionId: string }) {
     }
     return (streamId: string): string | undefined => names.get(streamId);
   }, [rows]);
+
+  /** Lane → the archived mic(s) behind its AUDIBLE clips in the loaded
+   * take (W5-B, W4-F follow-up): the seq-0 deviceDesc via the server-
+   * status poll. Audible = the take's complete streams — exactly the set
+   * the load effect hands the player (selectedStreamIds) — sorted, so the
+   * claim is deterministic regardless of worker enumeration order, and an
+   * F9 orphan sharing the lane can never lend the chip ITS mic (QA F1:
+   * the orphan is unplayable; the operator hears the fresh stream). A
+   * legit multi-clip lane enumerates its distinct mics. undefined = no
+   * claim — no audible clip, or the archive hasn't answered for any of
+   * them yet (QA F3); null = the archive answered but holds no device
+   * description (pre-mic-metadata stream). Tooltips the lane-header chip;
+   * the sinks panel shows the raw field per stream, orphans included. */
+  const takeMicOf = (row: TrackRow): string | null | undefined => {
+    const audible = row.streams
+      .filter((s) => s.takeId === selectedTakeId && selectedStreamIds.includes(s.streamId))
+      .map((s) => s.streamId)
+      .sort();
+    const claims: Array<string | null> = [];
+    for (const streamId of audible) {
+      const status = serverStatus.get(streamId);
+      if (status !== undefined) claims.push(status.deviceDesc);
+    }
+    if (claims.length === 0) return undefined;
+    const mics = [...new Set(claims.filter((desc): desc is string => desc !== null))];
+    return mics.length > 0 ? mics.join(", ") : null;
+  };
 
   /** The selected take's streams as comment-pin targets, labeled by lane. */
   const commentLanes = useMemo(() => {
@@ -848,7 +879,11 @@ function Desk({ sessionId }: { sessionId: string }) {
       if (e.code === "Space") {
         e.preventDefault();
         if (recording) getDeskSession(sessionId).stopTake();
-        else if (playerLoaded) getPlayer().toggle();
+        // Space mirrors THE transport button exactly (W5-B): while a take
+        // decodes, ▶ is disabled — so Space is a no-op too. Same predicate
+        // as the button's disabled state (parity by construction), read on
+        // the LIVE snapshot so a decode that began this frame already gates.
+        else if (playActionReady(playerLoaded, getPlayer().snapshot())) getPlayer().toggle();
         return;
       }
       // S: solo the selected lane (W4-E).
@@ -1230,7 +1265,10 @@ function Desk({ sessionId }: { sessionId: string }) {
   };
 
   return (
-    <main className="grid h-dvh grid-cols-[minmax(0,1fr)] grid-rows-[48px_40px_1fr_264px] overflow-hidden bg-bg text-[12px]">
+    // min-w floor (W5-B): below 520px no shed tier can save the top bar or
+    // toolbar from self-overlap, so the desk keeps its shape and the page
+    // scrolls — a desktop tool degrading honestly, not exploding.
+    <main className="grid h-dvh min-w-[520px] grid-cols-[minmax(0,1fr)] grid-rows-[48px_40px_1fr_264px] overflow-hidden bg-bg text-[12px]">
       <DeskTopBar
         sessionId={sessionId}
         joinUrl={joinUrl}
@@ -1247,6 +1285,8 @@ function Desk({ sessionId }: { sessionId: string }) {
         takeCount={takes.size}
         streamCount={state.deskStatus.length}
         exportMenu={exportMenu}
+        inviteOpen={inviteOpen}
+        onInviteOpen={setInviteOpen}
       />
 
       <DeskToolbar
@@ -1296,6 +1336,7 @@ function Desk({ sessionId }: { sessionId: string }) {
           onLaneMenu={openLaneMenu}
           onSeekTimeline={seekTimeline}
           onAddMarkerAt={(atSec) => takeMarkers.addAt(atSec)}
+          takeMicOf={takeMicOf}
         />
 
         {/* -------- right rail (272px) -------- */}
@@ -1320,6 +1361,7 @@ function Desk({ sessionId }: { sessionId: string }) {
               deskInput={deskInput}
               deskMidi={deskMidi}
               midiColor={TRACK_COLORS[rows.length % TRACK_COLORS.length] as string}
+              inviteOpen={inviteOpen}
             />
           ) : tab === "songs" ? (
             <SongsPanel

@@ -92,7 +92,8 @@ export function DeskToolbar({
     <div className="flex items-center justify-between border-b border-divider bg-raised px-3.5">
       <div className="flex min-w-0 items-center gap-3.5">
         <ToolGroup />
-        <div className="h-[18px] w-px bg-edge" />
+        {/* Divider belongs to SnapGrid — it sheds on the same tier (W5-B). */}
+        <div className="hidden h-[18px] w-px bg-edge min-[1200px]:block" />
         <SnapGrid />
         <button
           type="button"
@@ -105,7 +106,10 @@ export function DeskToolbar({
           data-align-state={alignState}
           disabled={!playerLoaded || playerSnap.aligning || recording}
           onClick={() => void getPlayer().align(true)}
-          className={`flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[10.5px] font-semibold transition-colors disabled:cursor-not-allowed ${
+          // whitespace-nowrap (W5-B seam): under flex squeeze the pill used
+          // to two-line ("align / declined") and break the 40px row — the
+          // verdict CHIP is the row's designated flexible child, not this.
+          className={`flex items-center gap-1.5 whitespace-nowrap rounded-full border px-2.5 py-1 text-[10.5px] font-semibold transition-colors disabled:cursor-not-allowed ${
             alignState === "idle" && lastChirpAt
               ? "border-accent/50 text-accent/80 hover:text-accent"
               : ALIGN_BUTTON_STYLES[alignState]
@@ -149,7 +153,7 @@ export function DeskToolbar({
           title="Add song marker at playhead (M) — or double-click the ruler"
           disabled={!markersUsable}
           onClick={onAddMarker}
-          className="flex items-center gap-1.5 rounded-full border border-edge-strong px-2.5 py-1 text-[10.5px] font-semibold text-text-mute transition-colors hover:text-text-hi disabled:cursor-not-allowed disabled:opacity-50"
+          className="flex items-center gap-1.5 whitespace-nowrap rounded-full border border-edge-strong px-2.5 py-1 text-[10.5px] font-semibold text-text-mute transition-colors hover:text-text-hi disabled:cursor-not-allowed disabled:opacity-50"
         >
           <span className="text-[8px] text-accent/80">◆</span>
           marker
@@ -160,7 +164,7 @@ export function DeskToolbar({
           title="Comment at playhead (C)"
           disabled={!markersUsable}
           onClick={onOpenComments}
-          className="flex items-center gap-1.5 rounded-full border border-edge-strong px-2.5 py-1 text-[10.5px] font-semibold text-text-mute transition-colors hover:text-text-hi disabled:cursor-not-allowed disabled:opacity-50"
+          className="flex items-center gap-1.5 whitespace-nowrap rounded-full border border-edge-strong px-2.5 py-1 text-[10.5px] font-semibold text-text-mute transition-colors hover:text-text-hi disabled:cursor-not-allowed disabled:opacity-50"
         >
           <span className="text-[8px] text-pin/80">●</span>
           comment
