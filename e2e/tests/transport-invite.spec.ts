@@ -8,7 +8,8 @@
 // (2) The avatar-stack "+" replaced both the Share button and the sidebar
 //     "Invite performer" toggle: it opens an anchored popover with the join
 //     QR + link + copy (clipboard-verified), dismissed by Esc (focus back
-//     on the "+") and by click-away.
+//     on the "+") and by click-away. Since W6-A the popover is the desk's
+//     ONLY QR surface — the performers tab's wall-poster card is gone.
 // (3) QA MAJOR regression: while the popover is open, the desk's global
 //     shortcuts must yield to the dialog — Space on the auto-focused Copy
 //     button copies natively (no playback behind the card), M drops no
@@ -152,17 +153,17 @@ test("the + invite popover: QR + link, copy feedback, Esc/click-away dismiss", a
   await desk.goto(`/session/${sessionId}`);
   await expect(desk.getByText("ANTIPHON", { exact: true })).toBeVisible();
 
-  // The Share button and the sidebar "+ Invite performer" toggle are gone:
-  // the avatar-stack "+" is the ONE invite affordance. (The Performers tab
-  // keeps its always-on QR card for the wall-poster case — selected
-  // explicitly, not assumed as the default, then asserted so the popover's
-  // QR provably isn't counted twice.)
+  // The Share button, the sidebar "+ Invite performer" toggle AND the
+  // performers tab's wall-poster QR card are gone (W4-D, then W6-A): the
+  // avatar-stack "+" is the ONE invite affordance. Performers tab selected
+  // explicitly so the no-QR claim is about the panel, not about which tab
+  // happened to be up.
   await expect(desk.getByRole("button", { name: "Share" })).toHaveCount(0);
   await expect(desk.getByRole("button", { name: /\+ Invite performer/ })).toHaveCount(0);
   const invite = desk.getByRole("button", { name: "Invite performer", exact: true });
   await expect(invite).toBeVisible();
   await desk.getByRole("button", { name: /^performers/i }).click();
-  await expect(desk.locator('svg[aria-label="Join QR code"]')).toHaveCount(1);
+  await expect(desk.locator('svg[aria-label="Join QR code"]')).toHaveCount(0);
 
   // Open: QR + join link, focus straight on the one action in the card.
   const dialog = desk.getByRole("dialog", { name: "Invite performers" });
@@ -171,6 +172,9 @@ test("the + invite popover: QR + link, copy feedback, Esc/click-away dismiss", a
   await expect(dialog).toBeVisible();
   await expect(invite).toHaveAttribute("aria-expanded", "true");
   await expect(dialog.locator('svg[aria-label="Join QR code"]')).toBeVisible();
+  // ...and page-wide that popover QR is the only one (the tab behind it
+  // contributes none).
+  await expect(desk.locator('svg[aria-label="Join QR code"]')).toHaveCount(1);
   await expect(dialog.getByText(`/join/${sessionId}`)).toBeVisible();
   const copy = dialog.getByRole("button", { name: "Copy link" });
   await expect(copy).toBeFocused();
@@ -196,42 +200,34 @@ test("the + invite popover: QR + link, copy feedback, Esc/click-away dismiss", a
   await desk.close();
 });
 
-// W5-B — the W4-D parked nit: at ≤1000px the open popover stacks straight
-// over the performers tab's wall-poster QR — two loud QRs read as a choice
-// that doesn't exist. The poster now yields while the popover is open
-// (dimmed + desaturated + aria-hidden, geometry stable) and returns when it
-// closes. Guarded at 1000 and at full width — the popover is the primary
-// invite surface everywhere, not just where the two happen to overlap.
+// W6-A — the wall poster is gone, and with it the W5-B yield choreography:
+// the performers tab used to carry an always-visible QR card that dimmed
+// while the popover was open — chrome whose whole job was apologizing for
+// its twin. The operator called it: the tab renders NO QR, ever; with the
+// popover open exactly one QR exists page-wide. Guarded at 1000 (where the
+// two used to stack into a which-one-do-I-scan puzzle) and at full width.
 for (const width of [1000, 1280]) {
-  test(`the wall-poster QR yields to the open invite popover at ${width}px`, async ({ page }) => {
+  test(`the + popover is the only QR surface at ${width}px`, async ({ page }) => {
     await page.setViewportSize({ width, height: 800 });
     const sessionId = crypto.randomUUID();
     await page.goto(`/session/${sessionId}`);
     await expect(page.getByRole("button", { name: "Record take" })).toBeVisible();
     await page.getByRole("button", { name: /^performers/i }).click();
 
-    const poster = page.locator("[data-qr-yielding]");
-    await expect(poster).toHaveAttribute("data-qr-yielding", "false");
+    // No poster in the tab — and none of its retired yield plumbing either.
+    const anyQr = page.locator('svg[aria-label="Join QR code"]');
+    await expect(anyQr).toHaveCount(0);
+    await expect(page.locator("[data-qr-yielding]")).toHaveCount(0);
 
     await page.getByRole("button", { name: "Invite performer", exact: true }).click();
     const dialog = page.getByRole("dialog", { name: "Invite performers" });
     await expect(dialog.locator('svg[aria-label="Join QR code"]')).toBeVisible();
-    await expect(poster).toHaveAttribute("data-qr-yielding", "true");
-    await expect(poster).toHaveAttribute("aria-hidden", "true");
-    // The dim is real (0.2 after the 150ms transition), not just declared.
-    await expect
-      .poll(async () => await poster.evaluate((el) => getComputedStyle(el).opacity))
-      .toBe("0.2");
+    // Page-wide count: the popover's QR is the one and only.
+    await expect(anyQr).toHaveCount(1);
 
-    // Evidence screenshot for design review (the QA finding was visual).
-    await page.screenshot({ path: test.info().outputPath(`dual-qr-${width}.png`) });
-
-    // Closing the popover brings the poster back to full strength.
+    // Closing the popover leaves the desk QR-free again.
     await page.keyboard.press("Escape");
     await expect(dialog).toHaveCount(0);
-    await expect(poster).toHaveAttribute("data-qr-yielding", "false");
-    await expect
-      .poll(async () => await poster.evaluate((el) => getComputedStyle(el).opacity))
-      .toBe("1");
+    await expect(anyQr).toHaveCount(0);
   });
 }

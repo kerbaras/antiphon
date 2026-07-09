@@ -1,7 +1,9 @@
 // The styled QR (rounded dots, inverted palette, center logo) must still be
 // machine-readable — pretty is worthless if phones can't scan it. Rasterize
 // the live SVG onto its card background and decode with ZXing, the engine
-// class real camera scanners are built on.
+// class real camera scanners are built on. The desk's one QR surface is the
+// top-bar "+" invite popover (W6-A retired the sidebar wall-poster copy),
+// so that is the QR under test.
 
 import { expect, test } from "@playwright/test";
 import { readBarcodes } from "zxing-wasm/reader";
@@ -10,6 +12,7 @@ import { WEB_PORT } from "../ports";
 test("styled join QR decodes to the join URL", async ({ page }) => {
   const sessionId = crypto.randomUUID();
   await page.goto(`/session/${sessionId}`);
+  await page.getByRole("button", { name: "Invite performer", exact: true }).click();
   const svg = page.locator('svg[aria-label="Join QR code"]');
   await expect(svg).toBeVisible();
 

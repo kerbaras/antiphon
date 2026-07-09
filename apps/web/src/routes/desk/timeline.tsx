@@ -139,10 +139,11 @@ export function TimelineSection({
           buttons + space bar are the keyboard path. min-h-full: the empty
           space below the last lane is timeline too (W4-C) — marquees and
           click-to-seek must work from the whole scrollable area, not just
-          the rows' own height. */}
+          the rows' own height. flex-col so the header-band filler after
+          the last lane can claim that leftover height (W6-A). */}
       <div
         ref={timelineRef}
-        className="relative min-h-full min-w-full"
+        className="relative flex min-h-full min-w-full flex-col"
         style={{ width: laneWidth + TRACK_HEADER_W }}
         onPointerDown={onLanePointerDown}
         role="presentation"
@@ -262,6 +263,25 @@ export function TimelineSection({
             selected take captured events. Sits below every audio row, so
             the marquee's row-indexed hit rects stay untouched. */}
         {midiLane && <MidiLaneRow lane={midiLane} pxPerSec={pxPerSec} laneWidth={laneWidth} />}
+
+        {/* Header-band filler (W6-A): the sticky row headers end with the
+            last lane, but the container is min-h-full — the leftover height
+            below used to expose whatever scrolled through it (playhead and
+            marker hairlines span the full container; grid and clips slide
+            by at content x). This flex-1 row extends the band to the
+            container's bottom edge: same sticky-left, same opaque bg-card,
+            same z-[5] over the z-[3]/z-[4] overlays — one unbroken column
+            at every scroll position, zero-height once lanes fill the view.
+            Pointer contract unchanged: presses here bubble to the W4-C
+            surface, where the viewport-space x-guard already excludes the
+            band from seek/marquee; the lane-side remainder stays live. */}
+        <div className="flex min-h-0 flex-1" role="presentation">
+          <div
+            data-header-filler
+            className="sticky left-0 z-[5] flex-none border-r border-divider bg-card"
+            style={{ width: TRACK_HEADER_W }}
+          />
+        </div>
 
         {/* Marquee selection rectangle */}
         {marquee && (

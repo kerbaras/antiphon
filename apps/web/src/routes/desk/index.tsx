@@ -120,10 +120,6 @@ function Desk({ sessionId }: { sessionId: string }) {
   const orphanedStreams = useOrphanedStreams(state.deskStatus, serverStatus, state.activeTakeId);
   const [zoom, setZoom] = useState(1);
   const [tab, setTab] = useState<RailTab>("performers");
-  // Invite popover state lives here (W5-B): the top bar's "+" drives it,
-  // and the performers tab's wall-poster QR yields while it is open — one
-  // loud QR at a time (the ≤1000px dual-QR stack read as a choice).
-  const [inviteOpen, setInviteOpen] = useState(false);
   const pxPerSec = 24 * zoom;
 
   const recording = state.activeTakeId !== null;
@@ -1285,8 +1281,6 @@ function Desk({ sessionId }: { sessionId: string }) {
         takeCount={takes.size}
         streamCount={state.deskStatus.length}
         exportMenu={exportMenu}
-        inviteOpen={inviteOpen}
-        onInviteOpen={setInviteOpen}
       />
 
       <DeskToolbar
@@ -1354,14 +1348,12 @@ function Desk({ sessionId }: { sessionId: string }) {
               sessionId={sessionId}
               recorders={phones}
               rows={rows}
-              joinUrl={joinUrl}
               activeTakeId={state.activeTakeId}
               streams={state.streams}
               levelForRow={levelFor}
               deskInput={deskInput}
               deskMidi={deskMidi}
               midiColor={TRACK_COLORS[rows.length % TRACK_COLORS.length] as string}
-              inviteOpen={inviteOpen}
             />
           ) : tab === "songs" ? (
             <SongsPanel

@@ -1,7 +1,7 @@
-// Right-rail Performers panel: connected phones, the desk input, QR invite.
+// Right-rail Performers panel: connected phones, the desk input.
 
 import type { PeerInfo } from "@antiphon/protocol";
-import { Avatar, StatusPill, StyledQr, VUMeter } from "../../ui/kit";
+import { Avatar, StatusPill, VUMeter } from "../../ui/kit";
 import { DeskInputBlock } from "./desk-input-block";
 import { MidiInputBlock } from "./midi-input-block";
 import { deviceName, initialsOf, TRACK_COLORS, type TrackRow } from "./track-model";
@@ -13,19 +13,16 @@ export function PerformersPanel({
   sessionId,
   recorders,
   rows,
-  joinUrl,
   activeTakeId,
   streams,
   levelForRow,
   deskInput,
   deskMidi,
   midiColor,
-  inviteOpen,
 }: {
   sessionId: string;
   recorders: PeerInfo[];
   rows: TrackRow[];
-  joinUrl: string;
   activeTakeId: string | null;
   streams: Array<{ streamId: string; takeId: string; peerId: string | null }>;
   levelForRow: (row: TrackRow) => number;
@@ -33,9 +30,6 @@ export function PerformersPanel({
   deskMidi: DeskMidiState;
   /** Track-palette color the MIDI lane draws with (card avatar matches). */
   midiColor: string;
-  /** The top-bar invite popover is open (W5-B): the wall-poster QR below
-   * yields to it — two loud QRs read as a choice that doesn't exist. */
-  inviteOpen: boolean;
 }) {
   const session = getDeskSession(sessionId);
 
@@ -104,24 +98,10 @@ export function PerformersPanel({
         color={midiColor}
       />
 
-      {/* The join QR stays put in the tab view — a wall poster the desk can
-          leave up for late joiners. The top-bar "+" popover is the primary
-          invite surface (W4-D retired this panel's toggle button); while
-          that popover is open THIS card recedes (W5-B): at ≤1000px the two
-          QRs otherwise stack into a which-one-do-I-scan puzzle. Dim, not
-          remove — the poster is still honestly there, geometry stable. */}
-      <div
-        data-qr-yielding={inviteOpen}
-        aria-hidden={inviteOpen}
-        className={`mt-0.5 rounded-lg border border-edge-card bg-card p-3 transition-opacity duration-150 ${
-          inviteOpen ? "opacity-20 grayscale" : ""
-        }`}
-      >
-        <StyledQr value={joinUrl} className="w-full" />
-        <p className="mt-2 break-all font-mono text-[9px] leading-relaxed text-text-dim">
-          {joinUrl}
-        </p>
-      </div>
+      {/* No QR here: the top-bar "+" popover is THE invite surface (W4-D).
+          This tab used to keep a wall-poster copy, which W5-B then had to
+          dim whenever the popover opened — chrome whose whole job was
+          apologizing for its twin. The operator called it: gone (W6-A). */}
       <p className="mt-auto px-1 pt-1 font-mono text-[9px] text-text-faint">
         sync {session.snapshot().serverSync}
       </p>

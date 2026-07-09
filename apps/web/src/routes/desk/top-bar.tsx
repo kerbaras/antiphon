@@ -3,7 +3,7 @@
 // as in the prototype.
 
 import type { PeerInfo } from "@antiphon/protocol";
-import { useRef } from "react";
+import { useRef, useState } from "react";
 import type { DeskSessionState } from "../../net/desk-session";
 import { Wordmark } from "../../ui/kit";
 import { AvatarStack, InfoChip, Timecode, TransportButton, TransportGroup } from "./daw";
@@ -38,8 +38,6 @@ export function DeskTopBar({
   takeCount,
   streamCount,
   exportMenu,
-  inviteOpen,
-  onInviteOpen,
 }: {
   sessionId: string;
   joinUrl: string;
@@ -57,12 +55,12 @@ export function DeskTopBar({
   takeCount: number;
   streamCount: number;
   exportMenu: ExportMenuProps;
-  /** The "+" on the avatar stack is THE invite affordance (W4-D). State
-   * lives with the desk orchestrator (W5-B): while the popover is open the
-   * performers tab's wall-poster QR yields, so the two QRs never compete. */
-  inviteOpen: boolean;
-  onInviteOpen: (open: boolean) => void;
 }) {
+  // The "+" on the avatar stack is THE invite affordance (W4-D) — and its
+  // popover holds the desk's ONLY join QR (W6-A retired the performers
+  // tab's wall-poster copy, and with it the W5-B yield plumbing that had
+  // this state living with the orchestrator). Nobody else cares: local.
+  const [inviteOpen, setInviteOpen] = useState(false);
   const inviteAnchor = useRef<HTMLButtonElement>(null);
 
   return (
@@ -194,7 +192,7 @@ export function DeskTopBar({
                 title: p.deviceInfo.label?.trim() || deviceName(p.deviceInfo.userAgent),
               })),
             ]}
-            onAdd={() => onInviteOpen(!inviteOpen)}
+            onAdd={() => setInviteOpen(!inviteOpen)}
             addRef={inviteAnchor}
             addExpanded={inviteOpen}
           />
@@ -202,7 +200,7 @@ export function DeskTopBar({
             <InvitePopover
               joinUrl={joinUrl}
               onClose={(restoreFocus) => {
-                onInviteOpen(false);
+                setInviteOpen(false);
                 if (restoreFocus) inviteAnchor.current?.focus();
               }}
             />
