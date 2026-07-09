@@ -5,6 +5,7 @@ import { useCallback, useSyncExternalStore } from "react";
 import { CaptureController, type CaptureSnapshot } from "../../audio/capture-controller";
 import { setNickname } from "../../net/device-identity";
 import { RecorderSession, type RecorderSessionState } from "../../net/recorder-session";
+import { loadMicPreference } from "./mic-preference";
 
 let controller: CaptureController | null = null;
 let latest: CaptureSnapshot | null = null;
@@ -51,6 +52,26 @@ export function getCaptureController(): CaptureController {
   return controller;
 }
 
+/** Start the pipeline on the persisted mic (W4-F), falling back to the
+ * default input when the saved device is gone — deviceIds rotate on iOS
+ * Safari, and a stale preference must never cost a take. Must run inside
+ * the user gesture (iOS). */
+export async function startCapture(): Promise<void> {
+  const ctl = getCaptureController();
+  const pref = loadMicPreference();
+  if (!pref) return ctl.start();
+  try {
+    await ctl.start({ deviceId: pref.deviceId });
+  } catch (e) {
+    // Permission denials aren't staleness — retrying would just re-prompt.
+    if (e instanceof DOMException && e.name === "NotAllowedError") throw e;
+    // Stale/rotated id (OverconstrainedError et al): default mic instead.
+    // The preference itself is kept — the picker heals it by label once
+    // the post-permission enumeration is in (see mic-picker.tsx).
+    await ctl.start();
+  }
+}
+
 /** Join the session (idempotent): transports come up; capture stays local
  * until the desk starts a take. */
 export function joinSession(sessionId: string): RecorderSession {
@@ -89,6 +110,7 @@ const EMPTY: CaptureSnapshot = {
   localChunks: 0,
   finalSeq: null,
   error: null,
+  takeOpen: false,
 };
 
 export function useCaptureSnapshot(): CaptureSnapshot {

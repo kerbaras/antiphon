@@ -19,12 +19,14 @@ import {
   VUMeter,
   Wordmark,
 } from "../../ui/kit";
+import { MicPicker } from "./mic-picker";
 import { useSessionExistence } from "./session-existence";
 import { formatClock } from "./timecode";
 import {
   getCaptureController,
   joinSession,
   renameSelf,
+  startCapture,
   takeOverSession,
   useCaptureSnapshot,
   useRecorderSessionState,
@@ -49,6 +51,12 @@ export function JoinRoute() {
   const capturing = snap.contextSampleRate !== null;
   const recording = state === "streaming";
   const inSession = sessionState !== null;
+  // A take is open for this stream (W4-F picker lock). snap.takeOpen is
+  // the controller's SYNCHRONOUS latch (set the instant arm() is invoked,
+  // held through draining) — never the ~250ms-lagged worker stats, which
+  // would leave the picker enabled into a rolling take (QA F1). The
+  // session's activeTakeId is belt-and-braces for the signaling window.
+  const takeOpen = snap.takeOpen || (sessionState?.activeTakeId ?? null) !== null;
 
   const seconds =
     snap.stats && snap.stats.sampleRate > 0 ? snap.stats.samplesIn / snap.stats.sampleRate : 0;
@@ -56,7 +64,7 @@ export function JoinRoute() {
   async function enableMic() {
     setBusy(true);
     try {
-      await getCaptureController().start();
+      await startCapture();
       if (uuid) joinSession(uuid);
     } finally {
       setBusy(false);
@@ -92,7 +100,7 @@ export function JoinRoute() {
       // Deliberate supersede-back: re-acquire the mic (this click is the
       // required user gesture), then reopen signaling under our identity —
       // the other tab gets the fatal this tab just lived through.
-      await getCaptureController().start();
+      await startCapture();
       takeOverSession();
     } finally {
       setBusy(false);
@@ -230,14 +238,11 @@ export function JoinRoute() {
           </div>
         ) : (
           <div className="mt-3 flex flex-col gap-2">
-            <div className="flex items-center justify-between">
-              <span className="max-w-[60%] truncate text-[11px] text-text-mute">
-                {snap.flags?.deviceLabel}
-              </span>
-              <span className="font-mono text-[10px] text-text-dim">
-                {snap.contextSampleRate} Hz
-              </span>
-            </div>
+            {/* Single input: static label. Several: the switch (W4-F).
+                Owns the whole row incl. the Hz readout, so the readout
+                stays centered on the select line when the lock note adds
+                a second line below. */}
+            <MicPicker flags={snap.flags} locked={takeOpen} sampleRate={snap.contextSampleRate} />
             <div className="mt-1 grid grid-cols-3 gap-2">
               <FlagBadge label="echo cancel" value={snap.flags?.echoCancellation} />
               <FlagBadge label="noise supp" value={snap.flags?.noiseSuppression} />
