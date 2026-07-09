@@ -25,7 +25,10 @@ import {
 } from "./eq";
 import type { RenderModel } from "./render";
 import {
+  type AlignLag,
   type AlignMethod,
+  type AlignShifts,
+  alignShifts,
   normalizeAlignDeltas,
   planSource,
   type TrackTiming,
@@ -789,23 +792,36 @@ export class TakePlayer {
     return (this.alignDelta(track) + driftSamples) / track.buffer.sampleRate;
   }
 
+  /** The applied alignment lags exactly as the schedule math consumes
+   * them — the single source for both the head-trim deltas below and the
+   * visual shift composition (W6-C). */
+  private appliedAlignLags(): AlignLag[] {
+    return [...this.tracks.values()]
+      .filter((t) => t.alignment?.applied)
+      .map((t) => ({
+        streamId: t.streamId,
+        lagSamples: t.alignment?.lagSamples ?? 0,
+        sampleRate: t.buffer.sampleRate,
+        method: t.alignment?.method ?? "chirp",
+      }));
+  }
+
   /** Samples to trim from each track's head so all aligned tracks share
    * the room clock — the modulo-repeat normalization lives in
    * timeline-math (shared with the offline render). Public as a pure
    * diagnostics readout (F7 e2e asserts restored deltas through it). */
   alignDeltas(): Map<string, number> {
     const spec = DEFAULT_CHIRP_SPEC;
-    return normalizeAlignDeltas(
-      [...this.tracks.values()]
-        .filter((t) => t.alignment?.applied)
-        .map((t) => ({
-          streamId: t.streamId,
-          lagSamples: t.alignment?.lagSamples ?? 0,
-          sampleRate: t.buffer.sampleRate,
-          method: t.alignment?.method ?? "chirp",
-        })),
-      (spec.durationMs + spec.gapMs) / 1_000,
-    );
+    return normalizeAlignDeltas(this.appliedAlignLags(), (spec.durationMs + spec.gapMs) / 1_000);
+  }
+
+  /** Visual composition of the loaded take's alignment (W6-C): per-clip
+   * box shifts + the room-zero anchor, derived from the SAME lag set the
+   * schedule trims with (timeline-math.alignShifts) — the timeline draws
+   * exactly what plays. Empty/zero until a verdict applies. */
+  alignShifts(): AlignShifts {
+    const spec = DEFAULT_CHIRP_SPEC;
+    return alignShifts(this.appliedAlignLags(), (spec.durationMs + spec.gapMs) / 1_000);
   }
 
   private alignDelta(track: Track): number {

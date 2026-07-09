@@ -14,7 +14,7 @@ export const MIDI_LANE_H = 28;
 export interface MidiLaneModel {
   notes: NoteSpan[];
   eventCount: number;
-  /** Take-timeline → arrangement drawing offset (selectedBaseSec). */
+  /** Take-timeline → arrangement drawing offset (timelineBaseSec). */
   baseSec: number;
   /** Fallback right edge for never-released notes (take duration). */
   durationSec: number;

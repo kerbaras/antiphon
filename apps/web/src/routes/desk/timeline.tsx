@@ -48,7 +48,7 @@ export function TimelineSection({
   markersUsable,
   activeSong,
   durationSec,
-  selectedBaseSec,
+  timelineBaseSec,
   markers,
   comments,
   midiLane,
@@ -77,7 +77,10 @@ export function TimelineSection({
   activeSong: Song | null;
   /** Loaded take duration (marker double-click bounds, song strip end). */
   durationSec: number;
-  selectedBaseSec: number;
+  /** Arrangement position of the take's room-time ZERO (W6-C): the base
+   * plus the alignment anchor — what every room-timeline drawing here
+   * (marker flags, comment ticks, song strip) adds to its atSec. */
+  timelineBaseSec: number;
   markers: Marker[];
   comments: TakeComment[];
   /** The selected take's captured MIDI (W3-C), when it has any. */
@@ -166,7 +169,7 @@ export function TimelineSection({
             onDoubleClick={(e) => {
               if (!markersUsable) return;
               const rect = e.currentTarget.getBoundingClientRect();
-              const atSec = (e.clientX - rect.left) / pxPerSec - selectedBaseSec;
+              const atSec = (e.clientX - rect.left) / pxPerSec - timelineBaseSec;
               if (atSec < 0 || atSec > durationSec) return;
               onAddMarkerAt(atSec);
             }}
@@ -184,7 +187,7 @@ export function TimelineSection({
               <div
                 className="pointer-events-none absolute top-0 z-[1] h-1 rounded-b-[2px] bg-accent opacity-70"
                 style={{
-                  left: (selectedBaseSec + activeSong.startSec) * pxPerSec,
+                  left: (timelineBaseSec + activeSong.startSec) * pxPerSec,
                   width: Math.max(
                     0,
                     ((activeSong.endSec ?? durationSec) - activeSong.startSec) * pxPerSec,
@@ -197,7 +200,7 @@ export function TimelineSection({
                 <MarkerFlag
                   key={marker.id}
                   marker={marker}
-                  x={(selectedBaseSec + marker.atSec) * pxPerSec}
+                  x={(timelineBaseSec + marker.atSec) * pxPerSec}
                   onSeek={() => getPlayer().seek(marker.atSec)}
                 />
               ))}
@@ -208,7 +211,7 @@ export function TimelineSection({
                 <CommentTick
                   key={comment.id}
                   comment={comment}
-                  x={(selectedBaseSec + comment.atSec) * pxPerSec}
+                  x={(timelineBaseSec + comment.atSec) * pxPerSec}
                   onSeek={() => getPlayer().seek(comment.atSec)}
                 />
               ))}
@@ -304,7 +307,7 @@ export function TimelineSection({
               key={marker.id}
               className="pointer-events-none absolute bottom-0 z-[3] w-px bg-accent/15"
               style={{
-                left: TRACK_HEADER_W + (selectedBaseSec + marker.atSec) * pxPerSec,
+                left: TRACK_HEADER_W + (timelineBaseSec + marker.atSec) * pxPerSec,
                 top: RULER_H,
               }}
             />

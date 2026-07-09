@@ -103,6 +103,39 @@ export function normalizeAlignDeltas(
   return out;
 }
 
+/** Visual composition of the applied head-trims (W6-C). Alignment is
+ * schedule-time only — stored audio and arrangement positions never move —
+ * but the desk must SHOW it: each clip box shifts right by how much later
+ * its stream started capturing, so aligned waveforms line up on screen.
+ * `shiftSec` is that per-stream box shift (0 for the earliest starter, the
+ * one with the maximal head-trim); `anchorSec` is where room-time zero
+ * lands relative to the take's arrangement base — the playhead (and every
+ * other room-timeline drawing) moves right with it, and it doubles as the
+ * shift for streams WITHOUT an applied lag (their audio starts exactly at
+ * room zero, unaligned). Both derive from the SAME normalized deltas the
+ * schedule trims with, so what is drawn is what plays by construction. */
+export interface AlignShifts {
+  /** streamId → seconds the clip box sits right of its arrangement position. */
+  shiftSec: Map<string, number>;
+  /** Arrangement offset of room-time zero (max head-trim, seconds ≥ 0). */
+  anchorSec: number;
+}
+
+export function alignShifts(lags: AlignLag[], repeatIntervalSec: number): AlignShifts {
+  const deltas = normalizeAlignDeltas(lags, repeatIntervalSec);
+  const rateOf = new Map(lags.map((l) => [l.streamId, l.sampleRate]));
+  const deltaSec = new Map<string, number>();
+  let anchorSec = 0;
+  for (const [streamId, delta] of deltas) {
+    const sec = delta / (rateOf.get(streamId) as number);
+    deltaSec.set(streamId, sec);
+    anchorSec = Math.max(anchorSec, sec);
+  }
+  const shiftSec = new Map<string, number>();
+  for (const [streamId, sec] of deltaSec) shiftSec.set(streamId, anchorSec - sec);
+  return { shiftSec, anchorSec };
+}
+
 /** Optional export range on the take's room timeline — the same domain as
  * player positions/seeks (0 = take head after alignment). W2-B song
  * markers render ranges through this; omitted bounds mean whole-take. */

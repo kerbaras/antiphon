@@ -10,10 +10,34 @@
 // Markers persist in localStorage per (session, take) and must survive a
 // desk reload alongside the OPFS archive rebuild.
 
+import { writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { expect, type Page, test } from "@playwright/test";
+import { sineWav } from "./helpers/align";
 import { parseWav, parseZip } from "./helpers/files";
 import { expectTakeConverged, joinAsRecorder, startTake, stopTake } from "./helpers/session";
+
+// Deterministic-decline mics (W6-C QA): the ruler dblclick below places a
+// marker by ruler coordinates assuming the take's room-zero anchor is 0.
+// The default beep grid stochastically crosses the content-accept bar
+// (helpers/align.ts sineWav rationale), and an applied verdict honestly
+// shifts the ruler mapping right by the anchor — a rare false accept
+// pushed the dblclick out of the take and no marker landed. The sine
+// declines by construction; every assertion stays strict.
+const sinePath = path.join(os.tmpdir(), `antiphon-markers-sine-${process.pid}.wav`);
+writeFileSync(sinePath, sineWav());
+
+test.use({
+  launchOptions: {
+    args: [
+      "--use-fake-device-for-media-stream",
+      "--use-fake-ui-for-media-stream",
+      `--use-file-for-fake-audio-capture=${sinePath}`,
+    ],
+  },
+});
 
 // ---- desk hook readers -------------------------------------------------------
 

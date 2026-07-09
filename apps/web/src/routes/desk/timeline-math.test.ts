@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  alignShifts,
   normalizeAlignDeltas,
   planSource,
   resolveRange,
@@ -142,6 +143,48 @@ describe("normalizeAlignDeltas", () => {
     expect(deltas.get("a")).toBe(0);
     expect(deltas.get("b")).toBe(400);
     expect(deltas.get("c")).toBe(500);
+  });
+});
+
+describe("alignShifts (W6-C visual composition)", () => {
+  it("is empty/zero without an applied verdict — clips stay put", () => {
+    expect(alignShifts([], 1)).toEqual({ shiftSec: new Map(), anchorSec: 0 });
+    // A lone lag yields no deltas (normalizeAlignDeltas rule) → no shifts.
+    expect(alignShifts([{ streamId: "a", lagSamples: 5_000, sampleRate: 48_000 }], 1)).toEqual({
+      shiftSec: new Map(),
+      anchorSec: 0,
+    });
+  });
+
+  it("shifts the LATER starter right; the earliest (max head-trim) stays put", () => {
+    // b holds 72 000 samples (1.5 s) more pre-roll: it started capturing
+    // 1.5 s earlier, so on an honest timeline REF sits 1.5 s to its right.
+    const { shiftSec, anchorSec } = alignShifts(
+      [
+        { streamId: "ref", lagSamples: 0, sampleRate: 48_000, method: "content" },
+        { streamId: "b", lagSamples: 72_000, sampleRate: 48_000, method: "content" },
+      ],
+      1,
+    );
+    expect(shiftSec.get("b")).toBe(0);
+    expect(shiftSec.get("ref")).toBeCloseTo(1.5, 12);
+    // Room-time zero draws at the base plus the max trim.
+    expect(anchorSec).toBeCloseTo(1.5, 12);
+  });
+
+  it("mirrors the schedule deltas exactly: shift + delta = anchor for every stream", () => {
+    const lags = [
+      { streamId: "a", lagSamples: 1_000, sampleRate: 48_000, method: "chirp" as const },
+      { streamId: "b", lagSamples: 49_400, sampleRate: 48_000, method: "chirp" as const },
+      { streamId: "c", lagSamples: 1_500, sampleRate: 48_000, method: "content" as const },
+    ];
+    const deltas = normalizeAlignDeltas(lags, 1);
+    const { shiftSec, anchorSec } = alignShifts(lags, 1);
+    for (const [streamId, delta] of deltas) {
+      expect((shiftSec.get(streamId) as number) + delta / 48_000).toBeCloseTo(anchorSec, 12);
+    }
+    // Every shift is a rightward (≥ 0) move — never off the left edge.
+    for (const shift of shiftSec.values()) expect(shift).toBeGreaterThanOrEqual(0);
   });
 });
 

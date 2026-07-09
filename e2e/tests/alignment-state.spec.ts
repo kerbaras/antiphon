@@ -2,8 +2,8 @@
 //
 // (a) Outcome states: alignment on a chirpless take must NOT end silent —
 //     it now AUTO-runs on take load (W4-B) and lands in a visible
-//     "declined" state carrying the measured confidence (fake mics emit a
-//     periodic tone: chirp correlation legitimately declines, and the
+//     "declined" state carrying the measured confidence (the fake mics
+//     replay a pure sine: chirp correlation legitimately declines, and the
 //     content fallback honestly declines too — a periodic signal matches
 //     at every period, so no unique lag exists). The near-identical-clips
 //     scenario that DOES content-align lives in content-align.spec.ts.
@@ -11,9 +11,35 @@
 //     survive a desk reload (doc + localStorage shadow) and reapply at
 //     schedule time WITHOUT re-decoding or re-correlating. Applied deltas
 //     are asserted non-null post-reload through the page hook.
+//
+// The DECLINED verdict must be deterministic (W6-C QA: third stochastic
+// "aligned" sighting this wave): Chromium's default beep grid carries
+// genuine aperiodic evidence at each capture's head that can cross the
+// 2.75 content bar, so the mics replay the shared constant-amplitude sine
+// fixture instead (helpers/align.ts sineWav — the W5-D topbar treatment;
+// full rationale there). Every assertion below stays strict.
 
+import { writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { expect, type Page, test } from "@playwright/test";
+import { sineWav } from "./helpers/align";
 import { expectTakeConverged, joinAsRecorder, startTake, stopTake } from "./helpers/session";
+
+// Written at module load: the browser (and its flags) launches per worker
+// AFTER the spec file is imported, so the path exists before capture.
+const sinePath = path.join(os.tmpdir(), `antiphon-alignment-state-sine-${process.pid}.wav`);
+writeFileSync(sinePath, sineWav());
+
+test.use({
+  launchOptions: {
+    args: [
+      "--use-fake-device-for-media-stream",
+      "--use-fake-ui-for-media-stream",
+      `--use-file-for-fake-audio-capture=${sinePath}`,
+    ],
+  },
+});
 
 interface TrackAlignmentView {
   streamId: string;

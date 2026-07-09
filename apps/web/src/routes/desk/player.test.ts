@@ -378,6 +378,25 @@ describe("content-alignment fallback (W4-B)", () => {
     });
   });
 
+  it("exposes the visual shifts of the same verdict (W6-C): shift + delta = anchor", async () => {
+    const { player } = await loadedPlayer(2, ["s1", "s2"]);
+    vi.mocked(align_content).mockReturnValueOnce(
+      JSON.stringify({ lagSamples: 4_800, peak: 0.92, confidence: 6.1 }),
+    );
+    await player.align(true);
+    // s2 started 0.1 s earlier (4 800 samples more pre-roll): its box
+    // stays put, s1's box shifts right by the trim it doesn't need — and
+    // room-time zero (the playhead anchor) lands at the max trim.
+    const { shiftSec, anchorSec } = player.alignShifts();
+    expect(anchorSec).toBeCloseTo(0.1, 9);
+    expect(shiftSec.get("s2")).toBe(0);
+    expect(shiftSec.get("s1")).toBeCloseTo(0.1, 9);
+    // What draws is what plays: shift + schedule delta = anchor, per stream.
+    for (const [streamId, delta] of player.alignDeltas()) {
+      expect((shiftSec.get(streamId) as number) + delta / 48_000).toBeCloseTo(anchorSec, 9);
+    }
+  });
+
   it("handles negative content offsets (the reference armed earlier)", async () => {
     const { player } = await loadedPlayer(2, ["s1", "s2"]);
     vi.mocked(align_content).mockReturnValueOnce(

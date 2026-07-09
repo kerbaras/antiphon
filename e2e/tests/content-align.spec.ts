@@ -2,7 +2,10 @@
 // identical clips". Two recorders capture near-identical content with NO
 // calibration chirp, at a real capture-start offset, and the desk must
 // align them via the content cross-correlation fallback — automatically,
-// with an honest "content" verdict.
+// with an honest "content" verdict. W6-C adds the two layers the verdict
+// chip alone can't prove: the RENDERED signal is aligned (per-lane tap,
+// residual ≈ 0), and the timeline SHOWS it (clip boxes shift by the same
+// head-trim spread the schedule applies — visual honesty).
 //
 // Scenario construction: Chromium's fake audio device plays a WAV file
 // (--use-file-for-fake-audio-capture) from ITS OWN start at each
@@ -12,66 +15,24 @@
 // tone can't serve here: it is periodic, so no unique content lag exists
 // (alignment-state.spec.ts pins that honest decline). The file is
 // music-like — AM tones + filtered noise under an APERIODIC phrase
-// contour, the same recipe as the dsp content.rs calibration tests.
+// contour, the same recipe as the dsp content.rs calibration tests
+// (helpers/align.ts).
 
 import { writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { expect, type Page, test } from "@playwright/test";
+import {
+  alignDeltas,
+  clipLefts,
+  expectTakeLoaded,
+  measureLaneOffset,
+  musicLikeWav,
+  SAMPLE_RATE,
+} from "./helpers/align";
 import { parseWav, parseZip } from "./helpers/files";
 import { expectTakeConverged, joinAsRecorder, startTake, stopTake } from "./helpers/session";
-
-const SAMPLE_RATE = 48_000;
-const FILE_SECONDS = 60;
-
-/** 16-bit mono PCM WAV of music-like content (see header comment). */
-function musicLikeWav(): Buffer {
-  const n = SAMPLE_RATE * FILE_SECONDS;
-  const tones: Array<[number, number]> = [
-    [220, 0.11],
-    [311.1, 0.07],
-    [466.2, 0.05],
-  ];
-  const knotLen = SAMPLE_RATE / 2; // 0.5 s phrase-contour knots
-  const knots = Array.from({ length: n / knotLen + 2 }, () => 0.4 + 0.6 * Math.random());
-  const data = Buffer.alloc(n * 2);
-  let lp1 = 0;
-  let lp2 = 0;
-  for (let i = 0; i < n; i++) {
-    const t = i / SAMPLE_RATE;
-    let s = 0;
-    for (let k = 0; k < tones.length; k++) {
-      const [freq, amp] = tones[k] as [number, number];
-      const am = 0.6 + 0.4 * Math.sin(2 * Math.PI * (0.23 + 0.11 * k) * t);
-      s += amp * am * Math.sin(2 * Math.PI * freq * t);
-    }
-    lp1 += 0.35 * (Math.random() * 2 - 1 - lp1);
-    lp2 += 0.35 * (lp1 - lp2);
-    const knot = i / knotLen;
-    const frac = (i % knotLen) / knotLen;
-    const contour =
-      (knots[Math.floor(knot)] as number) * (1 - frac) +
-      (knots[Math.floor(knot) + 1] as number) * frac;
-    const v = (s + 0.3 * lp2) * contour;
-    data.writeInt16LE(Math.max(-32768, Math.min(32767, Math.round(v * 26000))), i * 2);
-  }
-  const header = Buffer.alloc(44);
-  header.write("RIFF", 0, "latin1");
-  header.writeUInt32LE(36 + data.length, 4);
-  header.write("WAVE", 8, "latin1");
-  header.write("fmt ", 12, "latin1");
-  header.writeUInt32LE(16, 16); // fmt chunk size
-  header.writeUInt16LE(1, 20); // integer PCM
-  header.writeUInt16LE(1, 22); // mono
-  header.writeUInt32LE(SAMPLE_RATE, 24);
-  header.writeUInt32LE(SAMPLE_RATE * 2, 28); // byte rate
-  header.writeUInt16LE(2, 32); // block align
-  header.writeUInt16LE(16, 34); // bit depth
-  header.write("data", 36, "latin1");
-  header.writeUInt32LE(data.length, 40);
-  return Buffer.concat([header, data]);
-}
 
 // Written at module load: the browser (and its flags) launches per worker
 // AFTER the spec file is imported, so the path exists before capture.
@@ -111,30 +72,6 @@ async function playerTracks(desk: Page): Promise<TrackAlignmentView[]> {
   });
 }
 
-async function loadedTakeId(desk: Page): Promise<string | null> {
-  return await desk.evaluate(() => {
-    const hook = (
-      globalThis as unknown as {
-        __antiphonDesk?: { playerSnapshot(): { loadedTakeId: string | null } | null };
-      }
-    ).__antiphonDesk;
-    return hook?.playerSnapshot()?.loadedTakeId ?? null;
-  });
-}
-
-/** The player's applied head-trim deltas (streamId → samples), via hook. */
-async function alignDeltas(desk: Page): Promise<Array<[string, number]>> {
-  return await desk.evaluate(() => {
-    const hook = (
-      globalThis as unknown as {
-        __antiphonDesk?: { player: { alignDeltas(): Map<string, number> } };
-      }
-    ).__antiphonDesk;
-    if (!hook) return [];
-    return [...hook.player.alignDeltas().entries()];
-  });
-}
-
 test.describe("content alignment (W4-B)", () => {
   test.skip(({ browserName }) => browserName !== "chromium", "fake mic is Chromium-only");
 
@@ -163,7 +100,7 @@ test.describe("content alignment (W4-B)", () => {
     await desk.waitForTimeout(12_000);
     await stopTake(desk);
     await expectTakeConverged(desk, sessionId, takeId, 2, { timeoutMs: 90_000 });
-    await expect.poll(() => loadedTakeId(desk), { timeout: 30_000 }).toBe(takeId);
+    await expectTakeLoaded(desk, takeId, 30_000);
 
     // THE fix: alignment auto-runs on load, the chirp finds nothing, and
     // the content fallback aligns the clips — verdict says so, honestly.
@@ -192,6 +129,36 @@ test.describe("content alignment (W4-B)", () => {
     const spread = Math.max(...deltas.map(([, d]) => d)) - Math.min(...deltas.map(([, d]) => d));
     expect(spread).toBeGreaterThan(1.4 * SAMPLE_RATE);
     expect(spread).toBeLessThan(10 * SAMPLE_RATE);
+
+    // ---- W6-C visual honesty: the timeline SHOWS the alignment. ---------
+    // The clip boxes separate by exactly the head-trim spread (24 px/s at
+    // zoom 1), and it is the LATER starter (the zero-delta track) whose box
+    // sits right — the stored audio and arrangement positions never moved,
+    // only the drawing composed the align shift in.
+    const lefts = await clipLefts(desk);
+    expect(lefts.size).toBe(2);
+    const sortedByDelta = [...deltas].sort((a, b) => a[1] - b[1]); // [later starter, earlier]
+    const laterX = lefts.get((sortedByDelta[1] as [string, number])[0]) as number;
+    const zeroX = lefts.get((sortedByDelta[0] as [string, number])[0]) as number;
+    const pxPerSec = 24;
+    expect(Math.abs(zeroX - laterX - (spread / SAMPLE_RATE) * pxPerSec)).toBeLessThan(1);
+
+    // ---- W6-C audible proof: the RENDERED lanes carry no residual. ------
+    // Tap both track analysers inside the graph and cross-correlate the
+    // lanes' envelopes: near-identical content aligned by the schedule must
+    // correlate at ≈ zero lag (a broken application would read the raw
+    // ~1.5-2.5 s capture stagger instead). One schedule pass, gapless-style.
+    const residual = await measureLaneOffset(desk, 6);
+    expect(Math.abs(residual.lagSec)).toBeLessThanOrEqual(0.05);
+    expect(residual.r).toBeGreaterThan(0.9);
+    expect(residual.scheduleCount).toBe(1);
+    // Park the transport back at the head — the marker below spans the take.
+    await desk.evaluate(() => {
+      const hook = (
+        globalThis as unknown as { __antiphonDesk?: { player: { seek(s: number): void } } }
+      ).__antiphonDesk;
+      hook?.player.seek(0);
+    });
 
     // ---- W5-C × W4-B seam: a per-song export of this CONTENT-aligned take.
     // The package's manifest must tell the same story the desk just showed
