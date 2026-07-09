@@ -1,16 +1,18 @@
 // Pure halves of the track-model helpers:
 // QA #14 grapheme-safe initials + fileSafe (wave-2 G4) · F8 stable lane
-// order · F9 orphan-stream detection · positional song display names
-// (wave-2 G2).
+// order · F9 orphan-stream detection · W4-C click-to-seek take resolution
+// · positional song display names (wave-2 G2).
 
 import { describe, expect, it } from "vitest";
 import type { DeskStreamStatus } from "../../audio/sink-worker-protocol";
 import {
+  type ClipSpan,
   fileSafe,
   initialsOf,
   type LaneCandidate,
   orphanCandidate,
   stableLaneOrder,
+  takeAtSec,
   withPositionalSongNames,
 } from "./track-model";
 
@@ -163,6 +165,41 @@ describe("orphanCandidate (F9)", () => {
 
   it("withholds the verdict while the server view is unknown", () => {
     expect(orphanCandidate(deskStream({}), undefined, null)).toBe(false);
+  });
+});
+
+// ---- W4-C — takeAtSec --------------------------------------------------------------
+
+const span = (takeId: string, startSec: number, durationSec: number, live = false): ClipSpan => ({
+  takeId,
+  startSec,
+  durationSec,
+  live,
+});
+
+describe("takeAtSec (W4-C click-to-seek)", () => {
+  // Two takes on the arrangement: take-1 at 1..4, take-2 at 6..9.
+  const clips = [span("take-1", 1, 3), span("take-2", 6, 3)];
+
+  it("resolves the take under a clip span, on x only", () => {
+    expect(takeAtSec(clips, 2.5, null)).toBe("take-1");
+    expect(takeAtSec(clips, 7, "take-1")).toBe("take-2");
+  });
+
+  it("is null on bare surface: before, between, and after the takes", () => {
+    expect(takeAtSec(clips, 0.5, null)).toBeNull();
+    expect(takeAtSec(clips, 5, null)).toBeNull(); // the inter-take gap
+    expect(takeAtSec(clips, 30, null)).toBeNull();
+  });
+
+  it("prefers the selected take when dragged clips overlap", () => {
+    const overlapping = [...clips, span("take-2", 2, 3)]; // dragged onto take-1
+    expect(takeAtSec(overlapping, 2.5, "take-2")).toBe("take-2");
+    expect(takeAtSec(overlapping, 2.5, null)).toBe("take-1"); // first in row order
+  });
+
+  it("never matches the live take (transport-owned while recording)", () => {
+    expect(takeAtSec([span("take-live", 1, 3, true)], 2, null)).toBeNull();
   });
 });
 

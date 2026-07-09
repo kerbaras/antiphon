@@ -218,6 +218,40 @@ export function useOrphanedStreams(
   return orphaned;
 }
 
+// ---- W4-C — click-to-seek take resolution ----------------------------------------
+// A plain click on bare timeline surface is a transport seek; when it lands
+// inside a take's recorded audio, the transport retargets onto that take
+// (see index.tsx seekTimeline). This is the pure "which take is under
+// arrangement-second `sec`?" half of that gesture.
+
+export interface ClipSpan {
+  takeId: string;
+  /** Arrangement position (overrides included) — clip.x / pxPerSec. */
+  startSec: number;
+  durationSec: number;
+  live: boolean;
+}
+
+/** The take whose clip audio lies under arrangement-second `sec`, matched
+ * on x ONLY: the timeline is one time axis, so a click on bare lane below
+ * (or above) a clip still means that clip's take-time. Overlaps from
+ * dragged arrangements prefer `selectedTakeId` (a seek inside the loaded
+ * take must never switch it), then the first clip in row order. The live
+ * take is transport-owned while recording and never matches. */
+export function takeAtSec(
+  clips: readonly ClipSpan[],
+  sec: number,
+  selectedTakeId: string | null,
+): string | null {
+  let hit: string | null = null;
+  for (const clip of clips) {
+    if (clip.live || sec < clip.startSec || sec >= clip.startSec + clip.durationSec) continue;
+    if (clip.takeId === selectedTakeId) return clip.takeId;
+    hit ??= clip.takeId;
+  }
+  return hit;
+}
+
 // ---- song display names --------------------------------------------------------
 // QA low: default song names don't renumber — delete "Song 1" and the
 // panel reads "01 Song 2". Auto-assigned names (the `Song N` pattern from

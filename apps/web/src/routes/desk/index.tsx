@@ -46,6 +46,7 @@ import {
   type TakeSlot,
   TRACK_COLORS,
   type TrackRow,
+  takeAtSec,
   useOrphanedStreams,
   useReceiving,
   useTick,
@@ -481,6 +482,27 @@ function Desk({ sessionId }: { sessionId: string }) {
   // useState it replaced.
   const [clipStartOverrides, setClipStartOverrides] = useCollabArrange(collab);
   const [marquee, setMarquee] = useState<Marquee | null>(null);
+  // W4-C click-to-seek: the operator's parked playhead, in ARRANGEMENT
+  // seconds. Any bare-surface/ruler click parks it — even with nothing
+  // loaded at all — and it renders as THE playhead until the player can
+  // express the position itself (see the reconciliation effects below).
+  const [parkedSeekSec, setParkedSeekSec] = useState<number | null>(null);
+  /** The player's seek counter as of OUR last pin reconciliation; null
+   * before it runs. The yield effect tells a FOREIGN seek (marker flag,
+   * comment tick, songs panel, ⏮) from the pin's own clamped seek by this
+   * counter — the position value can't carry that signal (⏮ with the
+   * transport already parked at 0 moves nothing). */
+  const parkedAppliedSeek = useRef<number | null>(null);
+  // Session switch: the pick and the pin are per-session interaction state
+  // (the laneRanks treatment above) — a stale pick would load the previous
+  // session's take, a stale pin draws a playhead where nothing exists.
+  const pinSession = useRef(sessionId);
+  if (pinSession.current !== sessionId) {
+    pinSession.current = sessionId;
+    setPickedTakeId(null);
+    setParkedSeekSec(null);
+    parkedAppliedSeek.current = null;
+  }
   const timelineRef = useRef<HTMLDivElement | null>(null);
 
   /** Arrangement position of a clip: user override, else its take slot. */
@@ -639,23 +661,38 @@ function Desk({ sessionId }: { sessionId: string }) {
     window.addEventListener("pointerup", up);
   }
 
-  /** Empty-lane press: click seeks the playhead, click-and-hold drags a
-   * marquee that selects every clip it touches. With shift (or cmd/ctrl)
-   * held the marquee ADDS its hits to the selection instead of replacing
-   * it, and a modifier'd click on bare lane preserves the selection (F17)
-   * — additive gestures only ever edit selection, never wipe it. Seeking
-   * is modifier-agnostic. */
+  /** Bare-surface press — THE timeline pointer contract (W4-C). What a
+   * press means, in precedence order:
+   *  - on a clip or any control (buttons, marker flags, comment ticks) →
+   *    the control handles it (clip press = select, press-drag = move,
+   *    double-click = explicit load);
+   *  - on sticky chrome (ruler row, track headers) → not lane surface; the
+   *    ruler runs its own click-seek through the same seekTimeline;
+   *  - press-and-drag → marquee selection, startable from ANY bare spot
+   *    including the empty space below the last lane. With shift (or
+   *    cmd/ctrl) held the marquee ADDS its hits to the selection instead
+   *    of replacing it, and a modifier'd click on bare lane preserves the
+   *    selection (F17) — additive gestures only ever edit selection,
+   *    never wipe it;
+   *  - plain click (no drag) → transport seek: ANY x that doesn't hit a
+   *    clip parks the playhead there (seekTimeline), gaps and empty space
+   *    included. Seeking is modifier-agnostic. */
   function onLanePointerDown(e: React.PointerEvent) {
     if (e.button !== 0 || recording) return;
     const additive = e.shiftKey || e.metaKey || e.ctrlKey;
     const target = e.target as HTMLElement;
     if (target.closest("button")) return; // clips and controls handle themselves
     const container = timelineRef.current;
-    if (!container) return;
+    const viewport = container?.parentElement;
+    if (!container || !viewport) return;
+    // Sticky chrome is not lane surface: the ruler row seeks itself and the
+    // track headers are controls. Tested in VIEWPORT space — the content
+    // coordinates below drift under the sticky elements once scrolled.
+    const vp = viewport.getBoundingClientRect();
+    if (e.clientX - vp.left < TRACK_HEADER_W || e.clientY - vp.top < RULER_H) return;
     const rect = container.getBoundingClientRect();
     const x0 = e.clientX - rect.left;
     const y0 = e.clientY - rect.top;
-    if (x0 < TRACK_HEADER_W || y0 < RULER_H) return; // headers/ruler
     let moved = false;
     const move = (ev: PointerEvent) => {
       const x1 = ev.clientX - rect.left;
@@ -792,19 +829,87 @@ function Desk({ sessionId }: { sessionId: string }) {
       }));
   }, [pendingDelete, takes]);
 
+  /** Click-to-seek (W4-C): `sec` is an ARRANGEMENT-timeline position — any
+   * x on the surface counts, loaded or not. The playhead parks at the
+   * clicked spot immediately; when the spot lies inside another take's
+   * clips the pick retargets onto that take, so play-from-here needs no
+   * double-click focus dance first (the F5 latest-wins queue does the
+   * actual loading; double-click on a clip stays the explicit load for
+   * clip PRESSES, which remain selection-only — QA E3). The reconciliation
+   * effects below feed the player once it holds the right take — a click
+   * WHILE the transport rolls keeps its point through that load too (the
+   * yield effect ignores the old take's motion until then), and the
+   * retargeted take comes up PAUSED at the clicked spot: double-click load
+   * parity, no auto-resume. */
   function seekTimeline(sec: number) {
-    if (!playerLoaded) return;
-    getPlayer().seek(Math.max(0, sec - selectedBaseSec));
+    const target = takeAtSec(
+      rowClips.flat().map((clip) => ({
+        takeId: clip.takeId,
+        startSec: clip.x / pxPerSec,
+        durationSec: clip.durationSec,
+        live: clip.live,
+      })),
+      sec,
+      selectedTakeId,
+    );
+    if (target !== null && target !== selectedTakeId) setPickedTakeId(target);
+    parkedAppliedSeek.current = null; // not reconciled with the player yet
+    setParkedSeekSec(Math.max(0, sec));
   }
 
-  // Playhead position on the shared timeline.
+  // Parked-seek reconciliation: once the selected take is loaded, map the
+  // parked arrangement position into its room timeline. player.seek clamps
+  // into [0, duration]: a park on empty space parks the AUDIO at the
+  // nearest end of the take while the visual playhead honestly keeps the
+  // clicked spot — and Play from a beyond-the-end park then follows the
+  // transport's one end rule (F12) and restarts from the top. An in-span
+  // park is exactly expressed by the player, so the pin hands over to the
+  // player's own position.
+  useEffect(() => {
+    if (parkedSeekSec === null || !playerLoaded) return;
+    getPlayer().seek(parkedSeekSec - selectedBaseSec);
+    parkedAppliedSeek.current = getPlayer().snapshot().seekCount;
+    const inSpan =
+      parkedSeekSec >= selectedBaseSec && parkedSeekSec <= selectedBaseSec + getPlayer().duration();
+    if (inSpan) setParkedSeekSec(null);
+  }, [parkedSeekSec, playerLoaded, selectedBaseSec]);
+  // A parked pin is a promise about the NEXT play, not the current one: it
+  // yields when the transport rolls, a take starts recording, or any
+  // FOREIGN seek (marker flag, comment tick, songs panel, ⏮ — counted by
+  // the player, since a foreign seek needn't move the position value)
+  // lands — the pin must never mask where the audio truly is. But NOT
+  // before the pin's take is the loaded one: until a pending retarget load
+  // settles, playing/seeks belong to the PREVIOUS take and must not cost
+  // the operator the clicked point (the reconciliation above still has to
+  // run). playing/seekCount are the TRIGGERS; the body reads the live
+  // counter, which the reconciliation may have bumped within this same
+  // commit (snapshots lag one notify).
+  // biome-ignore lint/correctness/useExhaustiveDependencies: playing/seekCount re-run the check; the body reads the live counter
+  useEffect(() => {
+    if (parkedSeekSec === null) return;
+    if (recording) {
+      setParkedSeekSec(null);
+      return;
+    }
+    if (!playerLoaded) return;
+    const applied = parkedAppliedSeek.current;
+    if (playerSnap.playing || (applied !== null && getPlayer().snapshot().seekCount > applied)) {
+      setParkedSeekSec(null);
+    }
+  }, [parkedSeekSec, playerLoaded, playerSnap.playing, playerSnap.seekCount, recording]);
+
+  // Playhead position on the shared timeline: the live take's write head
+  // while recording; else the parked click (W4-C — it exists even with
+  // nothing loaded); else the player position.
   const playheadSec = recording
     ? state.activeTakeId && takes.has(state.activeTakeId)
       ? (takes.get(state.activeTakeId) as TakeSlot).offsetSec + elapsed
       : null
-    : playerLoaded && selectedTakeId
-      ? selectedBaseSec + playerSnap.positionSec
-      : null;
+    : parkedSeekSec !== null
+      ? parkedSeekSec
+      : playerLoaded && selectedTakeId
+        ? selectedBaseSec + playerSnap.positionSec
+        : null;
 
   // ---- presence (W3-A) -------------------------------------------------------
   // Publish who we are and where our playhead sits; read the other desks.
@@ -1046,7 +1151,6 @@ function Desk({ sessionId }: { sessionId: string }) {
           channels={playerSnap.channels}
           disarmedPeers={state.disarmedPeers}
           recording={recording}
-          playerLoaded={playerLoaded}
           markersUsable={markersUsable}
           activeSong={activeSong}
           durationSec={playerSnap.durationSec}

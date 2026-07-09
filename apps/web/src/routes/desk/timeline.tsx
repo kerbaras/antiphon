@@ -44,7 +44,6 @@ export function TimelineSection({
   channels,
   disarmedPeers,
   recording,
-  playerLoaded,
   markersUsable,
   activeSong,
   durationSec,
@@ -69,7 +68,6 @@ export function TimelineSection({
   channels: ChannelStrip[];
   disarmedPeers: string[];
   recording: boolean;
-  playerLoaded: boolean;
   markersUsable: boolean;
   activeSong: Song | null;
   /** Loaded take duration (marker double-click bounds, song strip end). */
@@ -114,12 +112,20 @@ export function TimelineSection({
     viewport.scrollLeft = Math.max(0, TRACK_HEADER_W + anchorSec * pxPerSec - anchorViewportX);
   }, [pxPerSec, playheadSec, timelineRef]);
   return (
-    <section className="relative min-w-0 flex-1 overflow-auto bg-bg">
+    // The timeline is an instrument surface, not a document (W4-C): drags
+    // here mean marquee/clip-move/seek, so text selection is suppressed for
+    // the whole surface — ruler numerals, lane labels, clip titles. Scoped
+    // to this section on purpose: copyable text elsewhere in the desk stays
+    // copyable, and the lane-rename input re-enables selection for itself.
+    <section className="relative min-w-0 flex-1 select-none overflow-auto bg-bg">
       {/* Pointer editing surface (seek/marquee/drag); the transport
-          buttons + space bar are the keyboard path. */}
+          buttons + space bar are the keyboard path. min-h-full: the empty
+          space below the last lane is timeline too (W4-C) — marquees and
+          click-to-seek must work from the whole scrollable area, not just
+          the rows' own height. */}
       <div
         ref={timelineRef}
-        className="relative min-w-full"
+        className="relative min-h-full min-w-full"
         style={{ width: laneWidth + TRACK_HEADER_W }}
         onPointerDown={onLanePointerDown}
         role="presentation"
@@ -147,10 +153,13 @@ export function TimelineSection({
               onAddMarkerAt(atSec);
             }}
           >
+            {/* Ruler seeks park the playhead even with nothing loaded
+                (W4-C click-to-seek); only a rolling take suspends them —
+                the playhead rides the write head. */}
             <LaneRuler
               pxPerSec={pxPerSec}
               widthPx={laneWidth}
-              {...(playerLoaded && !recording ? { onSeek: onSeekTimeline } : {})}
+              {...(!recording ? { onSeek: onSeekTimeline } : {})}
             />
             {/* Active-song accent strip (the prototype's ruler range bar) */}
             {markersUsable && activeSong && (
@@ -507,7 +516,9 @@ function LaneName({ name, onRename }: { name: string; onRename?: (label: string)
             e.currentTarget.blur();
           }
         }}
-        className="w-full min-w-0 rounded-[3px] border border-accent bg-bg px-1 py-px text-[11.5px] font-semibold text-text-hi outline-none"
+        // select-text: the timeline surface is select-none (W4-C) — the one
+        // legitimately editable/copyable field on it opts back in.
+        className="w-full min-w-0 select-text rounded-[3px] border border-accent bg-bg px-1 py-px text-[11.5px] font-semibold text-text-hi outline-none"
       />
     );
   }

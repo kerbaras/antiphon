@@ -117,6 +117,11 @@ export interface PlayerSnapshot {
   /** Times source scheduling ran since play() — a continuous, uncut
    * playback stays at 1 (regression guard for re-schedule storms). */
   scheduleCount: number;
+  /** Times seek() ran, ever. The desk's parked playhead pin (W4-C) tells a
+   * FOREIGN seek (marker flag, comment tick, ⏮) apart from its own
+   * reconciliation by this counter — the position value alone can't carry
+   * that signal (⏮ with the transport already parked at 0 moves nothing). */
+  seekCount: number;
 }
 
 interface Track {
@@ -197,6 +202,7 @@ export class TakePlayer {
   /** Last align() failure (F7a) — cleared by the next run/load/restore. */
   private alignError: string | null = null;
   private scheduleCount = 0;
+  private seekCount = 0;
   private raf: number | null = null;
   private listeners = new Set<(snap: PlayerSnapshot) => void>();
   /** Fired after an align() RUN settles with measurements — the F7b
@@ -241,6 +247,7 @@ export class TakePlayer {
       error: this.error,
       alignmentOutcome: this.alignmentOutcome(),
       scheduleCount: this.scheduleCount,
+      seekCount: this.seekCount,
     };
   }
 
@@ -832,6 +839,7 @@ export class TakePlayer {
   }
 
   seek(sec: number): void {
+    this.seekCount += 1;
     const clamped = Math.max(0, Math.min(sec, this.duration()));
     if (this.playing) {
       this.stopSources();
