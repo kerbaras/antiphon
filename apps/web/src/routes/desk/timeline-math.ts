@@ -50,30 +50,53 @@ export function trackEndSec(t: TrackTiming): number {
   return t.clipDelaySec + (t.bufferDurationSec - t.headSec) / t.ratio;
 }
 
+/** How a track's alignment lag was measured (W4-B): `chirp` = the §10
+ * calibration sweep located in the stream; `content` = cross-correlation
+ * of the recorded content itself against a reference stream, expressed in
+ * the same virtual lag domain (reference lag + signed pre-roll offset). */
+export type AlignMethod = "chirp" | "content";
+
 export interface AlignLag {
   streamId: string;
-  /** Chirp correlation lag in the stream's own samples. */
+  /** Alignment lag in the stream's own samples (see AlignMethod). */
   lagSamples: number;
   sampleRate: number;
+  /** Absent (legacy verdicts) means chirp. */
+  method?: AlignMethod;
+}
+
+/** Wrap a lag difference to the nearest repeat of `intervalSamples` —
+ * resolves which-sweep-did-I-lock-onto ambiguity between chirp lags. */
+export function wrapLag(raw: number, intervalSamples: number): number {
+  return raw - Math.round(raw / intervalSamples) * intervalSamples;
 }
 
 /** Samples to trim from each track's head so all aligned tracks share the
- * room clock. Streams may lock onto different repeats of the sweep (the
- * §10 schedule emits it twice); deltas are normalized modulo the repeat
- * interval, which is safe while true inter-device offsets stay under half
- * the interval (1 s — arming spread is hundreds of ms at worst). Fewer
- * than two lags yields no deltas: there is nothing to align against. */
+ * room clock. Chirp lags may lock onto different repeats of the sweep
+ * (the §10 schedule emits it twice), so their deltas are normalized
+ * modulo the repeat interval — safe while true inter-device offsets stay
+ * under half the interval (1 s — arming spread is hundreds of ms at
+ * worst). Content lags carry no repeat ambiguity (there is exactly one
+ * performance) and pass through unwrapped, so offsets beyond the chirp
+ * interval stay honest. Fewer than two lags yields no deltas: there is
+ * nothing to align against. */
 export function normalizeAlignDeltas(
   lags: AlignLag[],
   repeatIntervalSec: number,
 ): Map<string, number> {
   const out = new Map<string, number>();
   if (lags.length < 2) return out;
-  const base = Math.min(...lags.map((l) => l.lagSamples));
+  // The wrap base must come from the chirp domain when one exists: content
+  // lags are built ON a chirp reference lag (player.align), so wrapping
+  // them against a content minimum would tear the two domains apart.
+  const chirp = lags.filter((l) => (l.method ?? "chirp") === "chirp");
+  const anchored = chirp.length > 0 ? chirp : lags;
+  const base = Math.min(...anchored.map((l) => l.lagSamples));
   const normalized = lags.map((l) => {
-    const interval = Math.round(repeatIntervalSec * l.sampleRate);
     const raw = l.lagSamples - base;
-    return [l.streamId, raw - Math.round(raw / interval) * interval] as const;
+    if ((l.method ?? "chirp") === "content") return [l.streamId, raw] as const;
+    const interval = Math.round(repeatIntervalSec * l.sampleRate);
+    return [l.streamId, wrapLag(raw, interval)] as const;
   });
   const min = Math.min(...normalized.map(([, d]) => d));
   for (const [streamId, d] of normalized) out.set(streamId, d - min);

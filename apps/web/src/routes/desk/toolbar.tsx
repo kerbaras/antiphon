@@ -6,7 +6,7 @@
 import type { FatalSignalingError } from "../../net/signaling-client";
 import { Button, MonoReadout, Panel, SectionLabel, StatusPill } from "../../ui/kit";
 import { SnapGrid, ToolGroup, ViewTabs, ZoomControl } from "./daw";
-import { ALIGN_MIN_CONFIDENCE, type PlayerSnapshot } from "./player";
+import type { PlayerSnapshot } from "./player";
 import { getPlayer } from "./use-desk";
 
 /** Auto-align control state (F7a) — also the e2e observation surface. */
@@ -68,6 +68,25 @@ export function DeskToolbar({
             outcome.referenceStreamId,
         )
       : null;
+  // Honest method readout (W4-B): chirp-aligned ≠ waveform-aligned.
+  // Operator copy says "waveform" (PM decision); the persisted method
+  // value stays "content" for schema stability.
+  const methodLabel =
+    outcome?.kind === "aligned"
+      ? outcome.method === "mixed"
+        ? "chirp+waveform"
+        : outcome.method === "content"
+          ? "waveform"
+          : "chirp"
+      : null;
+  const alignedTitle =
+    outcome?.kind === "aligned"
+      ? outcome.method === "chirp"
+        ? "Chirp offsets applied at schedule time — stored audio untouched"
+        : outcome.method === "content"
+          ? "No usable calibration chirp — tracks aligned by cross-correlating their recorded waveforms against the reference lane. Offsets applied at schedule time — stored audio untouched."
+          : "Chirp offsets where the sweep was found; waveform cross-correlation placed the rest. Applied at schedule time — stored audio untouched."
+      : null;
 
   return (
     <div className="flex items-center justify-between border-b border-divider bg-raised px-3.5">
@@ -80,8 +99,8 @@ export function DeskToolbar({
           aria-label="Auto-align"
           title={
             alignState === "idle" && !lastChirpAt
-              ? "Correlate the calibration chirp across tracks (run Chirp during a take for best results)"
-              : "Re-run chirp alignment on the loaded take"
+              ? "Align tracks: chirp correlation, falling back to waveform cross-correlation (run Chirp during a take for best precision)"
+              : "Re-run alignment on the loaded take (chirp, then waveform fallback)"
           }
           data-align-state={alignState}
           disabled={!playerLoaded || playerSnap.aligning || recording}
@@ -102,9 +121,9 @@ export function DeskToolbar({
             data-testid="align-outcome"
             title={
               outcome.kind === "aligned"
-                ? "Chirp offsets applied at schedule time — stored audio untouched"
+                ? (alignedTitle ?? "")
                 : outcome.kind === "declined"
-                  ? `Best chirp correlation confidence ${outcome.confidence.toFixed(2)} is below the accept threshold ${ALIGN_MIN_CONFIDENCE} — tracks play unaligned. Replay the chirp during a take, then re-run.`
+                  ? `Best correlation confidence ${outcome.confidence.toFixed(2)} (chirp and waveform both measured) is below the accept threshold ${outcome.threshold} — tracks play unaligned. Replay the chirp during a take, then re-run.`
                   : "Alignment crashed — tracks play unaligned. Re-run to retry."
             }
             className={`min-w-0 max-w-[300px] truncate font-mono text-[9px] ${
@@ -116,11 +135,11 @@ export function DeskToolbar({
             }`}
           >
             {outcome.kind === "aligned"
-              ? `⇥ ${outcome.trackCount} track${outcome.trackCount === 1 ? "" : "s"} aligned${
+              ? `⇥ ${outcome.trackCount} track${outcome.trackCount === 1 ? "" : "s"} aligned · ${methodLabel}${
                   referenceName ? ` · ref ${referenceName}` : ""
                 }`
               : outcome.kind === "declined"
-                ? `declined · confidence ${outcome.confidence.toFixed(2)} < ${ALIGN_MIN_CONFIDENCE}`
+                ? `declined · confidence ${outcome.confidence.toFixed(2)} < ${outcome.threshold}`
                 : `failed: ${outcome.message}`}
           </span>
         )}

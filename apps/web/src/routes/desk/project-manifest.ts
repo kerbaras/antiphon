@@ -44,10 +44,12 @@ export interface ManifestStem {
    * (nickname when set). */
   lane: { key: string; name: string; peerId: string | null };
   mixer: ManifestMixer;
-  /** Raw chirp correlation against the RFC §10 alignment sweep:
-   * `lagSamples` = the chirp's position in this stream's own samples,
-   * `applied` = the fit was confident enough to schedule with. null = the
-   * take was never aligned (no chirp emitted). */
+  /** Raw alignment measurement. `method` "chirp" (or absent): `lagSamples`
+   * = the RFC §10 sweep's position in this stream's own samples. `method`
+   * "content" (W4-B fallback): the same lag domain, derived from content
+   * cross-correlation against the reference stream. `applied` = the fit
+   * was confident enough to schedule with. null = the take was never
+   * aligned. (Field keeps its v1 name for schema stability.) */
   chirp: AlignmentResult | null;
   /** Clock-drift fit vs the reference stream: `ratio` is
    * target_clock/reference_clock (played back as playbackRate), `ppm` the

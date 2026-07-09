@@ -19,6 +19,17 @@
 // collab-doc.ts's documented Y.Map semantics). Equal-content writes are
 // skipped, so doc echoes can never ping-pong.
 //
+// WIRE COMPAT (W4-B): stored entries are encoded (encodeEntry) before they
+// touch the doc or the shadow. Chirp verdicts keep the v1 shape; CONTENT
+// verdicts carry their lag as `contentLagSamples` and OMIT `lagSamples` —
+// pre-W4-B desks validate `lagSamples` as a finite number and rebuild only
+// known keys, so a content entry parsed by an old desk fails validation
+// and drops WHOLE (honest "no verdict" → that stream plays unaligned)
+// instead of being mistaken for a chirp lag and wrapped modulo the sweep
+// repeat interval — a real 1.9 s content offset would otherwise tear ~2 s
+// between desk versions on one session. New desks read both shapes;
+// decode normalizes back to the in-memory AlignmentResult.
+//
 // FRESHNESS (`at`, measurement wall-clock): the collab client coalesces
 // outgoing updates (~33 ms), so a verdict measured moments before a reload
 // may never reach the server — after the reload the doc then syncs an
@@ -53,12 +64,55 @@ export interface TakeAlignmentRecord {
   entries: TakeAlignment;
 }
 
+/** One stream's verdict as it travels the doc / localStorage (see the
+ * WIRE COMPAT header note): chirp lags under `lagSamples` (v1 shape),
+ * content lags under `contentLagSamples` — structurally invisible to
+ * legacy validators, which is the point. */
+interface WireTrackAlignment {
+  alignment: {
+    lagSamples?: number;
+    contentLagSamples?: number;
+    confidence: number;
+    applied: boolean;
+    method?: "chirp" | "content";
+  };
+  drift: StoredTrackAlignment["drift"];
+}
+
+interface WireTakeAlignmentRecord {
+  at: number;
+  entries: Record<string, WireTrackAlignment>;
+}
+
+/** In-memory verdict → wire shape (pure; deterministic key order so the
+ * equal-content write skip compares bytes meaningfully). */
+function encodeEntry(entry: StoredTrackAlignment): WireTrackAlignment {
+  const { lagSamples, confidence, applied } = entry.alignment;
+  const method = entry.alignment.method ?? "chirp";
+  return {
+    alignment:
+      method === "content"
+        ? { contentLagSamples: lagSamples, confidence, applied, method }
+        : { lagSamples, confidence, applied, method },
+    drift: entry.drift ? { ...entry.drift } : null,
+  };
+}
+
+function encodeRecord(record: TakeAlignmentRecord): WireTakeAlignmentRecord {
+  return {
+    at: record.at,
+    entries: Object.fromEntries(
+      Object.entries(record.entries).map(([streamId, entry]) => [streamId, encodeEntry(entry)]),
+    ),
+  };
+}
+
 const SCHEMA_VERSION = 1;
 
 interface AlignmentStorePayload {
   v: number;
   at: number;
-  entries: TakeAlignment;
+  entries: Record<string, WireTrackAlignment>;
 }
 
 type KVStore = Pick<Storage, "getItem" | "setItem">;
@@ -79,12 +133,34 @@ function isFiniteNumber(v: unknown): v is number {
   return typeof v === "number" && Number.isFinite(v);
 }
 
-function validAlignment(v: unknown): v is StoredTrackAlignment["alignment"] {
-  if (typeof v !== "object" || v === null) return false;
+/** Validate one wire alignment and decode it to the in-memory shape (null
+ * = malformed, drop the entry). Method rules: absent = legacy chirp;
+ * chirp entries carry `lagSamples`, content entries carry
+ * `contentLagSamples` (the WIRE COMPAT rule — a content entry with only a
+ * plain `lagSamples` does not exist in any released writer and is treated
+ * as junk); anything else is junk. */
+function decodeAlignment(v: unknown): StoredTrackAlignment["alignment"] | null {
+  if (typeof v !== "object" || v === null) return null;
   const a = v as Record<string, unknown>;
-  return (
-    isFiniteNumber(a.lagSamples) && isFiniteNumber(a.confidence) && typeof a.applied === "boolean"
-  );
+  if (!isFiniteNumber(a.confidence) || typeof a.applied !== "boolean") return null;
+  const method = a.method ?? "chirp";
+  if (method === "chirp" && isFiniteNumber(a.lagSamples)) {
+    return {
+      lagSamples: a.lagSamples,
+      confidence: a.confidence,
+      applied: a.applied,
+      method: "chirp",
+    };
+  }
+  if (method === "content" && isFiniteNumber(a.contentLagSamples)) {
+    return {
+      lagSamples: a.contentLagSamples,
+      confidence: a.confidence,
+      applied: a.applied,
+      method: "content",
+    };
+  }
+  return null;
 }
 
 function validDrift(v: unknown): v is NonNullable<StoredTrackAlignment["drift"]> {
@@ -112,17 +188,16 @@ export function parseTakeAlignment(raw: unknown): TakeAlignment | null {
   for (const [streamId, value] of Object.entries(raw)) {
     if (typeof value !== "object" || value === null) continue;
     const entry = value as Record<string, unknown>;
-    const alignment = entry.alignment;
-    if (!validAlignment(alignment)) continue;
+    // Rebuild exact shapes — never let unknown extra keys ride along.
+    // decodeAlignment applies the WIRE COMPAT rule (content lags travel
+    // as `contentLagSamples`) and normalizes legacy entries to chirp so
+    // every consumer downstream sees one canonical in-memory shape.
+    const alignment = decodeAlignment(entry.alignment);
+    if (!alignment) continue;
     const drift = entry.drift ?? null;
     if (drift !== null && !validDrift(drift)) continue;
-    // Rebuild exact shapes — never let unknown extra keys ride along.
     out[streamId] = {
-      alignment: {
-        lagSamples: alignment.lagSamples,
-        confidence: alignment.confidence,
-        applied: alignment.applied,
-      },
+      alignment,
       drift:
         drift === null
           ? null
@@ -178,7 +253,7 @@ export function saveLocalAlignment(
   record: TakeAlignmentRecord,
   store: KVStore | null = defaultStore(),
 ): void {
-  const payload: AlignmentStorePayload = { v: SCHEMA_VERSION, ...record };
+  const payload: AlignmentStorePayload = { v: SCHEMA_VERSION, ...encodeRecord(record) };
   try {
     store?.setItem(alignmentKey(sessionId, takeId), JSON.stringify(payload));
   } catch {
@@ -188,8 +263,8 @@ export function saveLocalAlignment(
 
 // ---- shared doc ------------------------------------------------------------------
 
-function alignmentMap(doc: Y.Doc): Y.Map<TakeAlignmentRecord> {
-  return doc.getMap<TakeAlignmentRecord>("alignment");
+function alignmentMap(doc: Y.Doc): Y.Map<WireTakeAlignmentRecord> {
+  return doc.getMap<WireTakeAlignmentRecord>("alignment");
 }
 
 export function readDocAlignment(doc: Y.Doc, takeId: string): TakeAlignmentRecord | null {
@@ -197,7 +272,10 @@ export function readDocAlignment(doc: Y.Doc, takeId: string): TakeAlignmentRecor
 }
 
 /** Write a take's verdict iff it differs from what the doc holds (LWW per
- * takeId key; equal-content writes skipped — no echo loops). */
+ * takeId key; equal-content writes skipped — no echo loops; wire-encoded,
+ * see the WIRE COMPAT header note). A legacy record that decodes equal
+ * but re-encodes differently (e.g. gains the explicit method) causes one
+ * converging rewrite, never a loop — the second compare is byte-equal. */
 export function writeDocAlignmentIfChanged(
   doc: Y.Doc,
   takeId: string,
@@ -205,9 +283,10 @@ export function writeDocAlignmentIfChanged(
   origin: unknown,
 ): boolean {
   const map = alignmentMap(doc);
-  if (JSON.stringify(map.get(takeId) ?? null) === JSON.stringify(record)) return false;
+  const wire = encodeRecord(record);
+  if (JSON.stringify(map.get(takeId) ?? null) === JSON.stringify(wire)) return false;
   doc.transact(() => {
-    map.set(takeId, record);
+    map.set(takeId, wire);
   }, origin);
   return true;
 }
@@ -291,7 +370,7 @@ export function bindAlignmentToCollab(
     if (entries) persistTakeAlignment(collab, sessionId, takeId, entries);
   });
   const map = alignmentMap(collab.doc);
-  const observer = (event: Y.YMapEvent<TakeAlignmentRecord>, txn: Y.Transaction): void => {
+  const observer = (event: Y.YMapEvent<WireTakeAlignmentRecord>, txn: Y.Transaction): void => {
     if (txn.origin === collab.origin) return;
     for (const takeId of event.keysChanged) {
       const winner = reconcile(collab, sessionId, takeId);

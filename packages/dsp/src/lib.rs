@@ -6,5 +6,6 @@
 //! legitimate WASM workloads.
 
 pub mod chirp;
+pub mod content;
 pub mod correlate;
 pub mod drift;

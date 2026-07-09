@@ -202,7 +202,8 @@ export interface TakeLoadRequest {
   /** Stream → mixer-lane mapping, resolved at load time (attribution may
    * land after the request is queued). */
   channelOf: (streamId: string) => string;
-  /** Auto-align after a successful load (a chirp was emitted). */
+  /** Auto-align after a successful load (chirp first, content fallback —
+   * see player.align). Skipped when a persisted verdict already restored. */
   align: boolean;
 }
 

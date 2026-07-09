@@ -78,6 +78,33 @@ pub fn find_chirp_offset(
     })
 }
 
+/// Content-based stream alignment (W4-B): locate `target`'s recorded
+/// content inside `reference` — the chirp-less fallback. Returns JSON
+/// `{"lagSamples":n,"peak":x,"confidence":y}` (lagSamples SIGNED: the
+/// target's extra pre-roll relative to the reference — same trim-more
+/// semantics as a chirp lag difference) or `null` when the streams share
+/// no locatable content (silence, uncorrelated takes, non-finite input).
+/// Callers pass stream HEADS only (the algorithm caps at 60 s anyway);
+/// full 45-min streams must never cross this boundary.
+#[wasm_bindgen]
+pub fn align_content(reference: &[f32], target: &[f32], sample_rate: u32) -> Option<String> {
+    antiphon_dsp::content::align_content(reference, target, sample_rate).map(|m| {
+        format!(
+            "{{\"lagSamples\":{},\"peak\":{},\"confidence\":{}}}",
+            m.lag_samples,
+            if m.peak.is_finite() { m.peak } else { 0.0 },
+            // The dsp side bounds confidence (MAX_PROMINENCE × consensus);
+            // a non-finite value here would be a bug, so it degrades to 0
+            // — an impossible-to-accept verdict, never a free pass.
+            if m.confidence.is_finite() {
+                m.confidence
+            } else {
+                0.0
+            },
+        )
+    })
+}
+
 /// Protocol constants exposed for TS consumers (§13).
 #[wasm_bindgen]
 pub fn constants_json() -> String {

@@ -101,6 +101,48 @@ describe("normalizeAlignDeltas", () => {
     expect(deltas.get("a")).toBe(0);
     expect(deltas.get("b")).toBe(400);
   });
+
+  it("content lags never wrap — offsets beyond the chirp interval stay honest (W4-B)", () => {
+    // 1.5 s of genuine pre-roll difference: a chirp lag pair would wrap
+    // this modulo the 1 s interval; content lags carry no repeat ambiguity.
+    const deltas = normalizeAlignDeltas(
+      [
+        { streamId: "ref", lagSamples: 0, sampleRate: 48_000, method: "content" },
+        { streamId: "b", lagSamples: 72_000, sampleRate: 48_000, method: "content" },
+      ],
+      1,
+    );
+    expect(deltas.get("ref")).toBe(0);
+    expect(deltas.get("b")).toBe(72_000);
+  });
+
+  it("negative content lags shift the base so every delta stays a head-trim", () => {
+    const deltas = normalizeAlignDeltas(
+      [
+        { streamId: "ref", lagSamples: 0, sampleRate: 48_000, method: "content" },
+        { streamId: "b", lagSamples: -4_800, sampleRate: 48_000, method: "content" },
+      ],
+      1,
+    );
+    expect(deltas.get("ref")).toBe(4_800);
+    expect(deltas.get("b")).toBe(0);
+  });
+
+  it("mixed sets wrap chirp lags against the CHIRP base and chain content raw (W4-B)", () => {
+    // Chirp pair with a repeat-wrapped member; a content track measured
+    // against the chirp anchor (lag = anchor lag 1 000 + offset 500).
+    const deltas = normalizeAlignDeltas(
+      [
+        { streamId: "a", lagSamples: 1_000, sampleRate: 48_000, method: "chirp" },
+        { streamId: "b", lagSamples: 49_400, sampleRate: 48_000, method: "chirp" },
+        { streamId: "c", lagSamples: 1_500, sampleRate: 48_000, method: "content" },
+      ],
+      1,
+    );
+    expect(deltas.get("a")).toBe(0);
+    expect(deltas.get("b")).toBe(400);
+    expect(deltas.get("c")).toBe(500);
+  });
 });
 
 describe("resolveRange", () => {

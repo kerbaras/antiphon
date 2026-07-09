@@ -349,15 +349,18 @@ function Desk({ sessionId }: { sessionId: string }) {
     [selectedStreamKey],
   );
 
-  // Load (and, when a chirp was emitted this session, auto-align) the
-  // selected take as soon as it is complete at the desk. Loads run through
-  // the latest-wins queue (F5): a pick landing mid-decode is never dropped
-  // — the player converges on the newest selection. Streams map to mixer
-  // lanes by performer (read through a ref: mapping identity churns every
-  // poll and must not re-fire this effect — see selectedStreamKey). Gated
-  // on the attribution fetch settling so a cold desk's first load already
-  // lands on performer lanes instead of streamId-keyed fallback strips.
-  const chirped = state.lastChirpAt !== null;
+  // Load AND auto-align the selected take as soon as it is complete at
+  // the desk. Alignment always runs (W4-B): align() tries the chirp first
+  // and falls back to content cross-correlation, so a chirpless session
+  // aligns too — the verdict UX carries the honest outcome either way,
+  // and a persisted verdict restored before the run satisfies align()'s
+  // idempotence (no re-measure). Loads run through the latest-wins queue
+  // (F5): a pick landing mid-decode is never dropped — the player
+  // converges on the newest selection. Streams map to mixer lanes by
+  // performer (read through a ref: mapping identity churns every poll and
+  // must not re-fire this effect — see selectedStreamKey). Gated on the
+  // attribution fetch settling so a cold desk's first load already lands
+  // on performer lanes instead of streamId-keyed fallback strips.
   const peerByStreamRef = useRef(peerByStream);
   peerByStreamRef.current = peerByStream;
   useEffect(() => {
@@ -369,9 +372,9 @@ function Desk({ sessionId }: { sessionId: string }) {
       takeId: selectedTakeId,
       streamIds: selectedStreamIds,
       channelOf: (streamId) => peerByStreamRef.current.get(streamId) ?? streamId,
-      align: chirped,
+      align: true,
     });
-  }, [sessionId, selectedTakeId, selectedStreamIds, recording, chirped, attribution.ready]);
+  }, [sessionId, selectedTakeId, selectedStreamIds, recording, attribution.ready]);
 
   // Late attribution (F1): if the stream→peer mapping lands AFTER a take
   // was loaded, re-key its tracks onto the performer lanes so saved strips

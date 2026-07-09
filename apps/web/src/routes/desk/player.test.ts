@@ -9,7 +9,7 @@
 // engine (`position()`) must never disagree about where the playhead is.
 // The wasm module is mocked so align() runs deterministically in node.
 
-import { find_chirp_offset, init as initWasm } from "@antiphon/core-wasm";
+import { align_content, find_chirp_offset, init as initWasm } from "@antiphon/core-wasm";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type PlayerSnapshot, type StoredTrackAlignment, TakePlayer } from "./player";
 
@@ -17,6 +17,8 @@ vi.mock("@antiphon/core-wasm", () => ({
   init: vi.fn(() => Promise.resolve()),
   // Default: a measurable but low-confidence hit → align() declines.
   find_chirp_offset: vi.fn(() => JSON.stringify({ lagSamples: 120, confidence: 0.3 })),
+  // Default: no shared content located → the chirp verdict stands (W4-B).
+  align_content: vi.fn((): string | null => null),
   DriftEstimator: class {
     next_request_json(): string | null {
       return null; // no windows: estimate immediately
@@ -300,18 +302,20 @@ describe("alignment outcome (F7a)", () => {
     const { player } = await loadedPlayer(1, ["s1", "s2"]);
     await player.align(true);
     const outcome = player.snapshot().alignmentOutcome;
-    expect(outcome).toEqual({ kind: "declined", confidence: 0.3 });
+    // Chirp-measured decline → the chirp bar (2.5) is the one it failed.
+    expect(outcome).toEqual({ kind: "declined", confidence: 0.3, threshold: 2.5 });
     // Declined ≠ applied: no head-trim deltas are in force.
     expect(player.alignDeltas().size).toBe(0);
   });
 
-  it("reports aligned with track count and the drift reference", async () => {
+  it("reports aligned with track count, the drift reference, and the method", async () => {
     const { player } = await loadedPlayer(1, ["s1", "s2"]);
     expect(player.restoreAlignment("take-1", appliedEntries())).toBe(true);
     expect(player.snapshot().alignmentOutcome).toEqual({
       kind: "aligned",
       trackCount: 2,
       referenceStreamId: "s1",
+      method: "chirp",
     });
   });
 
@@ -326,6 +330,133 @@ describe("alignment outcome (F7a)", () => {
       message: "wasm exploded",
     });
     expect(player.snapshot().aligning).toBe(false);
+  });
+});
+
+// ---- W4-B: content-alignment fallback --------------------------------------------
+
+describe("content-alignment fallback (W4-B)", () => {
+  beforeEach(() => {
+    vi.mocked(find_chirp_offset).mockClear();
+    vi.mocked(align_content).mockClear();
+  });
+
+  it("aligns chirpless near-identical clips through content correlation", async () => {
+    const { player } = await loadedPlayer(2, ["s1", "s2"]);
+    // Chirp declines on both (default mock); content locates s2's stream
+    // holding 4 800 samples MORE pre-roll than the reference s1.
+    vi.mocked(align_content).mockReturnValueOnce(
+      JSON.stringify({ lagSamples: 4_800, peak: 0.92, confidence: 6.1 }),
+    );
+    await player.align(true);
+    expect(align_content).toHaveBeenCalledTimes(1);
+    expect(player.snapshot().alignmentOutcome).toEqual({
+      kind: "aligned",
+      trackCount: 2,
+      referenceStreamId: "s1",
+      method: "content",
+    });
+    // Head-trim deltas flow through the SAME schedule math as chirp lags.
+    expect([...player.alignDeltas().entries()].sort()).toEqual([
+      ["s1", 0],
+      ["s2", 4_800],
+    ]);
+    // The measured track and the anchored reference both carry the method
+    // — persistence (F7b) rides on these exact fields.
+    const tracks = player.snapshot().tracks;
+    expect(tracks.find((t) => t.streamId === "s2")?.alignment).toEqual({
+      lagSamples: 4_800,
+      confidence: 6.1,
+      applied: true,
+      method: "content",
+    });
+    expect(tracks.find((t) => t.streamId === "s1")?.alignment).toEqual({
+      lagSamples: 0,
+      confidence: 6.1,
+      applied: true,
+      method: "content",
+    });
+  });
+
+  it("handles negative content offsets (the reference armed earlier)", async () => {
+    const { player } = await loadedPlayer(2, ["s1", "s2"]);
+    vi.mocked(align_content).mockReturnValueOnce(
+      JSON.stringify({ lagSamples: -4_800, peak: 0.9, confidence: 5.0 }),
+    );
+    await player.align(true);
+    // s2 holds LESS pre-roll: everyone else trims, s2 trims zero.
+    expect([...player.alignDeltas().entries()].sort()).toEqual([
+      ["s1", 4_800],
+      ["s2", 0],
+    ]);
+  });
+
+  it("declines honestly when content confidence is below the threshold", async () => {
+    const { player } = await loadedPlayer(1, ["s1", "s2"]);
+    vi.mocked(align_content).mockReturnValueOnce(
+      JSON.stringify({ lagSamples: 4_800, peak: 0.4, confidence: 1.2 }),
+    );
+    await player.align(true);
+    // Best measured confidence across BOTH methods (chirp 0.3, content 1.2)
+    // — and the bar shown is the CONTENT one (2.75), matching the method
+    // of that best measurement.
+    expect(player.snapshot().alignmentOutcome).toEqual({
+      kind: "declined",
+      confidence: 1.2,
+      threshold: 2.75,
+    });
+    expect(player.alignDeltas().size).toBe(0);
+    // The reference is never anchored without an applied peer.
+    const s1 = player.snapshot().tracks.find((t) => t.streamId === "s1");
+    expect(s1?.alignment?.applied).toBe(false);
+    expect(s1?.alignment?.method).toBe("chirp");
+  });
+
+  it("rescues chirp-declined tracks into the chirp anchor (mixed verdict)", async () => {
+    const { player } = await loadedPlayer(2, ["s1", "s2", "s3"]);
+    vi.mocked(find_chirp_offset)
+      .mockReturnValueOnce(JSON.stringify({ lagSamples: 48_000, confidence: 5 }))
+      .mockReturnValueOnce(JSON.stringify({ lagSamples: 48_400, confidence: 5 }))
+      .mockReturnValueOnce(JSON.stringify({ lagSamples: 0, confidence: 0.3 }));
+    // s3's content sits 500 samples deeper than the chirp reference s1:
+    // its stored lag lands in the VIRTUAL chirp domain (48 000 + 500).
+    vi.mocked(align_content).mockReturnValueOnce(
+      JSON.stringify({ lagSamples: 500, peak: 0.9, confidence: 4.2 }),
+    );
+    await player.align(true);
+    expect(align_content).toHaveBeenCalledTimes(1);
+    expect(player.snapshot().alignmentOutcome).toEqual({
+      kind: "aligned",
+      trackCount: 3,
+      referenceStreamId: "s1",
+      method: "mixed",
+    });
+    expect([...player.alignDeltas().entries()].sort()).toEqual([
+      ["s1", 0],
+      ["s2", 400],
+      ["s3", 500],
+    ]);
+  });
+
+  it("never runs content correlation when the chirp placed every track", async () => {
+    const { player } = await loadedPlayer(2, ["s1", "s2"]);
+    vi.mocked(find_chirp_offset)
+      .mockReturnValueOnce(JSON.stringify({ lagSamples: 48_000, confidence: 5 }))
+      .mockReturnValueOnce(JSON.stringify({ lagSamples: 48_400, confidence: 5 }));
+    await player.align(true);
+    expect(align_content).not.toHaveBeenCalled();
+    expect(player.snapshot().alignmentOutcome).toMatchObject({ kind: "aligned", method: "chirp" });
+  });
+
+  it("skips content entirely on a single-track take", async () => {
+    const { player } = await loadedPlayer(2, ["s1"]);
+    await player.align(true);
+    expect(align_content).not.toHaveBeenCalled();
+    expect(player.snapshot().alignmentOutcome).toEqual({
+      kind: "declined",
+      confidence: 0.3,
+      threshold: 2.5,
+    });
   });
 });
 
@@ -389,7 +520,12 @@ describe("alignment restore (F7b)", () => {
       s2: { alignment: { lagSamples: 120, confidence: 0.3, applied: false }, drift: null },
     };
     expect(player.restoreAlignment("take-1", declined)).toBe(true);
-    expect(player.snapshot().alignmentOutcome).toEqual({ kind: "declined", confidence: 0.3 });
+    // Restored legacy entries normalize to chirp → the chirp bar shows.
+    expect(player.snapshot().alignmentOutcome).toEqual({
+      kind: "declined",
+      confidence: 0.3,
+      threshold: 2.5,
+    });
     vi.mocked(find_chirp_offset).mockClear();
     await player.align(); // non-force: the restored verdict stands
     expect(find_chirp_offset).not.toHaveBeenCalled();

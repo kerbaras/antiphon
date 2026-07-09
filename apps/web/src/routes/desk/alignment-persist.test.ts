@@ -36,7 +36,7 @@ function memoryStore(): Pick<Storage, "getItem" | "setItem"> & { map: Map<string
 
 function verdict(lag: number, applied = true): StoredTrackAlignment {
   return {
-    alignment: { lagSamples: lag, confidence: applied ? 5 : 0.3, applied },
+    alignment: { lagSamples: lag, confidence: applied ? 5 : 0.3, applied, method: "chirp" },
     drift: null,
   };
 }
@@ -94,7 +94,8 @@ describe("parseTakeAlignment", () => {
     expect(parsed).toEqual({
       s1: verdict(0),
       s2: {
-        alignment: { lagSamples: 10, confidence: 3, applied: true },
+        // Legacy entry without a method normalizes to chirp (W4-B).
+        alignment: { lagSamples: 10, confidence: 3, applied: true, method: "chirp" },
         drift: {
           ratio: 1.0001,
           ppm: 100,
@@ -106,6 +107,78 @@ describe("parseTakeAlignment", () => {
         },
       },
     });
+  });
+
+  it("decodes content wire entries (contentLagSamples), drops junk methods", () => {
+    // WIRE COMPAT: content lags travel under `contentLagSamples`.
+    const wire = {
+      alignment: { contentLagSamples: -4_800, confidence: 4, applied: true, method: "content" },
+      drift: null,
+    };
+    expect(parseTakeAlignment({ s1: wire })).toEqual({
+      s1: {
+        alignment: { lagSamples: -4_800, confidence: 4, applied: true, method: "content" },
+        drift: null,
+      },
+    });
+    // A content entry carrying only a plain lagSamples exists in no
+    // released writer — junk, dropped.
+    expect(
+      parseTakeAlignment({
+        junk: {
+          alignment: { lagSamples: -4_800, confidence: 4, applied: true, method: "content" },
+          drift: null,
+        },
+      }),
+    ).toBeNull();
+    expect(
+      parseTakeAlignment({
+        junk: {
+          alignment: { lagSamples: 1, confidence: 4, applied: true, method: "psychic" },
+          drift: null,
+        },
+      }),
+    ).toBeNull();
+  });
+
+  it("content wire entries are structurally invisible to pre-W4-B validators", () => {
+    // The compat mechanism (see alignment-persist.ts WIRE COMPAT): an OLD
+    // desk requires a finite `lagSamples` and rebuilds only known keys. A
+    // content entry omits `lagSamples`, so the legacy validator drops it
+    // WHOLE — honest "no verdict" — instead of wrapping a >1 s content
+    // offset modulo the chirp repeat interval (a ~2 s tear). Pinned here
+    // by replicating the legacy validation logic verbatim.
+    const legacyValid = (v: unknown): boolean => {
+      if (typeof v !== "object" || v === null) return false;
+      const a = v as Record<string, unknown>;
+      return (
+        typeof a.lagSamples === "number" &&
+        Number.isFinite(a.lagSamples) &&
+        typeof a.confidence === "number" &&
+        typeof a.applied === "boolean"
+      );
+    };
+    const doc = new Y.Doc();
+    const collab = { doc, origin: {} };
+    persistTakeAlignment(collab, SESSION, TAKE, {
+      chirped: verdict(4_800),
+      contentAligned: {
+        alignment: { lagSamples: 88_800, confidence: 6, applied: true, method: "content" },
+        drift: null,
+      },
+    });
+    const raw = doc.getMap("alignment").get(TAKE) as {
+      entries: Record<string, { alignment: Record<string, unknown> }>;
+    };
+    // Chirp entries keep the v1 shape (old desks still restore them)…
+    expect(legacyValid(raw.entries.chirped?.alignment)).toBe(true);
+    // …content entries fail legacy validation and carry NO lagSamples an
+    // old desk could mistake for a chirp lag.
+    expect(legacyValid(raw.entries.contentAligned?.alignment)).toBe(false);
+    expect("lagSamples" in (raw.entries.contentAligned?.alignment ?? {})).toBe(false);
+    expect(raw.entries.contentAligned?.alignment.contentLagSamples).toBe(88_800);
+    // A NEW desk reads the full verdict back, lag intact.
+    expect(readDocAlignment(doc, TAKE)?.entries.contentAligned?.alignment.lagSamples).toBe(88_800);
   });
 
   it("drops malformed entries individually and nulls out empty results", () => {
@@ -136,6 +209,25 @@ describe("localStorage shadow", () => {
     saveLocalAlignment(SESSION, TAKE, record(42, 7), store);
     expect(store.map.has(alignmentKey(SESSION, TAKE))).toBe(true);
     expect(loadLocalAlignment(SESSION, TAKE, store)).toEqual(record(42, 7));
+  });
+
+  it("content verdicts round-trip the shadow wire-encoded", () => {
+    const store = memoryStore();
+    const record: TakeAlignmentRecord = {
+      at: 9,
+      entries: {
+        s1: {
+          alignment: { lagSamples: 88_800, confidence: 6, applied: true, method: "content" },
+          drift: null,
+        },
+      },
+    };
+    saveLocalAlignment(SESSION, TAKE, record, store);
+    // Wire shape on disk (contentLagSamples, no lagSamples)…
+    expect(store.map.get(alignmentKey(SESSION, TAKE))).toContain('"contentLagSamples":88800');
+    expect(store.map.get(alignmentKey(SESSION, TAKE))).not.toContain('"lagSamples"');
+    // …decoded back to the exact in-memory verdict.
+    expect(loadLocalAlignment(SESSION, TAKE, store)).toEqual(record);
   });
 
   it("degrades to null on junk, wrong schema, or absent keys", () => {

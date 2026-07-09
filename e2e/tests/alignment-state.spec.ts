@@ -1,9 +1,12 @@
 // F7 — alignment UX honesty + reload persistence.
 //
-// (a) Outcome states: auto-align on a chirpless take must NOT end silent —
-//     the toolbar control lands in a visible "declined" state carrying the
-//     measured confidence (fake mics emit a sine tone; chirp correlation
-//     legitimately declines). Never-ran / declined / aligned are distinct.
+// (a) Outcome states: alignment on a chirpless take must NOT end silent —
+//     it now AUTO-runs on take load (W4-B) and lands in a visible
+//     "declined" state carrying the measured confidence (fake mics emit a
+//     periodic tone: chirp correlation legitimately declines, and the
+//     content fallback honestly declines too — a periodic signal matches
+//     at every period, so no unique lag exists). The near-identical-clips
+//     scenario that DOES content-align lives in content-align.spec.ts.
 // (b) Persistence: the alignment verdict is take-derived state — it must
 //     survive a desk reload (doc + localStorage shadow) and reapply at
 //     schedule time WITHOUT re-decoding or re-correlating. Applied deltas
@@ -74,7 +77,9 @@ test.describe("alignment UX (F7)", () => {
     await joinAsRecorder(phoneB, sessionId);
     await expect(desk.getByText("2 phones connected")).toBeVisible({ timeout: 15_000 });
 
-    // --- a chirpless take: nothing auto-aligns, state must read "idle" ----
+    // --- a chirpless take AUTO-aligns on load (W4-B): the periodic fake
+    //     tone defeats chirp AND content correlation → honest DECLINED,
+    //     with the measured confidence, no click required.
     const takeId = await startTake(desk);
     await desk.waitForTimeout(3_000);
     await stopTake(desk);
@@ -82,19 +87,16 @@ test.describe("alignment UX (F7)", () => {
     await expect.poll(() => loadedTakeId(desk), { timeout: 30_000 }).toBe(takeId);
 
     const alignButton = desk.getByRole("button", { name: "Auto-align" });
-    await expect(alignButton).toHaveAttribute("data-align-state", "idle");
-
-    // --- force auto-align → honest DECLINED state with the confidence ----
-    await expect(alignButton).toBeEnabled({ timeout: 15_000 });
-    await alignButton.click();
     await expect(alignButton).toHaveAttribute("data-align-state", "declined", {
       timeout: 60_000,
     });
     const outcome = desk.getByTestId("align-outcome");
     await expect(outcome).toBeVisible();
-    // The readout carries the measured confidence and the accept threshold.
+    // The readout carries the measured confidence and the accept bar it
+    // failed: the chirp bar (2.5) or the stricter content bar (2.75),
+    // whichever matches the best measurement's method.
     await expect(outcome).toContainText(/declined/i);
-    await expect(outcome).toContainText(/confidence \d+(\.\d+)? < 2\.5/);
+    await expect(outcome).toContainText(/confidence \d+(\.\d+)? < 2\.(5|75)/);
     // Every loaded track carries a measured (non-null, unapplied) verdict.
     const measured = await playerTracks(desk);
     expect(measured).toHaveLength(2);

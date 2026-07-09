@@ -1,10 +1,17 @@
 // Take playback engine: decodes each stream's archived FLAC into an
 // AudioBuffer and plays them through per-track EQ → gain → pan → analyser
 // → master EQ → master gain → master pan → analyser → speakers. Alignment
-// offsets from chirp correlation and per-stream drift ratios are applied
-// at schedule time — stored audio is never touched (RFC §13).
+// offsets from chirp correlation — or, when no usable chirp is present,
+// from content cross-correlation against a reference stream (W4-B) — and
+// per-stream drift ratios are applied at schedule time — stored audio is
+// never touched (RFC §13).
 
-import { DriftEstimator, find_chirp_offset, init as initWasm } from "@antiphon/core-wasm";
+import {
+  align_content,
+  DriftEstimator,
+  find_chirp_offset,
+  init as initWasm,
+} from "@antiphon/core-wasm";
 import { DEFAULT_CHIRP_SPEC } from "@antiphon/protocol";
 import {
   applyEqPatch,
@@ -17,15 +24,38 @@ import {
   updateEqChain,
 } from "./eq";
 import type { RenderModel } from "./render";
-import { normalizeAlignDeltas, planSource, type TrackTiming, trackEndSec } from "./timeline-math";
+import {
+  type AlignMethod,
+  normalizeAlignDeltas,
+  planSource,
+  type TrackTiming,
+  trackEndSec,
+  wrapLag,
+} from "./timeline-math";
 
 const MIN_DB = -60;
 const MAX_DB = 6;
-/** Correlate against at most this much of the stream head. */
+/** Correlate against at most this much of the stream head (chirp). */
 const ALIGN_WINDOW_SECONDS = 25;
-/** Chirp-correlation accept threshold — exported so the toolbar's declined
- * readout can show the honest comparison (F7a). */
+/** Content correlation head window: pre-roll offsets are arming spread
+ * (seconds at worst), so both live in the head — and the slice caps what
+ * crosses the wasm boundary (the dsp side caps at 60 s anyway). */
+const CONTENT_WINDOW_SECONDS = 60;
+/** CHIRP correlation accept threshold. The chirp is a matched filter with
+ * its own sidelobe statistics — W1-A calibrated this bar and it stays
+ * put. Exported so the toolbar's declined readout can show the honest
+ * comparison (F7a). */
 export const ALIGN_MIN_CONFIDENCE = 2.5;
+/** CONTENT correlation accept threshold — deliberately STRICTER than the
+ * chirp bar. The two confidence scales are comparable (peak-to-sidelobe
+ * based) but their tail statistics are not: QA round-2 calibration put the
+ * uncorrelated-content false-accept tail at 2.62 (1/200) while the lowest
+ * honest content accept observed anywhere was 3.41 — 2.75 splits that gap
+ * with margin on both sides. The chirp path saw no false accepts near its
+ * bar, so the thresholds diverge on purpose; keep them separate constants
+ * and recalibrate them independently. Mirrored by the dsp calibration
+ * tests' ACCEPT pin (packages/dsp/src/content.rs). */
+export const CONTENT_MIN_CONFIDENCE = 2.75;
 /** Drift guard rails: below this confidence, or beyond this |ratio−1|,
  * fall back to ratio 1 — a wrong ratio is worse than uncorrected drift,
  * and real ADC crystals never miss by a full 1000 ppm. */
@@ -36,14 +66,31 @@ export interface AlignmentResult {
   lagSamples: number;
   confidence: number;
   applied: boolean;
+  /** How the lag was measured (W4-B). Absent — legacy pre-content
+   * verdicts, or entries applied through untyped hooks — means chirp. */
+  method?: AlignMethod;
 }
 
 /** One auto-align run's honest verdict for the toolbar (F7a), derived from
  * per-track state — so a persisted verdict restored after a reload reads
- * exactly like a freshly measured one. Null = never ran on this take. */
+ * exactly like a freshly measured one. Null = never ran on this take.
+ * `method` distinguishes chirp-aligned from content-aligned (and `mixed`
+ * when chirp anchored most tracks and content rescued the rest). */
 export type AlignmentOutcome =
-  | { kind: "aligned"; trackCount: number; referenceStreamId: string | null }
-  | { kind: "declined"; confidence: number }
+  | {
+      kind: "aligned";
+      trackCount: number;
+      referenceStreamId: string | null;
+      method: AlignMethod | "mixed";
+    }
+  | {
+      kind: "declined";
+      confidence: number;
+      /** The accept bar the best measurement failed — the content bar
+       * (2.75) when the best-confidence track was content-measured, else
+       * the chirp bar (2.5). The readout must compare like with like. */
+      threshold: number;
+    }
   | { kind: "failed"; message: string };
 
 /** Persisted per-stream alignment verdict (F7b): exactly the fields
@@ -261,15 +308,24 @@ export class TakePlayer {
     const applied = measured.filter((t) => t.alignment?.applied);
     if (applied.length > 0) {
       const reference = applied.find((t) => t.drift?.isReference) ?? null;
+      const methods = new Set<AlignMethod>(applied.map((t) => t.alignment?.method ?? "chirp"));
       return {
         kind: "aligned",
         trackCount: applied.length,
         referenceStreamId: reference?.streamId ?? null,
+        method: methods.size > 1 ? "mixed" : methods.has("content") ? "content" : "chirp",
       };
     }
+    const best = measured.reduce((a, b) =>
+      (b.alignment?.confidence ?? 0) > (a.alignment?.confidence ?? 0) ? b : a,
+    );
     return {
       kind: "declined",
-      confidence: Math.max(...measured.map((t) => t.alignment?.confidence ?? 0)),
+      confidence: best.alignment?.confidence ?? 0,
+      threshold:
+        (best.alignment?.method ?? "chirp") === "content"
+          ? CONTENT_MIN_CONFIDENCE
+          : ALIGN_MIN_CONFIDENCE,
     };
   }
 
@@ -417,10 +473,14 @@ export class TakePlayer {
     this.notify();
   }
 
-  /** Chirp correlation per track (RFC §10): the chirp position in each
-   * stream maps its sample domain onto the shared room clock. Idempotent
-   * unless `force`: auto-align triggers ride on status polls, and both the
-   * correlation cost and the final re-schedule must not repeat. */
+  /** Auto-align the loaded take (RFC §10 + W4-B). Chirp correlation per
+   * track first: the chirp position in each stream maps its sample domain
+   * onto the shared room clock. Tracks the chirp couldn't place (no chirp
+   * emitted, or too quiet/clipped to trust) then fall back to CONTENT
+   * cross-correlation against a reference stream — near-identical clips
+   * align without any calibration sweep. Idempotent unless `force`:
+   * auto-align triggers ride on status polls, and both the correlation
+   * cost and the final re-schedule must not repeat. */
   async align(force = false): Promise<void> {
     if (this.tracks.size === 0 || this.aligning) return;
     if (!force && [...this.tracks.values()].every((t) => t.alignment !== null)) return;
@@ -428,6 +488,14 @@ export class TakePlayer {
     this.aligning = true;
     this.alignError = null;
     this.notify();
+    // Schedule inputs before the run: a re-schedule mid-playback is an
+    // audible cut, so it must happen ONLY when the measurements actually
+    // changed a track's timing (align runs on every take load now, and
+    // W4-A's gapless invariant pins scheduleCount == 1 — a declined run
+    // landing during playback must be inaudible and schedule-free).
+    const fingerprint = () =>
+      JSON.stringify([...this.tracks.values()].map((t) => [t.streamId, this.timing(t)]));
+    const before = fingerprint();
     try {
       await initWasm();
       const spec = DEFAULT_CHIRP_SPEC;
@@ -453,15 +521,18 @@ export class TakePlayer {
             lagSamples: parsed.lagSamples,
             confidence: parsed.confidence,
             applied: parsed.confidence >= ALIGN_MIN_CONFIDENCE,
+            method: "chirp",
           };
         } else {
-          track.alignment = { lagSamples: 0, confidence: 0, applied: false };
+          track.alignment = { lagSamples: 0, confidence: 0, applied: false, method: "chirp" };
         }
       }
-      // Chirp offsets fix the take head; drift keeps it fixed for 45 min.
+      await this.alignContentFallback();
+      // Alignment offsets fix the take head; drift keeps it fixed for 45 min.
       await this.estimateDrift();
-      // Re-schedule if currently playing so offsets take effect audibly.
-      if (this.playing) {
+      // Re-schedule if currently playing AND the run changed any track's
+      // schedule timing, so offsets take effect audibly (see fingerprint).
+      if (this.playing && fingerprint() !== before) {
         const pos = this.position();
         this.stopSources();
         this.schedule(pos);
@@ -486,6 +557,72 @@ export class TakePlayer {
     }
   }
 
+  /** Content-based alignment for the tracks chirp correlation couldn't
+   * place (W4-B — the operator's "near-identical clips won't align" P0).
+   * Each chirp-declined track's head is cross-correlated against a
+   * reference stream's head (dsp content module: envelope coarse pass +
+   * PCM fine pass, consensus-gated); its lag is stored in the VIRTUAL
+   * chirp-lag domain — the reference's own (wrapped) chirp lag plus the
+   * measured signed pre-roll offset — so chirp- and content-aligned
+   * tracks share one domain and the existing delta/persistence/render
+   * math applies unchanged. Reference policy: the longest chirp-applied
+   * track when any exist (content rescues the stragglers into the chirp
+   * anchor), otherwise the longest track overall (pure content mode).
+   * A failed content measurement KEEPS the honest chirp decline — the
+   * verdict never fabricates. */
+  private async alignContentFallback(): Promise<void> {
+    if (this.tracks.size < 2) return; // nothing to align against
+    const tracks = [...this.tracks.values()];
+    const chirpApplied = tracks.filter((t) => t.alignment?.applied);
+    if (chirpApplied.length === tracks.length) return; // chirp placed everything
+    const anchors = chirpApplied.length > 0 ? chirpApplied : tracks;
+    const reference = anchors.reduce((a, b) => (b.buffer.length > a.buffer.length ? b : a));
+    const spec = DEFAULT_CHIRP_SPEC;
+    const rate = reference.buffer.sampleRate;
+    // Content lags chain onto the reference's chirp lag, wrapped exactly
+    // as normalizeAlignDeltas wraps it against the applied chirp set — the
+    // two computations must agree or restored deltas would tear apart.
+    let refVirtualLag = 0;
+    if (reference.alignment?.applied) {
+      const base = Math.min(...chirpApplied.map((t) => t.alignment?.lagSamples ?? 0));
+      const interval = Math.round(((spec.durationMs + spec.gapMs) / 1_000) * rate);
+      refVirtualLag = base + wrapLag(reference.alignment.lagSamples - base, interval);
+    }
+    const refWindow = Math.min(reference.buffer.length, Math.round(rate * CONTENT_WINDOW_SECONDS));
+    const refHead = reference.buffer.getChannelData(0).slice(0, refWindow);
+    let bestConfidence = 0;
+    for (const track of this.tracks.values()) {
+      if (track === reference || track.alignment?.applied) continue;
+      const trackRate = track.buffer.sampleRate;
+      const window = Math.min(track.buffer.length, Math.round(trackRate * CONTENT_WINDOW_SECONDS));
+      const head = track.buffer.getChannelData(0).slice(0, window);
+      // Yield to the UI between (potentially ~100ms) correlations.
+      await new Promise((r) => setTimeout(r, 0));
+      const result = align_content(refHead, head, trackRate);
+      if (!result) continue; // keep the honest chirp decline
+      const parsed = JSON.parse(result) as { lagSamples: number; confidence: number };
+      const applied = parsed.confidence >= CONTENT_MIN_CONFIDENCE;
+      track.alignment = {
+        lagSamples: refVirtualLag + parsed.lagSamples,
+        confidence: parsed.confidence,
+        applied,
+        method: "content",
+      };
+      if (applied) bestConfidence = Math.max(bestConfidence, parsed.confidence);
+    }
+    // Pure content mode: anchor the reference at lag 0 so the deltas have
+    // their second point. Its confidence is the set's best pair match —
+    // the anchor's verdict is only as trustworthy as what locked onto it.
+    if (bestConfidence > 0 && !reference.alignment?.applied) {
+      reference.alignment = {
+        lagSamples: 0,
+        confidence: bestConfidence,
+        applied: true,
+        method: "content",
+      };
+    }
+  }
+
   /** Register for settled align() runs (F7b persistence). */
   onAlignmentSettled(listener: (takeId: string) => void): () => void {
     this.alignmentSettledListeners.add(listener);
@@ -506,13 +643,20 @@ export class TakePlayer {
     for (const track of this.tracks.values()) {
       const entry = entries[track.streamId];
       if (!entry) continue;
+      // Normalize before comparing/applying: legacy verdicts (and untyped
+      // hook entries) carry no method — they can only be chirp.
+      const alignment: AlignmentResult = {
+        ...entry.alignment,
+        method: entry.alignment.method ?? "chirp",
+      };
       if (
         track.alignment !== null &&
-        JSON.stringify({ alignment: track.alignment, drift: track.drift }) === JSON.stringify(entry)
+        JSON.stringify({ alignment: track.alignment, drift: track.drift }) ===
+          JSON.stringify({ alignment, drift: entry.drift })
       ) {
         continue;
       }
-      track.alignment = { ...entry.alignment };
+      track.alignment = alignment;
       track.drift = entry.drift ? { ...entry.drift } : null;
       changed = true;
     }
@@ -658,6 +802,7 @@ export class TakePlayer {
           streamId: t.streamId,
           lagSamples: t.alignment?.lagSamples ?? 0,
           sampleRate: t.buffer.sampleRate,
+          method: t.alignment?.method ?? "chirp",
         })),
       (spec.durationMs + spec.gapMs) / 1_000,
     );
