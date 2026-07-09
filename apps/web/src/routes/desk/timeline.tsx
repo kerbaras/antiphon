@@ -12,6 +12,7 @@ import {
   type ClipModel,
   LaneRuler,
   laneGridStyle,
+  RenameInput,
   RULER_H,
   TRACK_HEADER_W,
   TRACK_ROW_H,
@@ -54,6 +55,9 @@ export function TimelineSection({
   playheadSec,
   ghostPlayheads,
   marquee,
+  selectedLaneKey,
+  onSelectLane,
+  onLaneMenu,
   onSeekTimeline,
   onAddMarkerAt,
 }: {
@@ -81,6 +85,12 @@ export function TimelineSection({
   /** Other desks' cursors (W3-A presence), arrangement-timeline seconds. */
   ghostPlayheads: Array<{ clientId: number; name: string; color: string; atSec: number }>;
   marquee: Marquee | null;
+  /** Selected lane (W4-E): desk-local UI state shared with the mixer —
+   * highlighted here, target of the S/M keyboard shortcuts. */
+  selectedLaneKey: string | null;
+  onSelectLane: (key: string) => void;
+  /** Right-click a row header: the lane context menu at the cursor (W4-E). */
+  onLaneMenu: (key: string, x: number, y: number) => void;
   onSeekTimeline: (sec: number) => void;
   onAddMarkerAt: (atSec: number) => void;
 }) {
@@ -227,6 +237,9 @@ export function TimelineSection({
             strip={channels.find((c) => c.key === row.key)}
             recording={recording}
             armed={recording ? row.armed : !disarmedPeers.includes(row.key)}
+            selected={row.key === selectedLaneKey}
+            onSelect={() => onSelectLane(row.key)}
+            onLaneMenu={(x, y) => onLaneMenu(row.key, x, y)}
             onToggleArm={() => getDeskSession(sessionId).toggleArm(row.key)}
             {...(row.peerId
               ? {
@@ -393,6 +406,9 @@ function TimelineRow({
   strip,
   recording,
   armed,
+  selected,
+  onSelect,
+  onLaneMenu,
   onToggleArm,
   onRename,
 }: {
@@ -406,14 +422,32 @@ function TimelineRow({
    * arm toggle is honestly disabled instead of silently deferring. */
   recording: boolean;
   armed: boolean;
+  /** Lane selection (W4-E): press anywhere on the header — same accent
+   * ring as the lane's mixer strip; S/M then key on this lane. */
+  selected: boolean;
+  onSelect: () => void;
+  /** Right-click: the lane context menu at the cursor (W4-E). */
+  onLaneMenu: (x: number, y: number) => void;
   onToggleArm: () => void;
   onRename?: (label: string) => void;
 }) {
   return (
     <div className="flex border-b border-[#0e0f10]" style={{ height: TRACK_ROW_H }}>
-      {/* header (232px, sticky) */}
+      {/* header (232px, sticky) — press anywhere selects the lane,
+          right-click opens the lane menu (the header's buttons remain
+          the keyboard path) */}
+      {/* biome-ignore lint/a11y/noStaticElementInteractions: pointer select/context-menu surface; the header's buttons are the keyboard path */}
       <div
-        className="sticky left-0 z-[5] flex flex-none items-stretch border-r border-divider bg-card"
+        data-lane-header={row.key}
+        data-selected={selected}
+        onPointerDown={onSelect}
+        onContextMenu={(e) => {
+          e.preventDefault();
+          onLaneMenu(e.clientX, e.clientY);
+        }}
+        className={`sticky left-0 z-[5] flex flex-none items-stretch border-r border-divider ${
+          selected ? "bg-card-hi shadow-[inset_0_0_0_1px_var(--color-accent)]" : "bg-card"
+        }`}
         style={{ width: TRACK_HEADER_W }}
       >
         <div className="w-1 flex-none" style={{ background: row.color }} />
@@ -481,44 +515,22 @@ function TimelineRow({
 /** Lane title with inline rename: double-click the name, or the pencil
  * that appears on header hover. Renames go through peer-update (A13) —
  * the server persists and fans out; the title updates on the echo. Only
- * lanes that map to a known peer get the affordance. */
+ * lanes that map to a known peer get the affordance. The editor itself is
+ * the shared RenameInput (daw.tsx) — the mixer strip title (W4-E) opens
+ * the exact same one. */
 function LaneName({ name, onRename }: { name: string; onRename?: (label: string) => void }) {
-  const [draft, setDraft] = useState<string | null>(null);
-  const cancelled = useRef(false);
+  const [editing, setEditing] = useState(false);
 
-  if (draft !== null && onRename) {
-    const commit = (value: string) => {
-      setDraft(null);
-      const next = value.trim();
-      if (next !== name) onRename(next);
-    };
+  if (editing && onRename) {
     return (
-      <input
-        // biome-ignore lint/a11y/noAutofocus: user explicitly opened the editor
-        autoFocus
-        value={draft}
-        maxLength={48}
-        aria-label="Rename lane"
-        onChange={(e) => setDraft(e.target.value)}
-        onFocus={(e) => e.target.select()}
-        onBlur={(e) => {
-          if (cancelled.current) {
-            cancelled.current = false;
-            setDraft(null);
-          } else {
-            commit(e.target.value);
-          }
-        }}
-        onKeyDown={(e) => {
-          if (e.key === "Enter") e.currentTarget.blur();
-          if (e.key === "Escape") {
-            cancelled.current = true;
-            e.currentTarget.blur();
-          }
-        }}
+      <RenameInput
+        name={name}
+        ariaLabel="Rename lane"
         // select-text: the timeline surface is select-none (W4-C) — the one
         // legitimately editable/copyable field on it opts back in.
         className="w-full min-w-0 select-text rounded-[3px] border border-accent bg-bg px-1 py-px text-[11.5px] font-semibold text-text-hi outline-none"
+        onCommit={onRename}
+        onClose={() => setEditing(false)}
       />
     );
   }
@@ -529,7 +541,7 @@ function LaneName({ name, onRename }: { name: string; onRename?: (label: string)
     <>
       <button
         type="button"
-        onDoubleClick={() => setDraft(name)}
+        onDoubleClick={() => setEditing(true)}
         title="Double-click to rename"
         className="min-w-0 cursor-text truncate text-left text-[11.5px] font-semibold text-text-strong"
       >
@@ -538,7 +550,7 @@ function LaneName({ name, onRename }: { name: string; onRename?: (label: string)
       <button
         type="button"
         aria-label={`Rename ${name}`}
-        onClick={() => setDraft(name)}
+        onClick={() => setEditing(true)}
         className="hidden flex-none font-mono text-[10px] leading-none text-text-faint group-hover/lane:inline hover:text-accent"
       >
         ✎

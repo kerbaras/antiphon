@@ -159,6 +159,36 @@ export function stableLaneOrder(ranks: Map<string, number>, candidates: LaneCand
     .sort((a, b) => (ranks.get(a) as number) - (ranks.get(b) as number));
 }
 
+// ---- W4-E — deliberate lane moves -----------------------------------------------
+// F8 froze the SPONTANEOUS reorder sources (status churn, late attribution,
+// reconnects); the context menu's Move up/down is the one sanctioned
+// mutation — an explicit operator action. Moves live in the shared doc
+// (collab-doc.ts 'laneOrder': laneKey → display ordinal, full-map writes,
+// LWW per key), so they persist across reloads and sync across desks like
+// the rest of the lane state. Ranks stay frozen underneath: colors and
+// default names key off the rank, so a moved lane keeps its identity.
+
+/** Layer deliberate move ordinals over the frozen-rank order. Lanes the
+ * ordinal source doesn't know (joined after the last move) follow F8's
+ * append rule — after every moved lane, frozen order among themselves.
+ * Ties (two desks moving concurrently can LWW-merge into equal ordinals)
+ * fall back to the frozen order too, so every desk resolves them alike. */
+export function applyLaneMoves(
+  frozenOrder: readonly string[],
+  ordinalOf: (key: string) => number | undefined,
+): string[] {
+  return frozenOrder
+    .map((key, base) => ({ key, base, ordinal: ordinalOf(key) }))
+    .sort((a, b) => {
+      if (a.ordinal === undefined && b.ordinal === undefined) return a.base - b.base;
+      if (a.ordinal === undefined || b.ordinal === undefined) {
+        return a.ordinal === undefined ? 1 : -1;
+      }
+      return a.ordinal - b.ordinal || a.base - b.base;
+    })
+    .map((entry) => entry.key);
+}
+
 // ---- F9 — orphaned mid-take-reload streams -------------------------------------
 // A6: a phone reloading mid-take arms a FRESH stream; the truncated
 // original never receives a stream-final, so completeness is

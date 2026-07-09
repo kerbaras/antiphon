@@ -14,10 +14,12 @@ import {
   healTakeListDuplicates,
   type MixStripState,
   readArrange,
+  readLaneOrder,
   readMix,
   readTakeList,
   seedTakeListOnce,
   writeArrange,
+  writeLaneOrder,
   writeMixIfChanged,
   writeTakeList,
 } from "./collab-doc";
@@ -94,6 +96,32 @@ describe("arrange map", () => {
 
     deleteArrangeKeys(b, ["stream-2", "never-there"], LOCAL);
     expect(readArrange(a)).toEqual({ "stream-1": 3.5 });
+  });
+});
+
+describe("lane order map (W4-E)", () => {
+  it("syncs full-map writes and drops keys that left the map", () => {
+    const a = new Y.Doc();
+    const b = new Y.Doc();
+    connect(a, b);
+
+    // One Move up/down writes every lane's position (see applyLaneMoves).
+    expect(writeLaneOrder(a, { "peer-b": 0, "peer-a": 1 }, LOCAL)).toBe(true);
+    expect(readLaneOrder(b)).toEqual({ "peer-b": 0, "peer-a": 1 });
+    // Unchanged map: no transaction at all — the no-echo write guard.
+    expect(writeLaneOrder(a, { "peer-b": 0, "peer-a": 1 }, LOCAL)).toBe(false);
+
+    // The next move re-keys the whole map (a lane deleted meanwhile just
+    // isn't in it anymore) — stale keys drop on every replica.
+    expect(writeLaneOrder(b, { "peer-a": 0 }, LOCAL)).toBe(true);
+    expect(readLaneOrder(a)).toEqual({ "peer-a": 0 });
+  });
+
+  it("stays independent of the arrange map (separate Y.Maps)", () => {
+    const doc = new Y.Doc();
+    writeLaneOrder(doc, { "peer-a": 0 }, LOCAL);
+    expect(readArrange(doc)).toEqual({});
+    expect(readLaneOrder(doc)).toEqual({ "peer-a": 0 });
   });
 });
 

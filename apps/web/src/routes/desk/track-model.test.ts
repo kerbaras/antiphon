@@ -6,6 +6,7 @@
 import { describe, expect, it } from "vitest";
 import type { DeskStreamStatus } from "../../audio/sink-worker-protocol";
 import {
+  applyLaneMoves,
   type ClipSpan,
   fileSafe,
   initialsOf,
@@ -120,6 +121,45 @@ describe("stableLaneOrder (F8)", () => {
     expect(stableLaneOrder(ranks, [lane("peer-x", 50, ["stream-1"]), lane("stream-2")])).toEqual([
       "peer-x",
       "stream-2",
+    ]);
+  });
+});
+
+// ---- W4-E — applyLaneMoves --------------------------------------------------------
+
+describe("applyLaneMoves (W4-E)", () => {
+  const ordinals = (map: Record<string, number>) => (key: string) => map[key];
+
+  it("keeps the frozen order when no move was ever made", () => {
+    expect(applyLaneMoves(["a", "b", "c"], ordinals({}))).toEqual(["a", "b", "c"]);
+  });
+
+  it("orders moved lanes by their ordinal", () => {
+    // One "Move up" on c wrote the full map: c before a and b.
+    expect(applyLaneMoves(["a", "b", "c"], ordinals({ a: 0, c: 1, b: 2 }))).toEqual([
+      "a",
+      "c",
+      "b",
+    ]);
+  });
+
+  it("appends ordinal-less newcomers after every moved lane (F8 append rule)", () => {
+    // d joined after the last move — no ordinal — and must land last even
+    // though its frozen rank sits between the moved lanes.
+    expect(applyLaneMoves(["a", "d", "b", "c"], ordinals({ b: 0, a: 1, c: 2 }))).toEqual([
+      "b",
+      "a",
+      "c",
+      "d",
+    ]);
+  });
+
+  it("breaks ordinal ties by frozen order, deterministically on every desk", () => {
+    // Two desks moved concurrently; LWW per key can merge into duplicates.
+    expect(applyLaneMoves(["a", "b", "c"], ordinals({ b: 0, a: 0, c: 1 }))).toEqual([
+      "a",
+      "b",
+      "c",
     ]);
   });
 });

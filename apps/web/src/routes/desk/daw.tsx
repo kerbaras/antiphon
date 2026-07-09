@@ -3,7 +3,8 @@
 // toolbar tools, ruler/track/clip geometry, pan knobs, faders, VU meters.
 // Anything not yet functional is visibly inert (aria-disabled), never fake.
 
-import type { ReactNode, Ref } from "react";
+import { type ReactNode, type Ref, useEffect, useRef, useState } from "react";
+import { NICKNAME_MAX_LENGTH } from "../../net/device-identity";
 import {
   EQ_DB_RANGE,
   EQ_MID_HZ_DEFAULT,
@@ -605,6 +606,60 @@ export function TrackMiniButton({
   );
 }
 
+// ---- inline rename -----------------------------------------------------------
+
+/** The one inline-rename editor (sidebar lane titles AND mixer strip
+ * names — W4-E rename parity): Enter commits via blur, Escape cancels,
+ * focus selects all. Renames ride the A13 peer-update path the caller
+ * wires in; maxLength advertises the UI-wide nickname cap
+ * (normalizeNickname re-enforces it at commit time regardless). Callers
+ * own the open/closed state; `onClose` always fires on exit. */
+export function RenameInput({
+  name,
+  ariaLabel,
+  className,
+  onCommit,
+  onClose,
+}: {
+  name: string;
+  ariaLabel: string;
+  className: string;
+  /** Receives the trimmed draft — only when it differs from `name`. */
+  onCommit: (label: string) => void;
+  onClose: () => void;
+}) {
+  const [draft, setDraft] = useState(name);
+  const cancelled = useRef(false);
+  return (
+    <input
+      // biome-ignore lint/a11y/noAutofocus: user explicitly opened the editor
+      autoFocus
+      value={draft}
+      maxLength={NICKNAME_MAX_LENGTH}
+      aria-label={ariaLabel}
+      onChange={(e) => setDraft(e.target.value)}
+      onFocus={(e) => e.target.select()}
+      onBlur={(e) => {
+        onClose();
+        if (cancelled.current) {
+          cancelled.current = false;
+          return;
+        }
+        const next = e.target.value.trim();
+        if (next !== name) onCommit(next);
+      }}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") e.currentTarget.blur();
+        if (e.key === "Escape") {
+          cancelled.current = true;
+          e.currentTarget.blur();
+        }
+      }}
+      className={className}
+    />
+  );
+}
+
 // ---- mixer -----------------------------------------------------------------
 
 /** Pan knob: drag horizontally (or vertically) to place the mono source in
@@ -880,6 +935,17 @@ function EqSection({
 const FADER_MAX_DB = 6;
 const FADER_MIN_DB = -60;
 
+// Wheel-over-strip gain trim (W4-E): one wheel notch ≈ 1 dB, ⌥ (Alt) for
+// 0.1 dB fine moves. Shift is deliberately NOT the fine modifier — macOS
+// turns shift+wheel into a horizontal gesture, which must keep meaning
+// "scroll the dock".
+const WHEEL_DB_PER_NOTCH = 1;
+const WHEEL_FINE_DB_PER_NOTCH = 0.1;
+/** A wheel burst compounds on its own target for this long: wheel events
+ * outrun React renders, so basing every notch on the last-rendered prop
+ * would silently drop most of a fast scroll. */
+const WHEEL_ACCUM_MS = 400;
+
 export function dbToFaderPos(db: number): number {
   return (FADER_MAX_DB - db) / (FADER_MAX_DB - FADER_MIN_DB);
 }
@@ -976,7 +1042,7 @@ export function Fader({
       aria-valuemax={FADER_MAX_DB}
       aria-valuetext={formatFaderDb(db)}
       tabIndex={0}
-      title={`Gain ${formatFaderDb(db)} — drag to set, double-click for 0 dB`}
+      title={`Gain ${formatFaderDb(db)} — drag to set, wheel over the strip to trim (⌥ fine), double-click for 0 dB`}
     >
       <div
         className="pointer-events-none absolute -left-2 h-[11px] w-[21px] rounded-[3px] border border-divider shadow-[0_1px_3px_rgba(0,0,0,.6)]"
@@ -1014,6 +1080,17 @@ export interface MixerStripProps {
   /** Another desk is touching this strip (W3-A presence): a faint inset
    * ring in that desk's color, quiet enough to ignore. */
   remoteEditor?: { name: string; color: string } | null;
+  /** Inline lane rename (W4-E): double-click the strip name. Present only
+   * when the lane maps to a known peer — same rule as the sidebar title. */
+  onRename?: (label: string) => void;
+  /** Lane selection (W4-E): accent inset ring, mirrored by the sidebar
+   * header; a selected lane is the S/M keyboard target. */
+  selected?: boolean;
+  /** Any press on the strip selects its lane (pointer path — the per-strip
+   * M/S buttons remain the keyboard path to those actions). */
+  onSelect?: () => void;
+  /** Right-click: open the lane context menu at the cursor (W4-E). */
+  onLaneMenu?: (x: number, y: number) => void;
 }
 
 export function MixerStrip({
@@ -1035,31 +1112,116 @@ export function MixerStrip({
   onSolo,
   dbText,
   remoteEditor,
+  onRename,
+  selected,
+  onSelect,
+  onLaneMenu,
 }: MixerStripProps) {
   const db = dbText ?? (onGainDb ? formatFaderDb(gainDb) : "—");
+  const [editingName, setEditingName] = useState(false);
+
+  // Wheel over the strip body trims ITS fader (W4-E) — master included.
+  // The dock's overflow-x stays reachable by construction: browsers only
+  // scroll horizontally on a horizontal gesture (trackpad deltaX or
+  // shift+wheel), and those pass through untouched below — this handler
+  // claims vertical-dominant wheel only. A native non-passive listener is
+  // required: React registers synthetic onWheel passively, so its
+  // preventDefault (which stops any residual scroll of ancestors) is void.
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const wheelProps = useRef({ gainDb, onGainDb });
+  wheelProps.current = { gainDb, onGainDb };
+  const wheelTarget = useRef<{ db: number; at: number } | null>(null);
+  useEffect(() => {
+    const el = rootRef.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      const { gainDb: current, onGainDb: apply } = wheelProps.current;
+      if (!apply) return;
+      if (Math.abs(e.deltaY) <= Math.abs(e.deltaX)) return; // horizontal → dock scroll
+      e.preventDefault();
+      // Notch normalization: pixel mode ≈ 100/notch (trackpads stream
+      // fractions of a notch — smooth by construction), line mode ≈ 3.
+      const notches = e.deltaY / (e.deltaMode === WheelEvent.DOM_DELTA_LINE ? 3 : 100);
+      const fresh = wheelTarget.current;
+      const base = fresh && performance.now() - fresh.at < WHEEL_ACCUM_MS ? fresh.db : current;
+      const moved = base - notches * (e.altKey ? WHEEL_FINE_DB_PER_NOTCH : WHEEL_DB_PER_NOTCH);
+      const next = Math.round(Math.max(FADER_MIN_DB, Math.min(FADER_MAX_DB, moved)) * 10) / 10;
+      wheelTarget.current = { db: next, at: performance.now() };
+      apply(next); // the drag path: live meter/readout/collab all follow
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, []);
+
+  // Inset rings layer, selection on top: the 1px accent selection ring
+  // (W4-E) over the remote-editor presence ring (W3-A) widened to 2px so
+  // its inner pixel stays visible when both apply.
+  const rings = [
+    selected ? "inset 0 0 0 1px var(--color-accent)" : null,
+    remoteEditor ? `inset 0 0 0 ${selected ? 2 : 1}px ${hexA(remoteEditor.color, 0.55)}` : null,
+  ]
+    .filter(Boolean)
+    .join(", ");
+
   return (
     <div
+      ref={rootRef}
+      data-mixer-strip={name}
+      data-selected={selected ?? false}
+      onPointerDown={onSelect}
+      {...(onLaneMenu
+        ? {
+            onContextMenu: (e: React.MouseEvent) => {
+              e.preventDefault();
+              onLaneMenu(e.clientX, e.clientY);
+            },
+          }
+        : {})}
       className={cx(
         "flex flex-none flex-col border-r border-[#0e0f10]",
         master ? "w-[118px] border-l border-l-divider bg-card-hi" : "w-[104px] bg-card",
       )}
+      {...(rings ? { style: { boxShadow: rings } } : {})}
       {...(remoteEditor
         ? {
             "data-remote-editor": remoteEditor.name,
             title: `${remoteEditor.name} is adjusting this strip`,
-            style: { boxShadow: `inset 0 0 0 1px ${hexA(remoteEditor.color, 0.55)}` },
           }
         : {})}
     >
       <div className="h-[3px]" style={{ background: color }} />
-      <div
-        className={cx(
-          "truncate px-2 pt-[5px] pb-[3px] text-center text-[10px] font-semibold",
-          master ? "font-bold tracking-[1.5px] text-text-hi" : "text-text",
-        )}
-      >
-        {name}
-      </div>
+      {/* Strip title — renameable in place (W4-E) exactly like the sidebar
+          lane title: double-click opens the shared editor, Enter commits
+          through the same A13 peer-update path, Escape cancels. */}
+      {editingName && onRename ? (
+        <div className="px-1 pt-[3px] pb-[1px]">
+          <RenameInput
+            name={name}
+            ariaLabel={`Rename ${name}`}
+            className="w-full min-w-0 rounded-[3px] border border-accent bg-bg px-1 py-px text-center text-[10px] font-semibold text-text-hi outline-none"
+            onCommit={onRename}
+            onClose={() => setEditingName(false)}
+          />
+        </div>
+      ) : onRename ? (
+        <button
+          type="button"
+          onDoubleClick={() => setEditingName(true)}
+          title="Double-click to rename"
+          className="w-full cursor-text truncate px-2 pt-[5px] pb-[3px] text-center text-[10px] font-semibold text-text"
+        >
+          {name}
+        </button>
+      ) : (
+        <div
+          className={cx(
+            "truncate px-2 pt-[5px] pb-[3px] text-center text-[10px] font-semibold",
+            master ? "font-bold tracking-[1.5px] text-text-hi" : "text-text",
+          )}
+        >
+          {name}
+        </div>
+      )}
       <div className="flex justify-center py-1">
         <PanKnob pan={pan} {...(onPan ? { onPan } : {})} label={`${name} pan`} />
       </div>

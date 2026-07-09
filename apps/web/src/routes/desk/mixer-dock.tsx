@@ -5,16 +5,21 @@ import { MixerStrip } from "./daw";
 import { defaultEq } from "./eq";
 import type { PlayerSnapshot } from "./player";
 import type { TrackRow } from "./track-model";
-import { getPlayer } from "./use-desk";
+import { getDeskSession, getPlayer } from "./use-desk";
 
 export function MixerDock({
+  sessionId,
   rows,
   playerSnap,
   recording,
   liveMasterLevel,
   levelFor,
   remoteEditing,
+  selectedLaneKey,
+  onSelectLane,
+  onLaneMenu,
 }: {
+  sessionId: string;
   rows: TrackRow[];
   playerSnap: PlayerSnapshot;
   recording: boolean;
@@ -24,6 +29,12 @@ export function MixerDock({
   /** Lanes another desk is touching right now (W3-A presence), by
    * channel key — the strip gets a faint ring in that desk's color. */
   remoteEditing: Map<string, { name: string; color: string }>;
+  /** Selected lane (W4-E): desk-local UI state shared with the sidebar —
+   * highlighted here, target of the S/M keyboard shortcuts. */
+  selectedLaneKey: string | null;
+  onSelectLane: (key: string) => void;
+  /** Right-click a strip: the lane context menu at the cursor (W4-E). */
+  onLaneMenu: (key: string, x: number, y: number) => void;
 }) {
   return (
     <div className="flex min-w-0 border-t border-divider bg-raised">
@@ -31,11 +42,15 @@ export function MixerDock({
         {rows.map((row) => (
           <RowMixerStrip
             key={row.key}
+            sessionId={sessionId}
             row={row}
             playerSnap={playerSnap}
             recording={recording}
             liveLevel={levelFor(row)}
             remoteEditor={remoteEditing.get(row.key) ?? null}
+            selected={row.key === selectedLaneKey}
+            onSelect={() => onSelectLane(row.key)}
+            onLaneMenu={(x, y) => onLaneMenu(row.key, x, y)}
           />
         ))}
       </div>
@@ -63,19 +78,28 @@ export function MixerDock({
  * the lane's persistent channel strip — independent of which take is
  * selected, loaded, or whether anything is loaded at all. Meters show the
  * phone's LIVE capture level while recording (METER telemetry) and the
- * playback analyser otherwise. */
+ * playback analyser otherwise. Renames (W4-E) ride the SAME peer-update
+ * path as the sidebar title — server-persisted, fanned out, echoed back. */
 function RowMixerStrip({
+  sessionId,
   row,
   playerSnap,
   recording,
   liveLevel,
   remoteEditor,
+  selected,
+  onSelect,
+  onLaneMenu,
 }: {
+  sessionId: string;
   row: TrackRow;
   playerSnap: PlayerSnapshot;
   recording: boolean;
   liveLevel: number;
   remoteEditor: { name: string; color: string } | null;
+  selected: boolean;
+  onSelect: () => void;
+  onLaneMenu: (x: number, y: number) => void;
 }) {
   const strip = playerSnap.channels.find((c) => c.key === row.key);
   return (
@@ -85,6 +109,15 @@ function RowMixerStrip({
       active={row.receiving}
       level={liveLevel}
       remoteEditor={remoteEditor}
+      selected={selected}
+      onSelect={onSelect}
+      onLaneMenu={onLaneMenu}
+      {...(row.peerId
+        ? {
+            onRename: (label: string) =>
+              getDeskSession(sessionId).renamePeer(row.peerId as string, label),
+          }
+        : {})}
       gainDb={strip?.gainDb ?? 0}
       onGainDb={(db) => getPlayer().setChannelDb(row.key, db)}
       pan={strip?.pan ?? 0}

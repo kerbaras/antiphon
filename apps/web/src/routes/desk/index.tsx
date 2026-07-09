@@ -22,6 +22,7 @@ import type { ClipModel } from "./daw";
 import { RULER_H, TRACK_HEADER_W, TRACK_ROW_H } from "./daw";
 import { DeleteConfirm, type DeleteSummaryTake } from "./delete-confirm";
 import type { ExportJob, ExportMenuProps } from "./export-menu";
+import { LaneContextMenu, type LaneMenuState } from "./lane-menu";
 import { type Song, songFileName, songsOf } from "./markers";
 import { noteSpansOf } from "./midi";
 import type { MidiLaneModel } from "./midi-lane";
@@ -36,6 +37,7 @@ import type { RenderRange } from "./timeline-math";
 import { DeskFatalPanel, DeskToolbar } from "./toolbar";
 import { DeskTopBar } from "./top-bar";
 import {
+  applyLaneMoves,
   deviceName,
   fileSafe,
   initialsOf,
@@ -52,7 +54,7 @@ import {
   useTick,
   withPositionalSongNames,
 } from "./track-model";
-import { useCollabArrange, useCollabPresence } from "./use-collab";
+import { useCollabArrange, useCollabLaneOrder, useCollabPresence } from "./use-collab";
 import {
   ensureWaveform,
   exportAbletonProject,
@@ -156,6 +158,10 @@ function Desk({ sessionId }: { sessionId: string }) {
     laneRanksSession.current = sessionId;
     laneRanks.current = new Map();
   }
+  // Deliberate operator moves (W4-E context menu) layered OVER the frozen
+  // ranks: laneKey → display ordinal in the shared doc, so the order
+  // persists across reloads and syncs across desks (see applyLaneMoves).
+  const [laneOrder, writeLaneOrderMap] = useCollabLaneOrder(collab);
   const rows = useMemo(() => {
     const streamsByKey = new Map<string, DeskStreamStatus[]>();
     const aliasesByKey = new Map<string, string[]>();
@@ -208,7 +214,19 @@ function Desk({ sessionId }: { sessionId: string }) {
         aliases: aliasesByKey.get(key) ?? [],
       });
     }
-    return stableLaneOrder(laneRanks.current, candidates).map((key): TrackRow => {
+    // Doc-held move ordinals resolve by lane key; a lane the archive later
+    // re-keyed (streamId fallback → attributed peer) inherits the ordinal
+    // written under its former key — mirroring the rank inheritance above,
+    // so attribution never undoes an operator's move.
+    const ordinalOf = (key: string): number | undefined => {
+      if (laneOrder[key] !== undefined) return laneOrder[key];
+      const inherited = (aliasesByKey.get(key) ?? [])
+        .map((alias) => laneOrder[alias])
+        .filter((ordinal): ordinal is number => ordinal !== undefined);
+      return inherited.length > 0 ? Math.min(...inherited) : undefined;
+    };
+    const frozen = stableLaneOrder(laneRanks.current, candidates);
+    return applyLaneMoves(frozen, ordinalOf).map((key): TrackRow => {
       const index = laneRanks.current.get(key) as number;
       const streams = streamsByKey.get(key) ?? [];
       const peer = recorders.find((p) => p.peerId === key);
@@ -251,6 +269,7 @@ function Desk({ sessionId }: { sessionId: string }) {
     receiving,
     state.activeTakeId,
     deskInput.peerId,
+    laneOrder,
   ]);
 
   // Takes in CHRONOLOGICAL order with sequential timeline offsets, ordered
@@ -467,6 +486,58 @@ function Desk({ sessionId }: { sessionId: string }) {
     }
     return lanes;
   }, [rows, selectedTakeId]);
+
+  // ---- lane selection (W4-E) -------------------------------------------------
+  // ONE selected lane, shared by the tracks sidebar and the mixer strips
+  // (both highlight it; clicking either surface sets it). Desk-local UI
+  // state by design — never in the shared doc: which lane an operator is
+  // about to solo is their cursor, not project state. With a lane selected
+  // S toggles its solo and M its mute (keyboard handler below); Escape
+  // clears.
+  const [selectedLaneKey, setSelectedLaneKey] = useState<string | null>(null);
+
+  // ---- lane context menu (W4-E) ------------------------------------------------
+  // Right-click on a lane (either surface) opens the cursor-anchored menu;
+  // opening also selects the lane, so the highlight anchors the menu to a
+  // visible target. The row is re-resolved from CURRENT rows every render —
+  // a lane that vanishes mid-menu (remote delete) takes its menu with it.
+  const [laneMenu, setLaneMenu] = useState<LaneMenuState | null>(null);
+  const menuRow = laneMenu ? (rows.find((row) => row.key === laneMenu.laneKey) ?? null) : null;
+
+  // A lane that leaves the console (stream delete, phone departure) takes
+  // its selection and menu STATE with it — not just their rendering. A
+  // stale selection would silently flip M back to marker-drop while the
+  // ring is long gone, and a lingering menu state would resurrect the menu
+  // at stale coordinates the moment a same-key lane rejoins (A12 resume).
+  useEffect(() => {
+    if (selectedLaneKey !== null && !rows.some((row) => row.key === selectedLaneKey)) {
+      setSelectedLaneKey(null);
+    }
+    if (laneMenu !== null && !rows.some((row) => row.key === laneMenu.laneKey)) {
+      setLaneMenu(null);
+    }
+  }, [rows, selectedLaneKey, laneMenu]);
+
+  function openLaneMenu(key: string, x: number, y: number) {
+    setSelectedLaneKey(key);
+    setLaneMenu({ laneKey: key, x, y });
+  }
+
+  /** Move a lane one slot (W4-E): swap within the CURRENT display order,
+   * then write the complete laneKey → ordinal map to the shared doc —
+   * every on-screen lane gets its position pinned, later joiners append
+   * (applyLaneMoves). Bounds-checked: the menu disables the impossible
+   * direction anyway. */
+  function moveLane(key: string, dir: -1 | 1) {
+    const order = rows.map((row) => row.key);
+    const from = order.indexOf(key);
+    const to = from + dir;
+    if (from < 0 || to < 0 || to >= order.length) return;
+    const other = order[to] as string;
+    order[to] = key;
+    order[from] = other;
+    writeLaneOrderMap(Object.fromEntries(order.map((laneKey, ordinal) => [laneKey, ordinal])));
+  }
 
   // ---- timeline editing: selection, marquee, clip drag ---------------------
   const [selection, setSelection] = useState<string[]>([]);
@@ -741,6 +812,8 @@ function Desk({ sessionId }: { sessionId: string }) {
   // Space bar: stop the ongoing recording, otherwise toggle playback.
   // Delete/Backspace: STAGE the selected takes' clips for deletion — the
   // confirm dialog (F2) owns the actual server-authoritative delete.
+  // S/M with a lane selected (W4-E): solo/mute that lane — text inputs
+  // are exempted up top, so typing never trips a shortcut.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement;
@@ -751,18 +824,41 @@ function Desk({ sessionId }: { sessionId: string }) {
       // its Copy button — Space must stay the native button click there,
       // never transport). Deliberately scoped to [role="dialog"], NOT all
       // buttons: with a transport/mini button focused, Space = transport is
-      // the DAW convention worth keeping.
+      // the DAW convention worth keeping. This yield covers EVERY shortcut
+      // below — the W4-E S/M lane keys included.
       if (target.closest?.('[role="dialog"]')) return;
-      // The confirm dialog owns the keyboard while open (Enter/Escape/trap).
-      if (pendingDelete) return;
+      // The confirm dialog owns the keyboard while open (Enter/Escape/trap),
+      // as does the lane context menu (arrows/Enter/Escape) — W4-E. Both
+      // gate by STATE, not focus, so they hold wherever focus sits.
+      if (pendingDelete || (laneMenu && menuRow)) return;
+      // The selected lane, verified against the CURRENT rows — a lane that
+      // left the console (delete, session switch) is not a shortcut target.
+      const laneKey =
+        selectedLaneKey !== null && rows.some((row) => row.key === selectedLaneKey)
+          ? selectedLaneKey
+          : null;
+      if (e.key === "Escape") {
+        setSelectedLaneKey(null);
+        return;
+      }
       if (e.code === "Space") {
         e.preventDefault();
         if (recording) getDeskSession(sessionId).stopTake();
         else if (playerLoaded) getPlayer().toggle();
         return;
       }
-      // M: drop a song marker at the playhead (W2-B).
+      // S: solo the selected lane (W4-E).
+      if (e.code === "KeyS" && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        if (laneKey) getPlayer().toggleChannelSolo(laneKey);
+        return;
+      }
+      // M: mute the selected lane (W4-E); with none selected, the key
+      // keeps its W2-B meaning — drop a song marker at the playhead.
       if (e.code === "KeyM" && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        if (laneKey) {
+          getPlayer().toggleChannelMute(laneKey);
+          return;
+        }
         if (playerLoaded && !recording) takeMarkers.addAt(getPlayer().position());
         return;
       }
@@ -791,7 +887,11 @@ function Desk({ sessionId }: { sessionId: string }) {
     playerLoaded,
     sessionId,
     selection,
+    selectedLaneKey,
+    rows,
     pendingDelete,
+    laneMenu,
+    menuRow,
     state.deskStatus,
     state.activeTakeId,
     takeMarkers.addAt,
@@ -1161,6 +1261,9 @@ function Desk({ sessionId }: { sessionId: string }) {
           playheadSec={playheadSec}
           ghostPlayheads={ghostPlayheads}
           marquee={marquee}
+          selectedLaneKey={selectedLaneKey}
+          onSelectLane={setSelectedLaneKey}
+          onLaneMenu={openLaneMenu}
           onSeekTimeline={seekTimeline}
           onAddMarkerAt={(atSec) => takeMarkers.addAt(atSec)}
         />
@@ -1230,13 +1333,43 @@ function Desk({ sessionId }: { sessionId: string }) {
       </div>
 
       <MixerDock
+        sessionId={sessionId}
         rows={rows}
         playerSnap={playerSnap}
         recording={recording}
         liveMasterLevel={liveMasterLevel}
         levelFor={levelFor}
         remoteEditing={remoteEditing}
+        selectedLaneKey={selectedLaneKey}
+        onSelectLane={setSelectedLaneKey}
+        onLaneMenu={openLaneMenu}
       />
+
+      {/* Lane context menu (W4-E). Delete only STAGES the lane's recorded
+          clips — the F2 confirm dialog below owns the durable destroy. */}
+      {laneMenu && menuRow && (
+        <LaneContextMenu
+          laneName={menuRow.name}
+          x={laneMenu.x}
+          y={laneMenu.y}
+          canMoveUp={rows.indexOf(menuRow) > 0}
+          canMoveDown={rows.indexOf(menuRow) < rows.length - 1}
+          soloed={playerSnap.channels.find((c) => c.key === menuRow.key)?.soloed ?? false}
+          muted={playerSnap.channels.find((c) => c.key === menuRow.key)?.muted ?? false}
+          deletableClipCount={menuRow.streams.filter((s) => s.takeId !== state.activeTakeId).length}
+          onMoveUp={() => moveLane(menuRow.key, -1)}
+          onMoveDown={() => moveLane(menuRow.key, 1)}
+          onSolo={() => getPlayer().toggleChannelSolo(menuRow.key)}
+          onMute={() => getPlayer().toggleChannelMute(menuRow.key)}
+          onDelete={() => {
+            const refs = menuRow.streams
+              .filter((s) => s.takeId !== state.activeTakeId)
+              .map((s) => ({ takeId: s.takeId, streamId: s.streamId }));
+            if (refs.length > 0) setPendingDelete(refs);
+          }}
+          onClose={() => setLaneMenu(null)}
+        />
+      )}
 
       {pendingDelete && (
         <DeleteConfirm

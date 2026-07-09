@@ -3,11 +3,12 @@
 // unit-testable with plain Y.Docs.
 //
 // One Y.Doc per session:
-//   getMap('mix')      channelKey (lane peerId | 'master') → MixStripState
-//   getMap('arrange')  streamId → clip start seconds on the arrangement
-//   getMap('markers')  takeId → Y.Array<Marker>       (W2-B plain objects)
-//   getMap('comments') takeId → Y.Array<TakeComment>  (W2-F plain objects)
-//   getMap('seeded')   `${kind}:${takeId}` → true      (seed-once guard)
+//   getMap('mix')       channelKey (lane peerId | 'master') → MixStripState
+//   getMap('arrange')   streamId → clip start seconds on the arrangement
+//   getMap('laneOrder') laneKey → display ordinal (W4-E deliberate moves)
+//   getMap('markers')   takeId → Y.Array<Marker>       (W2-B plain objects)
+//   getMap('comments')  takeId → Y.Array<TakeComment>  (W2-F plain objects)
+//   getMap('seeded')    `${kind}:${takeId}` → true      (seed-once guard)
 // Transport/playhead state is NOT in the doc (per-desk; presence carries a
 // ghost playhead). Lane names stay on the signaling peer-update protocol
 // (A13, server-persisted) — never duplicated here. Audio bytes are NEVER in
@@ -99,20 +100,26 @@ export function writeMixIfChanged(
   return true;
 }
 
-// ---- arrange -------------------------------------------------------------------
+// ---- arrange / lane order --------------------------------------------------------
+// Two flat number maps with identical mutation rules: read the whole map,
+// write a FULL replacement (set changed keys, drop keys that left) in one
+// transaction. LWW per key under concurrency, like every Y.Map here.
 
-export function readArrange(doc: Y.Doc): Record<string, number> {
+function readNumberMap(doc: Y.Doc, name: string): Record<string, number> {
   const out: Record<string, number> = {};
-  doc.getMap<number>("arrange").forEach((value, key) => {
+  doc.getMap<number>(name).forEach((value, key) => {
     out[key] = value;
   });
   return out;
 }
 
-/** Apply a full override map: set changed keys, drop keys not in `next`.
- * One transaction so a multi-clip drag fans out as one update. */
-export function writeArrange(doc: Y.Doc, next: Record<string, number>, origin: unknown): boolean {
-  const map = doc.getMap<number>("arrange");
+function writeNumberMap(
+  doc: Y.Doc,
+  name: string,
+  next: Record<string, number>,
+  origin: unknown,
+): boolean {
+  const map = doc.getMap<number>(name);
   const stale = [...map.keys()].filter((k) => !(k in next));
   const changed = Object.entries(next).filter(([k, v]) => map.get(k) !== v);
   if (stale.length === 0 && changed.length === 0) return false;
@@ -121,6 +128,33 @@ export function writeArrange(doc: Y.Doc, next: Record<string, number>, origin: u
     for (const [key, value] of changed) map.set(key, value);
   }, origin);
   return true;
+}
+
+export function readArrange(doc: Y.Doc): Record<string, number> {
+  return readNumberMap(doc, "arrange");
+}
+
+/** Apply a full override map: set changed keys, drop keys not in `next`.
+ * One transaction so a multi-clip drag fans out as one update. */
+export function writeArrange(doc: Y.Doc, next: Record<string, number>, origin: unknown): boolean {
+  return writeNumberMap(doc, "arrange", next, origin);
+}
+
+// ---- lane order (W4-E) -----------------------------------------------------------
+// Deliberate operator lane moves: laneKey (peerId, or the streamId fallback
+// for never-attributed lanes) → display ordinal. Written as a FULL map on
+// every move — one Move up/down assigns every on-screen lane its position —
+// so lanes absent from the map are exactly the ones that joined after the
+// last move; they follow F8's append rule (track-model.ts applyLaneMoves).
+// This map deliberately does NOT replace the frozen ranks: those stay the
+// spontaneous-churn guard, this is the sanctioned operator override.
+
+export function readLaneOrder(doc: Y.Doc): Record<string, number> {
+  return readNumberMap(doc, "laneOrder");
+}
+
+export function writeLaneOrder(doc: Y.Doc, next: Record<string, number>, origin: unknown): boolean {
+  return writeNumberMap(doc, "laneOrder", next, origin);
 }
 
 export function deleteArrangeKeys(doc: Y.Doc, keys: string[], origin: unknown): void {

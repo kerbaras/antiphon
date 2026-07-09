@@ -81,7 +81,8 @@ export interface DeskUiMirror {
   /** Comments of the selected take (W2-F), timeline-sorted. */
   comments: TakeComment[];
   /** Track rows in render order (F8 regression hook: this order must
-   * never change within a session). */
+   * never change within a session — EXCEPT through the operator's own
+   * context-menu Move up/down, the W4-E sanctioned reorder). */
   lanes: Array<{ key: string; name: string }>;
 }
 

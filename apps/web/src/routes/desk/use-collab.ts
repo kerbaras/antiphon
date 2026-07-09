@@ -10,8 +10,10 @@ import {
   MASTER_KEY,
   type MixStripState,
   readArrange,
+  readLaneOrder,
   readMix,
   writeArrange,
+  writeLaneOrder,
   writeMixIfChanged,
 } from "../../net/collab-doc";
 import type { ChannelStrip, TakePlayer } from "./player";
@@ -146,6 +148,31 @@ export function useCollabArrange(
     [collab],
   );
   return [overrides, update];
+}
+
+/** Deliberate lane order (W4-E) through the doc: a Move up/down writes the
+ * complete laneKey → ordinal map; remote desks' moves land here live and a
+ * reload restores the persisted order. Same read/observe shape as
+ * useCollabArrange — the setter takes the full map since every move
+ * reassigns every lane's position anyway. */
+export function useCollabLaneOrder(
+  collab: CollabClient,
+): [Record<string, number>, (next: Record<string, number>) => void] {
+  const [order, setOrder] = useState<Record<string, number>>(() => readLaneOrder(collab.doc));
+  useEffect(() => {
+    const map = collab.doc.getMap<number>("laneOrder");
+    const refresh = () => setOrder(readLaneOrder(collab.doc));
+    refresh();
+    map.observe(refresh);
+    return () => map.unobserve(refresh);
+  }, [collab]);
+  const write = useCallback(
+    (next: Record<string, number>) => {
+      writeLaneOrder(collab.doc, next, collab.origin);
+    },
+    [collab],
+  );
+  return [order, write];
 }
 
 /** Live presence: connection status + the OTHER desks in the room. */
