@@ -15,9 +15,11 @@
 // contour, the same recipe as the dsp content.rs calibration tests.
 
 import { writeFileSync } from "node:fs";
+import { readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { expect, type Page, test } from "@playwright/test";
+import { parseWav, parseZip } from "./helpers/files";
 import { expectTakeConverged, joinAsRecorder, startTake, stopTake } from "./helpers/session";
 
 const SAMPLE_RATE = 48_000;
@@ -190,6 +192,52 @@ test.describe("content alignment (W4-B)", () => {
     const spread = Math.max(...deltas.map(([, d]) => d)) - Math.min(...deltas.map(([, d]) => d));
     expect(spread).toBeGreaterThan(1.4 * SAMPLE_RATE);
     expect(spread).toBeLessThan(10 * SAMPLE_RATE);
+
+    // ---- W5-C × W4-B seam: a per-song export of this CONTENT-aligned take.
+    // The package's manifest must tell the same story the desk just showed
+    // (method "content", applied), and the content-alignment deltas must be
+    // baked into the sliced stems exactly like chirp ones — planSource is
+    // shared, so stems of one range come out lag-compensated and equal-length.
+    const addButton = desk.getByRole("button", { name: "Add marker at playhead" });
+    await expect(addButton).toBeEnabled({ timeout: 15_000 });
+    await addButton.click(); // one marker at 0 → "01 Song 1" spans the take
+    const exportButton = desk.getByRole("button", { name: "Export ▾" });
+    await expect(exportButton).toBeEnabled({ timeout: 30_000 });
+    await exportButton.click();
+    await desk.getByRole("menuitem", { name: /^01 Song 1/ }).hover();
+    const songProject = desk.getByRole("menuitem", { name: "Export 01 Song 1 project package" });
+    await expect(songProject).toBeEnabled({ timeout: 30_000 });
+    const [download] = await Promise.all([desk.waitForEvent("download"), songProject.click()]);
+    const zip = parseZip(await readFile(await download.path()));
+    const master = parseWav((zip.find((e) => e.name === "master.wav") as { data: Buffer }).data);
+    const stems = zip.filter((e) => e.name.startsWith("stems/"));
+    expect(stems).toHaveLength(2);
+    for (const stem of stems) {
+      // Aligned = every lane rendered to the same range length, with audio.
+      const wav = parseWav(stem.data);
+      expect(wav.durationSec).toBeCloseTo(master.durationSec, 6);
+      expect(wav.hasSignal).toBe(true);
+    }
+    const manifest = JSON.parse(
+      (zip.find((e) => e.name === "project.json") as { data: Buffer }).data.toString("utf8"),
+    ) as {
+      stems: Array<{
+        chirp: { lagSamples: number; applied: boolean; method?: string } | null;
+        baked: { headSec: number };
+      }>;
+    };
+    expect(manifest.stems).toHaveLength(2);
+    for (const stem of manifest.stems) {
+      expect(stem.chirp?.applied).toBe(true);
+      expect(stem.chirp?.method).toBe("content");
+    }
+    // The measured spread IS what got baked: headSec difference between
+    // the lanes matches the player's own head-trim spread.
+    const headSpread = Math.abs(
+      (manifest.stems[0]?.baked.headSec ?? 0) - (manifest.stems[1]?.baked.headSec ?? 0),
+    );
+    expect(headSpread * SAMPLE_RATE).toBeGreaterThan(1.4 * SAMPLE_RATE);
+    expect(headSpread * SAMPLE_RATE).toBeLessThan(10 * SAMPLE_RATE);
 
     await phoneA.close();
     await phoneB.close();

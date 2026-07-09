@@ -11,6 +11,7 @@ export {
   constants_json,
   DriftEstimator,
   decode_meter_frame,
+  encode_flac_mono,
   encode_have_summary,
   encode_meter_frame,
   extract_chunk_payload,

@@ -1,6 +1,7 @@
 // One DeskSession + one TakePlayer per page, bridged into React, plus
 // server-side archive polling for the sink-convergence table.
 
+import { encode_flac_mono, init as initWasm } from "@antiphon/core-wasm";
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { type CollabClient, getCollab } from "../../net/collab";
 import {
@@ -233,10 +234,10 @@ export function requestTakeLoad(req: TakeLoadRequest): void {
 
 // ---- export (W2-A) -----------------------------------------------------------
 // Heavy offline work lives here, out of the component tree: render the
-// loaded take through an OfflineAudioContext (render.ts), encode WAV/ZIP
-// (wav.ts/zip.ts), hand the bytes to the browser as a download. Both are
-// range-capable (RenderRange, room-timeline seconds) for W2-B markers;
-// today's UI passes no range = whole take.
+// loaded take through an OfflineAudioContext (render.ts), encode WAV/FLAC/
+// ZIP (wav.ts / core-wasm / zip.ts), hand the bytes to the browser as a
+// download. Both are range-capable (RenderRange, room-timeline seconds):
+// no range = whole take, a W2-B song span = that song alone (W5-C).
 
 /** Render the loaded take's master mix (mixer + master state, alignment,
  * drift — exactly what playback monitors) to a 24-bit 48 kHz stereo WAV. */
@@ -252,20 +253,31 @@ export async function exportMasterWav(fileName: string, range?: RenderRange): Pr
   );
 }
 
+/** Stem archive format (W5-C): identical mono 24-bit audio either way —
+ * FLAC is the same lossless samples through the capture pipeline's own
+ * encoder (core-wasm), at roughly half the bytes. */
+export type StemFormat = "wav" | "flac";
+
 /** Render aligned+drift-corrected mono stems (pre-mix: strip gain/pan/
  * mute/solo intentionally not baked — see renderStems) and bundle them
- * into a STORE ZIP. `stemName` maps each track to its archive filename. */
+ * into a STORE ZIP. `stemBaseName` maps each track to its archive filename
+ * WITHOUT extension — the format choice owns that. */
 export async function exportStemsZip(
   fileName: string,
-  stemName: (streamId: string, channelKey: string) => string,
+  stemBaseName: (streamId: string, channelKey: string) => string,
   range?: RenderRange,
+  format: StemFormat = "wav",
 ): Promise<void> {
   const model = getPlayer().renderModel();
   if (!model) throw new Error("no take loaded");
+  if (format === "flac") await initWasm();
   const stems = await renderStems(model, range);
   const entries = stems.map((stem) => ({
-    name: stemName(stem.streamId, stem.channelKey),
-    data: new Uint8Array(encodeWav(channelData(stem.buffer), stem.buffer.sampleRate)),
+    name: `${stemBaseName(stem.streamId, stem.channelKey)}.${format}`,
+    data:
+      format === "flac"
+        ? encode_flac_mono(stem.buffer.getChannelData(0), stem.buffer.sampleRate, 24)
+        : new Uint8Array(encodeWav(channelData(stem.buffer), stem.buffer.sampleRate)),
   }));
   downloadBlob(fileName, new Blob([buildZip(entries)], { type: "application/zip" }));
 }
@@ -313,8 +325,10 @@ function downloadBlob(name: string, blob: Blob): void {
 
 // ---- DAW project exports (W3-B) ------------------------------------------------
 // Three package flavors over one render path, all client-side from the
-// loaded take (range = whole take in v1; project.json carries the songs so
-// DAW-side slicing stays informed):
+// loaded take. Range-capable like the plain renders (W5-C ships a per-song
+// project package); project.json slices honestly — markers/comments inside
+// the range, rebased onto the exported timeline, the source range declared
+// (see buildProjectManifest):
 //   1. Project package — aligned stems + master mix + project.json, the
 //      honest interchange format and the fallback for every DAW.
 //   2. Ableton Live — a real .als (gzipped XML, als.ts) referencing the
@@ -393,6 +407,7 @@ function manifestOf(
     sampleRate: RENDER_SAMPLE_RATE,
     bitDepth: 24,
     range,
+    takeDurationSec: model.durationSec,
     masterFile: "master.wav",
     masterDb: snap.masterDb,
     masterPan: snap.masterPan,

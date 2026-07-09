@@ -2,7 +2,7 @@
 
 import { useRef, useState } from "react";
 import { formatAt, formatSpan } from "./format";
-import { type Song, songFileName } from "./markers";
+import type { Song } from "./markers";
 
 /** Right-rail song list: one row per marker-started song — name (inline
  * rename), start timecode, span. Click seeks; hover reveals rename /
@@ -13,6 +13,7 @@ export function SongsPanel({
   currentSongId,
   usable,
   canRender,
+  fileNameOf,
   onAdd,
   onSeek,
   onRename,
@@ -25,6 +26,9 @@ export function SongsPanel({
   /** A take is loaded and idle — markers can be added and seeked. */
   usable: boolean;
   canRender: boolean;
+  /** The exact download name onRender produces — the page composes it
+   * (take tag + song slug), the ↓ tooltip promises it. */
+  fileNameOf: (song: Song) => string;
   onAdd: () => void;
   onSeek: (song: Song) => void;
   onRename: (id: string, name: string) => void;
@@ -48,6 +52,7 @@ export function SongsPanel({
           active={song.id === currentSongId}
           usable={usable}
           canRender={canRender}
+          fileName={fileNameOf(song)}
           onSeek={() => onSeek(song)}
           onRename={(name) => onRename(song.id, name)}
           onRemove={() => onRemove(song.id)}
@@ -75,6 +80,7 @@ function SongRow({
   active,
   usable,
   canRender,
+  fileName,
   onSeek,
   onRename,
   onRemove,
@@ -85,6 +91,7 @@ function SongRow({
   active: boolean;
   usable: boolean;
   canRender: boolean;
+  fileName: string;
   onSeek: () => void;
   onRename: (name: string) => void;
   onRemove: () => void;
@@ -155,7 +162,7 @@ function SongRow({
             <button
               type="button"
               aria-label={`Export ${song.name}`}
-              title={`Render ${songFileName(song.index, song.name)}`}
+              title={`Render ${fileName}`}
               disabled={!canRender}
               onClick={onRender}
               className="hidden flex-none font-mono text-[10px] leading-none text-text-faint hover:text-accent disabled:cursor-not-allowed disabled:opacity-40 group-hover/song:inline"

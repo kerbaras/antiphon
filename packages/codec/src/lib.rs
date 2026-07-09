@@ -5,4 +5,6 @@
 
 pub mod encoder;
 
-pub use encoder::{BLOCK_SIZE, CodecError, EncodedChunk, EncoderConfig, StreamEncoder};
+pub use encoder::{
+    BLOCK_SIZE, CodecError, EncodedChunk, EncoderConfig, StreamEncoder, encode_flac_mono,
+};

@@ -4,8 +4,9 @@
 // desk operator bookmarks songs: a marker at the playhead (toolbar), one
 // by double-clicking the ruler, an inline rename in the Songs panel. Each
 // marker starts a song that runs to the next marker (or take end), and
-// the Export ▾ menu renders each span as "NN <name>.wav" (verified
-// structurally against the marker positions) plus an all-songs ZIP.
+// the Export ▾ menu renders each span as "<take> — NN <name>.wav" (verified
+// structurally against the marker positions) plus an all-songs ZIP whose
+// entries stay bare "NN <name>.wav" (the archive name carries the take).
 // Markers persist in localStorage per (session, take) and must survive a
 // desk reload alongside the OPFS archive rebuild.
 
@@ -160,7 +161,9 @@ test.describe("song markers (W2-B)", () => {
     const songItem = desk.getByRole("menuitem", { name: /^01 Kyrie/ });
     await expect(songItem).toBeEnabled({ timeout: 30_000 });
     const [songDownload] = await Promise.all([desk.waitForEvent("download"), songItem.click()]);
-    expect(songDownload.suggestedFilename()).toBe("01 Kyrie.wav");
+    // W5-C naming: the take tag keeps two takes' "01 Kyrie" apart in the
+    // Downloads folder.
+    expect(songDownload.suggestedFilename()).toBe("take-01 — 01 Kyrie.wav");
     const song = parseWav(await readFile(await songDownload.path()));
     expect(song.channels).toBe(2);
     expect(song.sampleRate).toBe(48_000);

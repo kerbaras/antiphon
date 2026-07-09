@@ -9,6 +9,7 @@ import {
   renameMarker,
   saveMarkers,
   songFileName,
+  songSlug,
   songsOf,
   sortMarkers,
 } from "./markers";
@@ -108,6 +109,15 @@ describe("songFileName", () => {
     const long = songFileName(8, "x".repeat(200));
     expect(long.length).toBeLessThanOrEqual(2 + 1 + 64 + 4);
     expect(long.endsWith(".wav")).toBe(true);
+  });
+
+  // W5-C: the slug is the extensionless stem every per-song export name
+  // composes around ("<take> — NN <name> — stems.zip" and friends).
+  it("songSlug is songFileName minus the extension — same sanitizing", () => {
+    expect(songSlug(1, "Kyrie")).toBe("01 Kyrie");
+    expect(songSlug(2, 'Agnus / Dei: "final"?')).toBe("02 Agnus Dei final");
+    expect(songSlug(7, "///???")).toBe("07 song");
+    expect(`${songSlug(9, "Gloria")}.wav`).toBe(songFileName(9, "Gloria"));
   });
 });
 

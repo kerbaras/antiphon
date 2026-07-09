@@ -23,7 +23,7 @@ import { RULER_H, TRACK_HEADER_W, TRACK_ROW_H } from "./daw";
 import { DeleteConfirm, type DeleteSummaryTake } from "./delete-confirm";
 import type { ExportJob, ExportMenuProps } from "./export-menu";
 import { LaneContextMenu, type LaneMenuState } from "./lane-menu";
-import { type Song, songFileName, songsOf } from "./markers";
+import { type Song, songFileName, songSlug, songsOf } from "./markers";
 import { noteSpansOf } from "./midi";
 import type { MidiLaneModel } from "./midi-lane";
 import { MixerDock } from "./mixer-dock";
@@ -70,6 +70,7 @@ import {
   getPlayer,
   publishUiMirror,
   requestTakeLoad,
+  type StemFormat,
   useDeskState,
   usePlayer,
   useServerStatus,
@@ -1117,6 +1118,11 @@ function Desk({ sessionId }: { sessionId: string }) {
   const canRenderTake = playerLoaded && !recording && !playerSnap.loading && !playerSnap.aligning;
   const [exportBusy, setExportBusy] = useState<ExportJob | null>(null);
   const [exportError, setExportError] = useState<string | null>(null);
+  // Stem archive format (W5-C) — same mono 24-bit audio, WAV or FLAC.
+  // Applies to the whole-take Stems export and the per-song stems alike;
+  // deliberately page-lifetime state, not persisted (a format is a
+  // per-delivery choice, not a desk setting).
+  const [stemFormat, setStemFormat] = useState<StemFormat>("wav");
 
   const takeNumber = selectedTakeId ? [...takes.keys()].indexOf(selectedTakeId) + 1 : 0;
   const takeTag = `take-${String(Math.max(1, takeNumber)).padStart(2, "0")}`;
@@ -1136,15 +1142,17 @@ function Desk({ sessionId }: { sessionId: string }) {
 
   const exportMaster = () => runExport("master", () => exportMasterWav(`${takeTag}-master.wav`));
 
+  /** Stem entry name (sans extension — the format owns that): lane name
+   * (nickname when set) + stream id, like the FLAC path. */
+  const stemBaseName = (streamId: string, channelKey: string): string => {
+    const lane = rows.find((row) => row.key === channelKey)?.name;
+    return `${lane ? `${fileSafe(lane)}-` : ""}${streamId.slice(0, 8)}`;
+  };
+
   const exportStems = () =>
-    runExport("stems", () => {
-      // Stems carry the lane name (nickname when set), like the FLAC path.
-      const laneOf = new Map(rows.map((row) => [row.key, row.name]));
-      return exportStemsZip(`${takeTag}-stems.zip`, (streamId, channelKey) => {
-        const lane = laneOf.get(channelKey);
-        return `${lane ? `${fileSafe(lane)}-` : ""}${streamId.slice(0, 8)}.wav`;
-      });
-    });
+    runExport("stems", () =>
+      exportStemsZip(`${takeTag}-stems.zip`, stemBaseName, undefined, stemFormat),
+    );
 
   /** A song's render span: a last-marker song runs to the true take end,
    * expressed by omitting endSec (resolveRange fills the duration in). */
@@ -1153,8 +1161,23 @@ function Desk({ sessionId }: { sessionId: string }) {
     ...(song.endSec !== null ? { endSec: song.endSec } : {}),
   });
 
+  /** Per-song download names: `<take> — NN <name>` + what it is. The take
+   * tag keeps two takes' "01 Kyrie" apart in the Downloads folder; inside
+   * a ZIP the take tag is on the archive, so entries stay bare. */
+  const songTag = (song: Song) => `${takeTag} — ${songSlug(song.index, song.name)}`;
+
   const exportSong = (song: Song) =>
-    runExport("songs", () => exportMasterWav(songFileName(song.index, song.name), songRange(song)));
+    runExport("songs", () => exportMasterWav(`${songTag(song)}.wav`, songRange(song)));
+
+  const exportSongStems = (song: Song) =>
+    runExport("stems", () =>
+      exportStemsZip(`${songTag(song)} — stems.zip`, stemBaseName, songRange(song), stemFormat),
+    );
+
+  const exportSongProject = (song: Song) =>
+    runExport("project", () =>
+      exportProjectPackage(`${songTag(song)} — project.zip`, projectCtx(), songRange(song)),
+    );
 
   const exportAllSongs = () =>
     runExport("songs", () =>
@@ -1191,9 +1214,13 @@ function Desk({ sessionId }: { sessionId: string }) {
     songs,
     takeDurationSec: playerSnap.durationSec,
     midiEventCount: takeMidi.events.length,
+    stemFormat,
+    onStemFormat: setStemFormat,
     onMaster: () => void exportMaster(),
     onStems: () => void exportStems(),
     onSong: (song) => void exportSong(song),
+    onSongStems: (song) => void exportSongStems(song),
+    onSongProject: (song) => void exportSongProject(song),
     onAllSongs: () => void exportAllSongs(),
     onFlac: exportFlacAll,
     onMidi: () => exportMidiFile(`${takeTag}.mid`, takeMidi.events),
@@ -1301,6 +1328,7 @@ function Desk({ sessionId }: { sessionId: string }) {
               currentSongId={currentSongId}
               usable={markersUsable}
               canRender={canRenderTake && exportBusy === null}
+              fileNameOf={(song) => `${songTag(song)}.wav`}
               onAdd={addMarkerAtPlayhead}
               onSeek={(song) => getPlayer().seek(song.startSec)}
               onRename={takeMarkers.rename}

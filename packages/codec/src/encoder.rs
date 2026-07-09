@@ -312,6 +312,37 @@ impl StreamEncoder {
     }
 }
 
+/// One-shot mono FLAC file encode (W5-C desk stem exports): a whole buffer
+/// of Web-Audio floats in, a complete standalone `.flac` out — the same
+/// `StreamEncoder` the capture pipeline runs (header + every chunk payload
+/// in order), so desk exports and phone captures share one codec path.
+/// Unlike the streaming header, STREAMINFO total-samples is finalized here:
+/// the count is known before the first byte is written.
+pub fn encode_flac_mono(cfg: EncoderConfig, samples: &[f32]) -> Result<Vec<u8>, CodecError> {
+    let mut enc = StreamEncoder::new(cfg)?;
+    let mut out = enc.codec_header();
+    finalize_total_samples(&mut out, samples.len() as u64);
+    let mut chunks = enc.push_f32(samples)?;
+    chunks.extend(enc.finish()?);
+    for c in &chunks {
+        out.extend_from_slice(&c.payload);
+    }
+    Ok(out)
+}
+
+/// Write the STREAMINFO total-samples field (36 bits: low nibble of body
+/// byte 13, then 4 bytes big-endian) into a 42-byte `codec_header()`. A
+/// count that doesn't fit 36 bits stays 0 — the spec's "unknown", still a
+/// valid stream (>2^36 mono samples is ~16 days at 48 kHz).
+fn finalize_total_samples(header: &mut [u8], total: u64) {
+    debug_assert_eq!(header.len(), 42);
+    if total >= 1 << 36 {
+        return;
+    }
+    header[21] = (header[21] & 0xF0) | ((total >> 32) as u8 & 0x0F);
+    header[22..26].copy_from_slice(&((total & 0xFFFF_FFFF) as u32).to_be_bytes());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -469,6 +500,44 @@ mod tests {
         assert_eq!(info.bits_per_sample, 24);
         assert_eq!(info.channels, 1);
         assert!(samples.is_empty());
+    }
+
+    #[test]
+    fn one_shot_mono_file_decodes_sample_exact_with_finalized_streaminfo() {
+        let rate = 48_000;
+        // Deliberately not block-aligned: the final short frame must land.
+        let input = sine(rate as usize + 4_321, rate, 440.0);
+        let flac = encode_flac_mono(
+            EncoderConfig {
+                sample_rate: rate,
+                bits_per_sample: 24,
+            },
+            &input,
+        )
+        .unwrap();
+        let (info, decoded) = decode(&flac);
+        assert_eq!(info.sample_rate, rate);
+        assert_eq!(info.channels, 1);
+        assert_eq!(info.bits_per_sample, 24);
+        // The one-shot path knows the total up front — no 0-means-unknown.
+        assert_eq!(info.samples, Some(input.len() as u64));
+        assert_eq!(decoded, expected_i32(&input, 24), "lossless or bust");
+    }
+
+    #[test]
+    fn one_shot_empty_input_is_a_valid_zero_sample_stream() {
+        let flac = encode_flac_mono(
+            EncoderConfig {
+                sample_rate: 48_000,
+                bits_per_sample: 24,
+            },
+            &[],
+        )
+        .unwrap();
+        let (info, decoded) = decode(&flac);
+        // A written 0 IS the spec's "unknown" — readers report it as such.
+        assert_eq!(info.samples, None);
+        assert!(decoded.is_empty());
     }
 
     #[test]

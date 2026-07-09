@@ -78,17 +78,26 @@ export interface ProjectManifest {
   /** WAV bit depth (integer PCM). */
   bitDepth: number;
   /** The slice of the take's room timeline this package renders, seconds
-   * (0 = take head after alignment). v1 exports the whole take. */
+   * (0 = take head after alignment) — where the exported WAVs sit in the
+   * source take. Whole-take exports declare {0, takeDuration}; per-song
+   * exports (W5-C) declare the song's span. */
   range: { startSec: number; endSec: number };
   /** The desk's reference mixdown — all mixer/master state applied. */
   master: { file: string; gainDb: number; pan: number; eq: EqState };
   stems: ManifestStem[];
-  /** Named points on the take timeline (song starts). */
+  /** Named points (song starts) on the EXPORTED timeline: 0 = the range
+   * head = second 0 of every WAV in this package. A range export slices
+   * honestly — only markers inside [range.startSec, range.endSec) appear,
+   * rebased by −range.startSec; `range` says where they came from. The end
+   * turns inclusive when the range runs to the take's true end: no next
+   * song exists past it, so an event parked exactly there stays. */
   markers: Marker[];
-  /** Marker-derived spans: marker N → marker N+1, the last running to the
-   * take end (endSec null). Slice the WAVs by these to split songs. */
+  /** Marker-derived spans on the exported timeline: marker N → marker N+1,
+   * the last running to the range end (endSec null). Slice the WAVs by
+   * these to split songs. */
   songs: Song[];
-  /** Timestamped production notes ("alto flat at 2:31"), take timeline. */
+  /** Timestamped production notes ("alto flat at 2:31"), exported timeline
+   * — filtered/rebased exactly like markers. */
   comments: TakeComment[];
 }
 
@@ -109,6 +118,10 @@ export interface ManifestInput {
   sampleRate: number;
   bitDepth: number;
   range: { startSec: number; endSec: number };
+  /** The take's full room-timeline length — lets the slicer recognize a
+   * range that runs to the true take end (whose end is inclusive: no next
+   * song exists past it — QA M-1). */
+  takeDurationSec: number;
   masterFile: string;
   masterDb: number;
   masterPan: number;
@@ -127,6 +140,14 @@ export interface ManifestInput {
 export function buildProjectManifest(input: ManifestInput): ProjectManifest {
   const stripOf = new Map(input.channels.map((c) => [c.key, c]));
   const laneOf = new Map(input.lanes.map((l) => [l.key, l]));
+  // Honest range slicing (W5-C): only events inside the exported span, on
+  // the exported timeline (0 = range head, matching the WAVs). Half-open —
+  // an event AT endSec belongs to the next song, not to a zero-length tail
+  // (the same rule als.ts uses for locators) — EXCEPT at the take's true
+  // end, where no next song exists (QA M-1): whole-take exports and a
+  // final-song range keep an event parked exactly on the end.
+  const markers = rebased(input.markers, input.range, input.takeDurationSec);
+  const comments = rebased(input.comments, input.range, input.takeDurationSec);
   return {
     format: PROJECT_MANIFEST_FORMAT,
     version: PROJECT_MANIFEST_VERSION,
@@ -167,10 +188,31 @@ export function buildProjectManifest(input: ManifestInput): ProjectManifest {
         baked: { ...stem.timing },
       };
     }),
-    markers: input.markers.map((m) => ({ ...m })),
-    songs: songsOf(input.markers),
-    comments: input.comments.map((c) => ({ ...c })),
+    markers,
+    songs: songsOf(markers),
+    comments,
   };
+}
+
+/** Filter timeline events to [startSec, endSec) and rebase onto the
+ * exported timeline. The end bound turns inclusive when the range runs to
+ * the take's true end — a boundary event belongs to the NEXT song, and
+ * past the take end there is no next song (QA M-1). Order-preserving;
+ * copies, never mutates. */
+function rebased<T extends { atSec: number }>(
+  events: readonly T[],
+  range: { startSec: number; endSec: number },
+  takeDurationSec: number,
+): T[] {
+  // resolveRange clamps endSec ≤ duration; ≥ is float-robust equality here.
+  const endInclusive = range.endSec >= takeDurationSec;
+  return events
+    .filter(
+      (e) =>
+        e.atSec >= range.startSec &&
+        (endInclusive ? e.atSec <= range.endSec : e.atSec < range.endSec),
+    )
+    .map((e) => ({ ...e, atSec: e.atSec - range.startSec }));
 }
 
 /** Parse + validate a serialized manifest (the schema's read side — used

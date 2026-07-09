@@ -105,6 +105,27 @@ pub fn align_content(reference: &[f32], target: &[f32], sample_rate: u32) -> Opt
     })
 }
 
+/// One-shot mono FLAC encode for desk stem exports (W5-C): Web-Audio
+/// floats in, a complete decodable `.flac` file out — the same encoder the
+/// phones capture through (packages/codec), with STREAMINFO finalized
+/// (total samples are known up front, unlike the streaming path). Call
+/// from the desk main thread with one rendered stem buffer at a time.
+#[wasm_bindgen]
+pub fn encode_flac_mono(
+    samples: &[f32],
+    sample_rate: u32,
+    bits_per_sample: u8,
+) -> Result<Vec<u8>, JsError> {
+    antiphon_codec::encode_flac_mono(
+        antiphon_codec::EncoderConfig {
+            sample_rate,
+            bits_per_sample,
+        },
+        samples,
+    )
+    .map_err(|e| JsError::new(&e.to_string()))
+}
+
 /// Protocol constants exposed for TS consumers (§13).
 #[wasm_bindgen]
 pub fn constants_json() -> String {

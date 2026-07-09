@@ -91,17 +91,24 @@ export function songsOf(markers: readonly Marker[]): Song[] {
   }));
 }
 
-/** `NN <name>.wav`, filesystem-safe on macOS/Windows/Linux: keep letters,
+/** `NN <name>`, filesystem-safe on macOS/Windows/Linux: keep letters,
  * numbers and tame punctuation; collapse whitespace; no edge dots (hidden
- * files / Windows trailing-dot stripping); bounded length. */
-export function songFileName(index: number, name: string): string {
+ * files / Windows trailing-dot stripping); bounded length. The shared stem
+ * of every per-song export name (W5-C: `<take> — NN <name> — stems.zip`
+ * and friends compose around it). */
+export function songSlug(index: number, name: string): string {
   const safe = name
     .replace(/[^\p{L}\p{N}\s'&()[\].,+#@!_-]/gu, "")
     .replace(/\s+/g, " ")
     .replace(/^[\s.]+|[\s.]+$/g, "")
     .slice(0, 64)
     .trim();
-  return `${String(index).padStart(2, "0")} ${safe || "song"}.wav`;
+  return `${String(index).padStart(2, "0")} ${safe || "song"}`;
+}
+
+/** `NN <name>.wav` — the per-song WAV entry name inside song ZIPs. */
+export function songFileName(index: number, name: string): string {
+  return `${songSlug(index, name)}.wav`;
 }
 
 // ---- persistence (doc shadow — see the W3-A boundary note up top) -------------

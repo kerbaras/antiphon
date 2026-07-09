@@ -4,6 +4,7 @@ import { useState } from "react";
 import { SectionLabel } from "../../ui/kit";
 import { formatSpan } from "./format";
 import type { Song } from "./markers";
+import type { StemFormat } from "./use-desk";
 
 /** One export job at a time; the button carries the busy label. */
 export type ExportJob = "master" | "stems" | "songs" | "project" | "ableton" | "logic";
@@ -16,9 +17,15 @@ export interface ExportMenuProps {
   takeDurationSec: number;
   /** Captured MIDI events on the loaded take (W3-C); 0 hides the item. */
   midiEventCount: number;
+  /** Stem archive format (W5-C) — applies to every stems export, whole
+   * take and per song alike. The menu shows it; the page owns it. */
+  stemFormat: StemFormat;
+  onStemFormat: (format: StemFormat) => void;
   onMaster: () => void;
   onStems: () => void;
   onSong: (song: Song) => void;
+  onSongStems: (song: Song) => void;
+  onSongProject: (song: Song) => void;
   onAllSongs: () => void;
   onFlac: () => void;
   onMidi: () => void;
@@ -38,11 +45,13 @@ const BUSY_LABELS: Record<ExportJob, string> = {
 };
 
 /** Top-bar "Export ▾" dropdown (the prototype's decorative button, live):
- * offline renders of the loaded take — master WAV, stems ZIP, and (when
- * markers exist) each song's span as "NN <name>.wav" or all of them in one
- * ZIP — plus the raw per-stream FLAC downloads. Render items gate on
- * playback readiness; the button shows an indeterminate busy label while
- * an OfflineAudioContext render runs (one-shot: no progress to report). */
+ * offline renders of the loaded take — master WAV, stems ZIP (WAV or FLAC,
+ * the row's own toggle), and (when markers exist) a Songs section where
+ * each row is the whole per-song story: click renders the song's master
+ * mix, the hover-revealed chips render its stems / project package (W5-C)
+ * — plus the raw per-stream FLAC downloads. Render items gate on playback
+ * readiness; the button shows an indeterminate busy label while an
+ * OfflineAudioContext render runs (one-shot: no progress to report). */
 export function ExportMenu({
   busy,
   canRender,
@@ -50,9 +59,13 @@ export function ExportMenu({
   songs,
   takeDurationSec,
   midiEventCount,
+  stemFormat,
+  onStemFormat,
   onMaster,
   onStems,
   onSong,
+  onSongStems,
+  onSongProject,
   onAllSongs,
   onFlac,
   onMidi,
@@ -93,7 +106,7 @@ export function ExportMenu({
           />
           <div
             role="menu"
-            className="absolute top-[calc(100%+6px)] right-0 z-[20] w-[236px] rounded-lg border border-edge-card bg-card p-1 shadow-[0_10px_28px_rgba(0,0,0,.55)]"
+            className="absolute top-[calc(100%+6px)] right-0 z-[20] w-[272px] rounded-lg border border-edge-card bg-card p-1 shadow-[0_10px_28px_rgba(0,0,0,.55)]"
           >
             <ExportItem
               title="Master mix"
@@ -101,12 +114,46 @@ export function ExportMenu({
               disabled={!canRender}
               onClick={pick(onMaster)}
             />
-            <ExportItem
-              title="Stems"
-              hint="ZIP · aligned mono WAVs"
-              disabled={!canRender}
-              onClick={pick(onStems)}
-            />
+            {/* Stems row: the title exports, the trailing toggle picks the
+                archive format (W5-C) — same mono 24-bit audio either way,
+                so it's one row with a setting, not two exports. Setting
+                the format deliberately does NOT close the menu. */}
+            <div className="group/stems flex items-center rounded-md hover:bg-card-hi focus-within:bg-card-hi">
+              <button
+                type="button"
+                role="menuitem"
+                disabled={!canRender}
+                onClick={pick(onStems)}
+                className="flex min-w-0 flex-1 items-baseline justify-between gap-3 rounded-md px-2.5 py-2 text-left disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                <span className="text-[11px] font-semibold text-text-strong">Stems</span>
+                <span className="font-mono text-[9px] text-text-faint">ZIP · aligned mono</span>
+              </button>
+              {/* fieldset = implicit role "group": SRs announce the radios
+                  as "Stem format" instead of a bare "wav, checked" (QA M-2). */}
+              <fieldset
+                aria-label="Stem format"
+                className="mr-2.5 flex flex-none gap-px rounded border border-edge bg-bg p-px"
+              >
+                {(["wav", "flac"] as const).map((format) => (
+                  <button
+                    key={format}
+                    type="button"
+                    role="menuitemradio"
+                    aria-checked={stemFormat === format}
+                    disabled={!canRender}
+                    onClick={() => onStemFormat(format)}
+                    className={`rounded-[3px] px-1.5 py-0.5 font-mono text-[8px] font-semibold uppercase disabled:cursor-not-allowed disabled:opacity-40 ${
+                      stemFormat === format
+                        ? "bg-accent text-white"
+                        : "text-text-faint hover:text-text"
+                    }`}
+                  >
+                    {format}
+                  </button>
+                ))}
+              </fieldset>
+            </div>
             {/* ---- Projects (W3-B): DAW-ready packages — keep this block
                 self-contained; sibling branches add their own entries. */}
             <div className="mx-1.5 my-1 h-px bg-divider" />
@@ -140,12 +187,14 @@ export function ExportMenu({
                 </div>
                 <div className="max-h-[204px] overflow-y-auto">
                   {songs.map((song) => (
-                    <ExportItem
+                    <SongExportRow
                       key={song.id}
-                      title={`${String(song.index).padStart(2, "0")} ${song.name}`}
-                      hint={`WAV · ${formatSpan((song.endSec ?? takeDurationSec) - song.startSec)}`}
+                      song={song}
+                      spanSec={(song.endSec ?? takeDurationSec) - song.startSec}
                       disabled={!canRender}
-                      onClick={pick(() => onSong(song))}
+                      onMaster={pick(() => onSong(song))}
+                      onStems={pick(() => onSongStems(song))}
+                      onProject={pick(() => onSongProject(song))}
                     />
                   ))}
                 </div>
@@ -202,6 +251,85 @@ function ExportItem({
     >
       <span className="text-[11px] font-semibold text-text-strong">{title}</span>
       <span className="font-mono text-[9px] text-text-faint">{hint}</span>
+    </button>
+  );
+}
+
+/** One Songs row, three exports (W5-C): the row itself renders the song's
+ * master WAV (the W2-B click, unchanged); hovering — or tabbing in —
+ * swaps the span hint for two chips that render the song's stems ZIP and
+ * its project package. Same hover-reveal grammar as the songs panel's
+ * ✎/↓/× row actions, so the menu gains no permanent rows. The chips are
+ * an opacity-revealed OVERLAY on the hint's spot, never display:none
+ * (QA M-2): they stay focusable, so Shift+Tab from the next row lands on
+ * them and the focus itself triggers the reveal — keyboard-reachable in
+ * both directions. pointer-events gate with the reveal, so an invisible
+ * chip can never swallow a click meant for the row. */
+function SongExportRow({
+  song,
+  spanSec,
+  disabled,
+  onMaster,
+  onStems,
+  onProject,
+}: {
+  song: Song;
+  spanSec: number;
+  disabled: boolean;
+  onMaster: () => void;
+  onStems: () => void;
+  onProject: () => void;
+}) {
+  const title = `${String(song.index).padStart(2, "0")} ${song.name}`;
+  return (
+    <div className="group/song relative flex items-center rounded-md hover:bg-card-hi focus-within:bg-card-hi">
+      <button
+        type="button"
+        role="menuitem"
+        title={`Render ${title} master mix (WAV)`}
+        disabled={disabled}
+        onClick={onMaster}
+        className="flex min-w-0 flex-1 items-baseline justify-between gap-3 rounded-md px-2.5 py-2 text-left disabled:cursor-not-allowed disabled:opacity-40"
+      >
+        <span className="truncate text-[11px] font-semibold text-text-strong">{title}</span>
+        <span className="flex-none font-mono text-[9px] text-text-faint group-focus-within/song:hidden group-hover/song:hidden">
+          WAV · {formatSpan(spanSec)}
+        </span>
+      </button>
+      <span className="pointer-events-none absolute inset-y-0 right-2.5 flex items-center gap-1 opacity-0 group-focus-within/song:pointer-events-auto group-focus-within/song:opacity-100 group-hover/song:pointer-events-auto group-hover/song:opacity-100">
+        <SongChip label={`Export ${title} stems`} disabled={disabled} onClick={onStems}>
+          stems
+        </SongChip>
+        <SongChip label={`Export ${title} project package`} disabled={disabled} onClick={onProject}>
+          project
+        </SongChip>
+      </span>
+    </div>
+  );
+}
+
+function SongChip({
+  label,
+  disabled,
+  onClick,
+  children,
+}: {
+  label: string;
+  disabled: boolean;
+  onClick: () => void;
+  children: string;
+}) {
+  return (
+    <button
+      type="button"
+      role="menuitem"
+      aria-label={label}
+      title={label}
+      disabled={disabled}
+      onClick={onClick}
+      className="rounded border border-edge-strong px-1.5 py-0.5 font-mono text-[9px] text-text-mute hover:border-accent hover:text-accent disabled:cursor-not-allowed disabled:opacity-40"
+    >
+      {children}
     </button>
   );
 }

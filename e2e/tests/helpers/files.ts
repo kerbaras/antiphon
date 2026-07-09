@@ -40,6 +40,51 @@ export function parseWav(bytes: Buffer): WavInfo {
   };
 }
 
+// ---- FLAC (W5-C stem exports) --------------------------------------------------
+
+export interface FlacInfo {
+  channels: number;
+  sampleRate: number;
+  bitsPerSample: number;
+  /** 0 in STREAMINFO means "unknown"; desk exports always finalize it. */
+  totalSamples: number;
+  durationSec: number;
+}
+
+/** Read a FLAC file's STREAMINFO from the spec's bit layout (sample rate
+ * 20 bits / channels 3 / bits-per-sample 5 / total-samples 36), walk the
+ * metadata blocks, and check real audio frames follow (sync code). */
+export function parseFlacHeader(bytes: Buffer): FlacInfo {
+  expect(bytes.subarray(0, 4).toString("latin1")).toBe("fLaC");
+  expect((bytes[4] as number) & 0x7f).toBe(0); // first block: STREAMINFO
+  const infoLen = bytes.readUIntBE(5, 3);
+  expect(infoLen).toBe(34);
+  const b = (i: number) => bytes[8 + i] as number;
+  const sampleRate = (b(10) << 12) | (b(11) << 4) | (b(12) >> 4);
+  const channels = ((b(12) >> 1) & 0x07) + 1;
+  const bitsPerSample = (((b(12) & 0x01) << 4) | (b(13) >> 4)) + 1;
+  const totalSamples =
+    (b(13) & 0x0f) * 2 ** 32 + b(14) * 2 ** 24 + b(15) * 2 ** 16 + b(16) * 2 ** 8 + b(17);
+  // Walk metadata blocks (bit 7 of the block header = last-metadata flag).
+  let at = 4;
+  for (;;) {
+    const header = bytes[at] as number;
+    at += 4 + bytes.readUIntBE(at + 1, 3);
+    if (header & 0x80) break;
+  }
+  // Audio frames follow: FLAC frame sync code (11111111 111110xx).
+  expect(bytes[at]).toBe(0xff);
+  expect((bytes[at + 1] as number) & 0xfc).toBe(0xf8);
+  expect(sampleRate).toBeGreaterThan(0);
+  return {
+    channels,
+    sampleRate,
+    bitsPerSample,
+    totalSamples,
+    durationSec: totalSamples / sampleRate,
+  };
+}
+
 /** Reference CRC-32 (IEEE, bitwise) to check a ZIP's stored CRCs. */
 function crc32(data: Buffer): number {
   let crc = 0xffffffff;
