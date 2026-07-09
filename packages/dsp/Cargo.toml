@@ -19,3 +19,7 @@ criterion = { workspace = true }
 [[bench]]
 name = "correlate_bench"
 harness = false
+
+[[bench]]
+name = "content_bench"
+harness = false
