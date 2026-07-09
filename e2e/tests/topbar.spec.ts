@@ -38,15 +38,15 @@ for (const width of [1280, 1024, 900]) {
     await expect(page.getByText("ANTIPHON", { exact: true })).toBeVisible();
 
     // The title/subtitle column (left), the transport cluster (center) and
-    // the avatars/Share/Export group (right) — located structurally, no
-    // test ids (house style).
+    // the avatars/Export group (right; W4-D folded Share into the avatar
+    // stack's "+") — located structurally, no test ids (house style).
     const titleBlock = page.locator("header span", { hasText: /^Session / }).locator("xpath=..");
     const cluster = page
       .locator("header > div")
       .filter({ has: page.getByRole("button", { name: "Record take" }) });
     const rightBlock = page
       .locator("header > div")
-      .filter({ has: page.getByRole("button", { name: "Share" }) });
+      .filter({ has: page.getByRole("button", { name: /Export/ }) });
 
     await expect(titleBlock).toBeVisible();
     await expect(cluster).toBeVisible();

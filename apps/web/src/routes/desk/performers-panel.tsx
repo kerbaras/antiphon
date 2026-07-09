@@ -1,7 +1,6 @@
 // Right-rail Performers panel: connected phones, the desk input, QR invite.
 
 import type { PeerInfo } from "@antiphon/protocol";
-import { useState } from "react";
 import { Avatar, StatusPill, StyledQr, VUMeter } from "../../ui/kit";
 import { DeskInputBlock } from "./desk-input-block";
 import { MidiInputBlock } from "./midi-input-block";
@@ -34,10 +33,6 @@ export function PerformersPanel({
   /** Track-palette color the MIDI lane draws with (card avatar matches). */
   midiColor: string;
 }) {
-  const [showQr, setShowQr] = useState<boolean | null>(null);
-  // Auto-open while the room is empty, tuck away once performers arrive;
-  // manual toggling wins after the first click.
-  const qrVisible = showQr ?? recorders.length === 0;
   const session = getDeskSession(sessionId);
 
   return (
@@ -105,24 +100,15 @@ export function PerformersPanel({
         color={midiColor}
       />
 
-      <button
-        type="button"
-        onClick={() => setShowQr(!qrVisible)}
-        className="mt-0.5 flex items-center justify-center gap-2 rounded-lg border border-dashed border-edge-strong p-2.5 text-[11px] font-semibold text-text-dim hover:text-text"
-      >
-        + Invite performer
-        <span className="rounded border border-edge-strong px-1.5 py-px font-mono text-[9px]">
-          QR
-        </span>
-      </button>
-      {qrVisible && (
-        <div className="rounded-lg border border-edge-card bg-card p-3">
-          <StyledQr value={joinUrl} className="w-full" />
-          <p className="mt-2 break-all font-mono text-[9px] leading-relaxed text-text-dim">
-            {joinUrl}
-          </p>
-        </div>
-      )}
+      {/* The join QR stays put in the tab view — a wall poster the desk can
+          leave up for late joiners. The top-bar "+" popover is the primary
+          invite surface (W4-D retired this panel's toggle button). */}
+      <div className="mt-0.5 rounded-lg border border-edge-card bg-card p-3">
+        <StyledQr value={joinUrl} className="w-full" />
+        <p className="mt-2 break-all font-mono text-[9px] leading-relaxed text-text-dim">
+          {joinUrl}
+        </p>
+      </div>
       <p className="mt-auto px-1 pt-1 font-mono text-[9px] text-text-faint">
         sync {session.snapshot().serverSync}
       </p>

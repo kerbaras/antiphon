@@ -30,3 +30,6 @@ data/
 
 # QA browser artifacts
 .playwright-mcp/
+
+# parallel workstream worktrees
+.worktrees/

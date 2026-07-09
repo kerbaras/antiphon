@@ -3,7 +3,7 @@
 // toolbar tools, ruler/track/clip geometry, pan knobs, faders, VU meters.
 // Anything not yet functional is visibly inert (aria-disabled), never fake.
 
-import type { ReactNode } from "react";
+import type { ReactNode, Ref } from "react";
 import {
   EQ_DB_RANGE,
   EQ_MID_HZ_DEFAULT,
@@ -101,11 +101,17 @@ export function InfoChip({ value, unit }: { value: ReactNode; unit?: string }) {
 export function AvatarStack({
   people,
   onAdd,
+  addRef,
+  addExpanded,
 }: {
   /** `id` is the stable identity (titles may repeat: two desks both named
    * "Desk"). */
   people: Array<{ id: string; initials: string; color: string; title: string }>;
   onAdd?: () => void;
+  /** The "+" anchors the invite popover (W4-D): the opener owns the
+   * aria-expanded state and gets the element so Esc can hand focus back. */
+  addRef?: Ref<HTMLButtonElement>;
+  addExpanded?: boolean;
 }) {
   return (
     <div className="flex items-center">
@@ -124,8 +130,11 @@ export function AvatarStack({
         </div>
       ))}
       <button
+        ref={addRef}
         type="button"
         aria-label="Invite performer"
+        aria-haspopup="dialog"
+        aria-expanded={addExpanded ?? false}
         onClick={onAdd}
         className="-ml-[7px] grid size-[26px] place-items-center rounded-full border-2 border-panel bg-card-hi text-[11px] text-text-dim hover:text-text"
       >

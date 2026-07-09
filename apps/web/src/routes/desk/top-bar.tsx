@@ -1,12 +1,14 @@
 // Top bar (48px): wordmark + session identity, the centered transport
-// cluster, avatar stack, share, export menu — as in the prototype.
+// cluster, avatar stack (its "+" opens the invite popover), export menu —
+// as in the prototype.
 
 import type { PeerInfo } from "@antiphon/protocol";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import type { DeskSessionState } from "../../net/desk-session";
 import { Wordmark } from "../../ui/kit";
 import { AvatarStack, InfoChip, Timecode, TransportButton, TransportGroup } from "./daw";
 import { ExportMenu, type ExportMenuProps } from "./export-menu";
+import { InvitePopover } from "./invite-popover";
 import type { PlayerSnapshot } from "./player";
 import { deviceName, initialsOf, TRACK_COLORS } from "./track-model";
 import { getDeskSession, getPlayer } from "./use-desk";
@@ -26,7 +28,6 @@ export function DeskTopBar({
   playerLoaded,
   takeCount,
   streamCount,
-  onInvite,
   exportMenu,
 }: {
   sessionId: string;
@@ -44,17 +45,12 @@ export function DeskTopBar({
   playerLoaded: boolean;
   takeCount: number;
   streamCount: number;
-  onInvite: () => void;
   exportMenu: ExportMenuProps;
 }) {
-  const [shared, setShared] = useState(false);
-
-  function share() {
-    void navigator.clipboard.writeText(joinUrl).then(() => {
-      setShared(true);
-      window.setTimeout(() => setShared(false), 1_500);
-    });
-  }
+  // The "+" on the avatar stack is THE invite affordance (W4-D): it took
+  // over the old Share button's clipboard job and the sidebar QR toggle.
+  const [inviteOpen, setInviteOpen] = useState(false);
+  const inviteAnchor = useRef<HTMLButtonElement>(null);
 
   return (
     // Left and right groups are equal flex shares (flex-1 basis-0), so at
@@ -94,14 +90,25 @@ export function DeskTopBar({
           >
             ⏮
           </TransportButton>
+          {/* THE transport button (W4-D): one context-aware control whose
+              face IS the transport state — ■ Stop while a take rolls
+              (stopping is the only sane transport action then; record and
+              playback stay mutually exclusive), ⏸ Pause while playing,
+              ▶ Play when idle. Recording wins the precedence, exactly like
+              the Space shortcut in index.tsx always has. Stop never gates
+              on the player or on signaling: a rolling take must stay
+              stoppable even mid-server-restart (the recovery e2e relies on
+              it); Play alone waits for a loaded, decoded take. */}
           <TransportButton
-            label={playerSnap.playing ? "Pause" : "Play"}
+            label={recording ? "Stop take" : playerSnap.playing ? "Pause" : "Play"}
             tone="accent"
-            active={playerSnap.playing}
-            disabled={!playerLoaded || recording || playerSnap.loading}
-            onClick={() => getPlayer().toggle()}
+            active={!recording && playerSnap.playing}
+            disabled={!recording && (!playerLoaded || playerSnap.loading)}
+            onClick={() =>
+              recording ? getDeskSession(sessionId).stopTake() : getPlayer().toggle()
+            }
           >
-            {playerSnap.playing ? "⏸" : "▶"}
+            {recording ? "■" : playerSnap.playing ? "⏸" : "▶"}
           </TransportButton>
           <TransportButton
             label="Record take"
@@ -111,13 +118,6 @@ export function DeskTopBar({
             onClick={() => getDeskSession(sessionId).startTake()}
           >
             ●
-          </TransportButton>
-          <TransportButton
-            label="Stop take"
-            disabled={!recording}
-            onClick={() => getDeskSession(sessionId).stopTake()}
-          >
-            ■
           </TransportButton>
           <TransportButton
             label="Chirp"
@@ -139,32 +139,38 @@ export function DeskTopBar({
       </div>
 
       <div className="flex flex-1 items-center justify-end gap-3">
-        <AvatarStack
-          people={[
-            { id: "you", initials: "DK", color: "#c8c9cb", title: "You (Desk)" },
-            // Other desks co-editing this session (W3-A presence).
-            ...remoteDesks.slice(0, 3).map((d) => ({
-              id: `desk-${d.clientId}`,
-              initials: initialsOf(d.name) ?? "D",
-              color: d.color,
-              title: `${d.name} (Desk)`,
-            })),
-            ...phones.slice(0, 3).map((p, i) => ({
-              id: `phone-${p.peerId}`,
-              initials: initialsOf(p.deviceInfo.label) ?? p.peerId.slice(0, 2).toUpperCase(),
-              color: TRACK_COLORS[i % TRACK_COLORS.length] as string,
-              title: p.deviceInfo.label?.trim() || deviceName(p.deviceInfo.userAgent),
-            })),
-          ]}
-          onAdd={onInvite}
-        />
-        <button
-          type="button"
-          onClick={share}
-          className="rounded-md border border-edge-strong px-3 py-1.5 text-[11px] font-semibold text-text hover:bg-card-hi"
-        >
-          {shared ? "Copied!" : "Share"}
-        </button>
+        <div className="relative">
+          <AvatarStack
+            people={[
+              { id: "you", initials: "DK", color: "#c8c9cb", title: "You (Desk)" },
+              // Other desks co-editing this session (W3-A presence).
+              ...remoteDesks.slice(0, 3).map((d) => ({
+                id: `desk-${d.clientId}`,
+                initials: initialsOf(d.name) ?? "D",
+                color: d.color,
+                title: `${d.name} (Desk)`,
+              })),
+              ...phones.slice(0, 3).map((p, i) => ({
+                id: `phone-${p.peerId}`,
+                initials: initialsOf(p.deviceInfo.label) ?? p.peerId.slice(0, 2).toUpperCase(),
+                color: TRACK_COLORS[i % TRACK_COLORS.length] as string,
+                title: p.deviceInfo.label?.trim() || deviceName(p.deviceInfo.userAgent),
+              })),
+            ]}
+            onAdd={() => setInviteOpen((open) => !open)}
+            addRef={inviteAnchor}
+            addExpanded={inviteOpen}
+          />
+          {inviteOpen && (
+            <InvitePopover
+              joinUrl={joinUrl}
+              onClose={(restoreFocus) => {
+                setInviteOpen(false);
+                if (restoreFocus) inviteAnchor.current?.focus();
+              }}
+            />
+          )}
+        </div>
         <ExportMenu {...exportMenu} />
       </div>
     </header>

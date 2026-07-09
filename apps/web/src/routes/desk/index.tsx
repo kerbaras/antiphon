@@ -710,6 +710,12 @@ function Desk({ sessionId }: { sessionId: string }) {
       if (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable) {
         return;
       }
+      // Open dialogs own the keyboard wholesale (the invite popover focuses
+      // its Copy button — Space must stay the native button click there,
+      // never transport). Deliberately scoped to [role="dialog"], NOT all
+      // buttons: with a transport/mini button focused, Space = transport is
+      // the DAW convention worth keeping.
+      if (target.closest?.('[role="dialog"]')) return;
       // The confirm dialog owns the keyboard while open (Enter/Escape/trap).
       if (pendingDelete) return;
       if (e.code === "Space") {
@@ -1005,7 +1011,6 @@ function Desk({ sessionId }: { sessionId: string }) {
         playerLoaded={playerLoaded}
         takeCount={takes.size}
         streamCount={state.deskStatus.length}
-        onInvite={() => setTab("performers")}
         exportMenu={exportMenu}
       />
 
