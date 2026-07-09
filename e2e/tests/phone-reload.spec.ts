@@ -7,7 +7,7 @@
 // incomplete (it never receives a stream-final), while the new stream
 // converges normally at take stop.
 
-import { expect, test } from "@playwright/test";
+import { expect, type Page, test } from "@playwright/test";
 import {
   deskStatus,
   expectTakeConverged,
@@ -19,6 +19,17 @@ import {
   startTake,
   stopTake,
 } from "./helpers/session";
+
+async function uiSelection(desk: Page): Promise<string[]> {
+  return await desk.evaluate(() => {
+    const hook = (
+      globalThis as unknown as {
+        __antiphonDesk?: { ui(): { selection: string[] } | null };
+      }
+    ).__antiphonDesk;
+    return [...(hook?.ui()?.selection ?? [])].sort();
+  });
+}
 
 test.describe("phone reload mid-take", () => {
   test.skip(({ browserName }) => browserName !== "chromium", "fake mic is Chromium-only");
@@ -121,6 +132,11 @@ test.describe("phone reload mid-take", () => {
         { timeout: 20_000 },
       )
       .toBeGreaterThanOrEqual(4);
+    // Keep recording well past the fresh stream's eventual ~2.5-4 s length
+    // (chunks are ~500 ms): the orphan clip must fully COVER its audible
+    // sibling for the W7-C hit-priority assertions below — both boxes
+    // share the take-slot x, so the longer orphan blankets the fresh clip.
+    await desk.waitForTimeout(4_500);
     const truncatedChunksBefore = (await serverTakeStreams(desk, sessionId, takeId)).find(
       (s) => s.streamId === oldStreamId,
     )?.chunkCount as number;
@@ -236,6 +252,55 @@ test.describe("phone reload mid-take", () => {
       freshClip.locator('[data-badge="converged"], [data-status-dot="converged"]'),
     ).toBeVisible({ timeout: 20_000 });
     await expect(freshClip).toHaveAttribute("title", /— converged/);
+
+    // --- W7-C hit priority: the audible clip wins the overlap ---------------
+    // Both clips draw from the same take-slot x, and the orphan recorded
+    // longer (the pre-reload wait), so its box fully covers the fresh one.
+    // The complete clip must own pointer events across the whole overlap
+    // REGARDLESS of DOM order (z-order, not sibling order, decides):
+    // clicks inside the fresh clip's box select the audible stream — never
+    // the orphan — while the orphan's exposed tail stays clickable.
+    const freshBox = (await freshClip.boundingBox()) as {
+      x: number;
+      y: number;
+      width: number;
+      height: number;
+    };
+    const orphanBox = (await orphanClip.boundingBox()) as { x: number; width: number };
+    // Fabrication precondition, not product behavior: the orphan really
+    // covers the fresh clip and leaves a clickable tail past its right edge.
+    expect(Math.abs(orphanBox.x - freshBox.x), "clips share the take-slot x").toBeLessThan(3);
+    expect(
+      orphanBox.x + orphanBox.width - (freshBox.x + freshBox.width),
+      "orphan extends past the audible clip (longer pre-reload recording)",
+    ).toBeGreaterThan(24);
+    // The priority is Z-ORDER, not DOM order: sibling order follows stream
+    // announce order and can put EITHER clip on top (this fabrication
+    // happens to list the orphan first — a desk reload can list it last).
+    // The complete clip must stack strictly above the terminal-incomplete
+    // one (the header-band spec's computed-style pattern).
+    const [freshZ, orphanZ] = await Promise.all([
+      freshClip.evaluate((el) => getComputedStyle(el).zIndex),
+      orphanClip.evaluate((el) => getComputedStyle(el).zIndex),
+    ]);
+    expect(Number(freshZ), `fresh z ${freshZ} stacks above orphan z ${orphanZ}`).toBeGreaterThan(
+      Number(orphanZ) || 0,
+    );
+    // The pixel at the overlap's center belongs to the audible clip…
+    const overlap = { x: freshBox.x + freshBox.width / 2, y: freshBox.y + freshBox.height * 0.6 };
+    const hit = await desk.evaluate(
+      ({ x, y }) =>
+        document.elementFromPoint(x, y)?.closest("[data-clip]")?.getAttribute("data-clip") ?? null,
+      overlap,
+    );
+    expect(hit).toBe(newStreamId);
+    // …so a click there selects the audible stream, never the orphan…
+    await desk.mouse.click(overlap.x, overlap.y);
+    await expect.poll(async () => await uiSelection(desk)).toEqual([newStreamId]);
+    // …while the orphan keeps pointer events where it is actually exposed
+    // (selecting it for deletion must stay possible).
+    await desk.mouse.click(freshBox.x + freshBox.width + 8, overlap.y);
+    await expect.poll(async () => await uiSelection(desk)).toEqual([oldStreamId]);
 
     // Sinks tab: the orphan stays LISTED — labeled with its lane name and a
     // short stream id (no bare UUID), marked incomplete, with the A6 story

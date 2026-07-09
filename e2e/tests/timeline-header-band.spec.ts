@@ -30,7 +30,11 @@ const TAKE_BASE_SEC = 1; // first take sits at +1 s on the arrangement
 
 /** elementFromPoint across the header band's box; returns the offenders.
  * Sampling starts below the sticky ruler (its corner cell is its own,
- * separately-sticky chrome) and ends at the container's bottom edge. */
+ * separately-sticky chrome) and ends at the container's bottom edge.
+ * Row SEAM pixels are sampled explicitly (W7-C): each lane header's
+ * bottom border must belong to the header itself (border-on-children),
+ * not to a z-auto row wrapper — a wrapper-owned seam is the 1px slit the
+ * z-[4] playhead used to bleed through while crossing the band. */
 async function bandLeaks(desk: Page): Promise<string[]> {
   return await desk.evaluate(
     ({ headerW, rulerH }) => {
@@ -41,6 +45,22 @@ async function bandLeaks(desk: Page): Promise<string[]> {
       const ys: number[] = [];
       for (let y = rulerH + 6; y < viewport.clientHeight - 6; y += 40) ys.push(y);
       ys.push(viewport.clientHeight - 8);
+      // The seam pixel of every visible lane ROW: the last pixel of the
+      // row wrapper's box — measured on the wrapper, NOT the header, so a
+      // wrapper-owned border (the regression shape: the header stops 1px
+      // short of the row bottom, exposing a z-auto slit the playhead
+      // paints through) is actually sampled instead of the header's own
+      // last pixel. The integer y matters: Chromium's elementFromPoint
+      // quantizes fractional points, and bottom-1 is the one y that
+      // reliably lands IN the border pixel. Seams hidden under the sticky
+      // ruler or below the viewport are skipped (rects are viewport-
+      // absolute; ys are vp-relative).
+      for (const header of document.querySelectorAll("[data-lane-header]")) {
+        const row = header.parentElement;
+        if (!row) continue;
+        const seamY = Math.round(row.getBoundingClientRect().bottom) - 1 - vp.top;
+        if (seamY > rulerH + 1 && seamY < viewport.clientHeight - 1) ys.push(seamY);
+      }
       const bad: string[] = [];
       for (const y of ys) {
         for (const x of xs) {

@@ -76,6 +76,10 @@ test.describe("desk MIDI capture (W3-C)", () => {
     await expect(desk.locator("[data-midi-lane]")).toBeVisible({ timeout: 20_000 });
     await expect(desk.locator("[data-midi-note]")).toHaveCount(2); // C4 + E4 spans
     await expect(desk.getByText("8 ev")).toBeVisible();
+    // Its header is tracks-band chrome like every audio lane header (W7-C):
+    // the band contract (timeline-header-band.spec.ts) recognizes chrome by
+    // data-lane-header, so a MIDI row must carry it too.
+    await expect(desk.locator('[data-lane-header="midi"]')).toBeVisible();
 
     // --- .mid export downloads and parses ------------------------------------
     const exportButton = desk.getByRole("button", { name: "Export ▾" });

@@ -414,6 +414,16 @@ export function ClipCard({ clip }: { clip: ClipModel }) {
       onDoubleClick={clip.onDoubleClick}
       className={cx(
         "absolute inset-y-1 overflow-hidden rounded-[5px] border p-0 text-left",
+        // Hit priority (W7-C): an F9 orphan shares its take slot with the
+        // audible re-armed stream and can fully cover it (a mid-take phone
+        // reload truncates the orphan at ANY length — DOM order alone
+        // decides nothing). Terminal-incomplete clips therefore sit one
+        // z-plane BELOW every other clip: clicks/double-clicks in the
+        // overlap always reach the complete clip, while the orphan stays
+        // clickable wherever it is actually exposed. z-[1] keeps clips
+        // under all timeline overlays (marker guides/ghosts z-[3],
+        // playhead z-[4], marquee/headers z-[5]).
+        clip.badge === "incomplete" ? "z-0" : "z-[1]",
         clip.onPointerDown ? "cursor-grab active:cursor-grabbing" : "cursor-default",
         clip.selected && "shadow-[0_0_0_1px_var(--color-accent)]",
       )}

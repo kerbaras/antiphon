@@ -302,6 +302,19 @@ function Desk({ sessionId }: { sessionId: string }) {
       const byClock = live && state.takeStartedAt ? (Date.now() - state.takeStartedAt) / 1_000 : 0;
       const durationSec = Math.max(bySamples, byClock, 1.5);
       slots.set(takeId, { takeId, offsetSec: offset, durationSec, live });
+      // KNOWN COSMETIC LIMIT (W7-C): slots are laid out from DECLARED
+      // stream lengths only, but the loaded take's boxes draw shifted
+      // right by their align shifts (clipShiftSec, W6-C) — when a take's
+      // arming spread exceeds this 2 s gap, its longest-shifted box can
+      // overlap the next take's box on screen. Widening the slot by the
+      // take's alignment anchor here is NOT cheap enough to do yet:
+      // offsetSec feeds the session plan (W6-B audio placement), seeks
+      // and the parked pin — and the anchor lands asynchronously (align()
+      // settling, persisted-verdict restore), so a late anchor would
+      // reflow every downstream take on screen AND on the transport
+      // clock mid-session. Deferred to W7-A's draw-ALL-takes-aligned
+      // pass, which sources per-take anchors from the persisted verdicts
+      // (alignment-persist.readTakeAlignment) and owns that reflow.
       offset += durationSec + TAKE_GAP_SECONDS;
     }
     return slots;

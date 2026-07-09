@@ -45,9 +45,19 @@ export function MidiLaneRow({
   const yOf = (note: number) => pad + (1 - (note - bandLo) / span) * usable;
 
   return (
-    <div className="flex border-b border-[#0e0f10]" style={{ height: MIDI_LANE_H }}>
+    // Row seam on the CHILDREN, not the wrapper — the audio rows' W7-C
+    // border-on-children rule (timeline.tsx TimelineRow): the header's
+    // seam must paint inside its z-[5] layer or the full-height overlays
+    // bleed 1px through it in the header band.
+    <div className="flex" style={{ height: MIDI_LANE_H }}>
+      {/* data-lane-header: the tracks-band contract (W6-A, pinned by
+          timeline-header-band.spec.ts elementFromPoint sweeps) recognizes
+          band chrome by this attribute — the MIDI header is band chrome
+          like every audio lane header. "midi" can't collide with the
+          audio rows' keys (peer/stream ids). */}
       <div
-        className="sticky left-0 z-[5] flex flex-none items-stretch border-r border-divider bg-card"
+        data-lane-header="midi"
+        className="sticky left-0 z-[5] flex flex-none items-stretch border-r border-b border-divider border-b-[#0e0f10] bg-card"
         style={{ width: TRACK_HEADER_W }}
       >
         <div className="w-1 flex-none" style={{ background: lane.color }} />
@@ -72,7 +82,7 @@ export function MidiLaneRow({
       </div>
       <div
         data-midi-lane
-        className="relative bg-lane"
+        className="relative border-b border-[#0e0f10] bg-lane"
         style={{ width: laneWidth, ...laneGridStyle(pxPerSec) }}
       >
         {notes.map((n, i) => (

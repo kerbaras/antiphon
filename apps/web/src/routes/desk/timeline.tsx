@@ -475,7 +475,16 @@ function TimelineRow({
   onRename?: (label: string) => void;
 }) {
   return (
-    <div className="flex border-b border-[#0e0f10]" style={{ height: TRACK_ROW_H }}>
+    // The row seam (border-b) lives on the CHILDREN, never on this wrapper
+    // (W7-C): a wrapper border paints at z-auto, so the full-height z-[3]/
+    // z-[4] overlays (marker guides, ghost cursors, playhead) bled 1px
+    // through the seam while crossing the sticky header band. On the
+    // header the border paints inside its own z-[5] layer — over every
+    // overlay, like the rest of the band — while the lane keeps its seam
+    // under the overlays (a playhead crossing lane seams is correct DAW
+    // drawing). Same geometry either way: TRACK_ROW_H is border-box tall
+    // with the seam as its last pixel.
+    <div className="flex" style={{ height: TRACK_ROW_H }}>
       {/* header (232px, sticky) — press anywhere selects the lane,
           right-click opens the lane menu (the header's buttons remain
           the keyboard path) */}
@@ -488,7 +497,7 @@ function TimelineRow({
           e.preventDefault();
           onLaneMenu(e.clientX, e.clientY);
         }}
-        className={`sticky left-0 z-[5] flex flex-none items-stretch border-r border-divider ${
+        className={`sticky left-0 z-[5] flex flex-none items-stretch border-r border-b border-divider border-b-[#0e0f10] ${
           selected ? "bg-card-hi shadow-[inset_0_0_0_1px_var(--color-accent)]" : "bg-card"
         }`}
         style={{ width: TRACK_HEADER_W }}
@@ -562,7 +571,10 @@ function TimelineRow({
       </div>
 
       {/* lane */}
-      <div className="relative bg-lane" style={{ width: laneWidth, ...laneGridStyle(pxPerSec) }}>
+      <div
+        className="relative border-b border-[#0e0f10] bg-lane"
+        style={{ width: laneWidth, ...laneGridStyle(pxPerSec) }}
+      >
         {clips.map((clip) => (
           <ClipCard key={clip.id} clip={clip} />
         ))}
