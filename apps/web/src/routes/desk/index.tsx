@@ -14,7 +14,9 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useParams } from "react-router";
 import type { DeskStreamStatus } from "../../audio/sink-worker-protocol";
+import { deleteArrangeKeys } from "../../net/collab-doc";
 import { recordRecentSession } from "../home/recent-sessions";
+import { planAlignScopes, runAlignFlow } from "./align-flow";
 import { orderTakeIds } from "./attribution";
 import { loadAuthorPref, saveAuthorPref } from "./comments";
 import { type CommentLane, CommentsPanel } from "./comments-panel";
@@ -33,7 +35,7 @@ import { type RailTab, RailTabs } from "./right-rail";
 import { SinksPanel } from "./sinks-panel";
 import { SongsPanel } from "./songs-panel";
 import { type Marquee, TimelineSection } from "./timeline";
-import type { RenderRange } from "./timeline-math";
+import { anchorAtSec, type RenderRange, type TakeAnchorSpan } from "./timeline-math";
 import { DeskFatalPanel, DeskToolbar } from "./toolbar";
 import { DeskTopBar, playActionReady } from "./top-bar";
 import {
@@ -76,6 +78,7 @@ import {
   usePlayer,
   useServerStatus,
   useSessionAttribution,
+  useTakeAlignShifts,
   useTakeComments,
   useTakeMarkers,
   waveformCacheSize,
@@ -302,19 +305,18 @@ function Desk({ sessionId }: { sessionId: string }) {
       const byClock = live && state.takeStartedAt ? (Date.now() - state.takeStartedAt) / 1_000 : 0;
       const durationSec = Math.max(bySamples, byClock, 1.5);
       slots.set(takeId, { takeId, offsetSec: offset, durationSec, live });
-      // KNOWN COSMETIC LIMIT (W7-C): slots are laid out from DECLARED
-      // stream lengths only, but the loaded take's boxes draw shifted
-      // right by their align shifts (clipShiftSec, W6-C) — when a take's
-      // arming spread exceeds this 2 s gap, its longest-shifted box can
-      // overlap the next take's box on screen. Widening the slot by the
-      // take's alignment anchor here is NOT cheap enough to do yet:
-      // offsetSec feeds the session plan (W6-B audio placement), seeks
-      // and the parked pin — and the anchor lands asynchronously (align()
-      // settling, persisted-verdict restore), so a late anchor would
-      // reflow every downstream take on screen AND on the transport
-      // clock mid-session. Deferred to W7-A's draw-ALL-takes-aligned
-      // pass, which sources per-take anchors from the persisted verdicts
-      // (alignment-persist.readTakeAlignment) and owns that reflow.
+      // KNOWN COSMETIC LIMIT (W7-C, still open after W7-A): slots are
+      // laid out from DECLARED stream lengths only, while EVERY take's
+      // boxes now draw shifted right by their align shifts (clipShiftSec
+      // — live verdict for the loaded take, persisted for the rest,
+      // W7-A) — when a take's arming spread exceeds this 2 s gap, its
+      // longest-shifted box can overlap the next take's box on screen.
+      // W7-A shipped the drawing, NOT the slot widening: offsetSec feeds
+      // the session plan (W6-B audio placement), seeks and the parked
+      // pin — and anchors still land asynchronously (align() settling,
+      // verdict restore/sync), so a late anchor would reflow every
+      // downstream take on screen AND on the transport clock
+      // mid-session. Parked as cosmetic until someone owns that reflow.
       offset += durationSec + TAKE_GAP_SECONDS;
     }
     return slots;
@@ -426,12 +428,17 @@ function Desk({ sessionId }: { sessionId: string }) {
     for (const t of playerSnap.tracks) map.set(t.streamId, t.alignment?.applied ?? false);
     return map;
   }, [playerSnap.tracks]);
-  // Visual alignment (W6-C): the loaded take's clip boxes shift right by
-  // their stream's capture lateness so aligned waveforms LINE UP on screen
-  // — a read-only display transform over the same deltas the schedule
-  // trims with (player.alignShifts). Arrangement positions (overrides,
-  // clip delays, the drag write-back) stay in the un-shifted audio domain:
-  // stored audio and stored positions never move, only the boxes do.
+  // Visual alignment (W6-C): clip boxes shift right by their stream's
+  // capture lateness so aligned waveforms LINE UP on screen — a read-only
+  // display transform over the same deltas the schedule trims with.
+  // Arrangement positions (overrides, clip delays, the drag write-back)
+  // stay in the un-shifted audio domain: stored audio and stored positions
+  // never move, only the boxes do. W7-A promotes the composition from
+  // "loaded take only" to EVERY take: the loaded take reads the player's
+  // LIVE verdict (player.alignShifts — doc-synced by F7b, fresher mid-run),
+  // all others their PERSISTED verdict (useTakeAlignShifts) — identical
+  // values once a run settles, so promoting a take from persisted to live
+  // never moves a box.
   // biome-ignore lint/correctness/useExhaustiveDependencies: playerSnap.tracks carries the verdict state this reads
   const alignView = useMemo(
     () =>
@@ -440,12 +447,25 @@ function Desk({ sessionId }: { sessionId: string }) {
         : { shiftSec: new Map<string, number>(), anchorSec: 0 },
     [playerLoaded, playerSnap.tracks],
   );
-  /** Seconds a clip's box draws right of its arrangement position. Only
-   * the loaded take shifts (its verdict is the player's live state, doc-
-   * synced across desks by F7b); an unmeasured/declined stream sits at the
-   * room-zero anchor — its audio starts exactly there, unaligned. */
-  const clipShiftSec = (streamId: string, takeId: string): number =>
-    takeId === selectedTakeId ? (alignView.shiftSec.get(streamId) ?? alignView.anchorSec) : 0;
+  const drawnTakeIdsKey = useMemo(
+    () => [...takes.keys()].filter((takeId) => takeId !== state.activeTakeId).join(","),
+    [takes, state.activeTakeId],
+  );
+  const persistedShiftsByTake = useTakeAlignShifts(sessionId, drawnTakeIdsKey);
+  /** Seconds a clip's box draws right of its arrangement position (see the
+   * W7-A note above): live verdict for the loaded take, persisted verdict
+   * for every other (and for the selected one until its load settles — the
+   * values agree, so the handover is seamless). Within a take, an
+   * unmeasured/declined stream sits at the room-zero anchor — its audio
+   * starts exactly there, unaligned; a take with no applied verdict draws
+   * unshifted (anchor 0). */
+  const clipShiftSec = (streamId: string, takeId: string): number => {
+    if (takeId === selectedTakeId && playerLoaded) {
+      return alignView.shiftSec.get(streamId) ?? alignView.anchorSec;
+    }
+    const persisted = persistedShiftsByTake.get(takeId);
+    return persisted ? (persisted.shiftSec.get(streamId) ?? persisted.anchorSec) : 0;
+  };
   const driftByStream = useMemo(() => {
     const map = new Map<string, DriftResult>();
     for (const t of playerSnap.tracks) {
@@ -472,19 +492,26 @@ function Desk({ sessionId }: { sessionId: string }) {
       .map((s) => clipStartOverrides[s.streamId] ?? takes.get(selectedTakeId)?.offsetSec ?? 0);
     return starts.length > 0 ? Math.min(...starts) : 0;
   }, [selectedTakeId, state.deskStatus, clipStartOverrides, takes]);
-  // ---- THE W6-B × W6-C composition invariant --------------------------------
+  // ---- THE W6-B × W6-C composition invariant (W7-A: every take) --------------
   // The SESSION clock (player position/seek/duration) is ANCHOR-FREE:
   // every take's aligned audio starts at its clips' arrangement positions
   // — schedule-identical whether the take is selected or a mounted
   // neighbor. The anchor is a DRAWING transform, scoped exactly where the
-  // drawn geometry shifts: the SELECTED take's boxes (W6-C draws only the
-  // loaded take aligned today). So:
-  //   · audio at session t INSIDE the selected take draws at t + anchor;
-  //   · everywhere else (gaps, other takes) drawn x == session t;
+  // drawn geometry shifts — since W7-A that is EVERY take with an applied
+  // verdict (live for the loaded one, persisted for the rest), so the
+  // anchor is per-take everywhere:
+  //   · audio at session t INSIDE a verdict-holding take draws at
+  //     t + THAT take's anchor;
+  //   · everywhere else (gaps, beyond the session, verdict-less takes)
+  //     drawn x == session t;
   //   · the playhead and the drawn↔audio click mapping apply the anchor
   //     per-take (see playheadSec and the pin reconciliation below) — a
-  //     session playhead crossing an UNSHIFTED neighbor take must never
-  //     lie by the loaded take's anchor.
+  //     session playhead crossing a neighbor take rides the NEIGHBOR's
+  //     drawn waves (its own anchor), never the loaded take's. The honest
+  //     consequence: the playhead steps by a take's anchor at its drawn
+  //     boundary — the piecewise transform made visible, replacing the
+  //     old (documented) step-left when leaving the loaded take over
+  //     unshifted neighbor waves.
   /** Where the selected take's room-time ZERO draws on the arrangement
    * (W6-C): base + anchor. Room-timeline DRAWING (marker flags, comment
    * ticks, MIDI lane, active-song strip) maps through this; audio-domain
@@ -1057,6 +1084,129 @@ function Desk({ sessionId }: { sessionId: string }) {
       }));
   }, [pendingDelete, takes]);
 
+  // ---- selection-aware auto-align (W7-A) -------------------------------------
+  // The toolbar button forks on selection: none → force re-align the
+  // loaded take, all lanes (the pre-W7-A behavior); selection → every take
+  // owning selected clips gets (re)aligned, SELECTED streams only
+  // (player.align scope), sequentially through the F5 queue
+  // (load → align → next), then the operator's loaded take comes back and
+  // the selection stays put. ANY forced run first RESETS the scoped
+  // clips' manual arrange overrides — a manual move is exactly what
+  // re-align exists to undo — and the chip note reports the reset
+  // honestly. Cancel semantics (latest wins) live in align-flow.ts.
+  const [alignFlow, setAlignFlow] = useState<{ done: number; total: number } | null>(null);
+  const [alignNote, setAlignNote] = useState<string | null>(null);
+  const alignNoteTimer = useRef<number | null>(null);
+  /** Transient chip note — auto-expires, replaced by the next align run. */
+  const noteAlign = useCallback((text: string | null) => {
+    if (alignNoteTimer.current !== null) window.clearTimeout(alignNoteTimer.current);
+    alignNoteTimer.current = null;
+    setAlignNote(text);
+    if (text !== null) {
+      alignNoteTimer.current = window.setTimeout(() => setAlignNote(null), 10_000);
+    }
+  }, []);
+  useEffect(
+    () => () => {
+      if (alignNoteTimer.current !== null) window.clearTimeout(alignNoteTimer.current);
+    },
+    [],
+  );
+  const recordingRef = useRef(recording);
+  recordingRef.current = recording;
+  // Session-identity guard for the async flow (the pinSession treatment):
+  // a session switch or unmount cancels before the next step. An EPOCH,
+  // not a boolean — a flag would flip back true for the new session while
+  // the old flow's closure still watches the same ref; each flow captures
+  // the epoch at start and cancels the moment it moves on.
+  const flowEpoch = useRef(0);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: sessionId IS the trigger — its change (and unmount) must bump the epoch
+  useEffect(() => {
+    return () => {
+      flowEpoch.current += 1;
+    };
+  }, [sessionId]);
+
+  function autoAlign() {
+    if (alignFlow !== null || playerSnap.aligning || recording || !selectedTakeId) return;
+    const scopes =
+      selection.length > 0
+        ? planAlignScopes(
+            selection,
+            state.deskStatus.map((s) => ({
+              streamId: s.streamId,
+              takeId: s.takeId,
+              complete: s.complete,
+            })),
+            {
+              liveTakeId: state.activeTakeId,
+              orphanedStreamIds: orphanedStreams,
+              takeOrder: [...takes.keys()],
+              loadedTakeId: playerSnap.loadedTakeId,
+            },
+          )
+        : [{ takeId: selectedTakeId, streamIds: selectedStreamIds }];
+    if (scopes.length === 0) {
+      // Filter-not-fail left nothing: say so instead of silently no-opping.
+      noteAlign("selection has no alignable clips");
+      return;
+    }
+    // Reset manual moves UP FRONT, one doc transaction: the whole reset
+    // fans out to other desks as one update (arrange is shared state —
+    // intended). A mid-flow cancel can leave a scope reset-but-not-
+    // remeasured, and that is SAFE: the persisted verdict still draws AND
+    // plays those clips aligned (align-flow.ts header).
+    const scopedIds = scopes.flatMap((s) => s.streamIds);
+    const resetCount = scopedIds.filter((id) => clipStartOverrides[id] !== undefined).length;
+    deleteArrangeKeys(collab.doc, scopedIds, collab.origin);
+    noteAlign(
+      resetCount > 0
+        ? `manual offsets reset · ${resetCount} clip${resetCount === 1 ? "" : "s"}`
+        : null,
+    );
+    setAlignFlow({ done: 0, total: scopes.length });
+    const flowSessionId = sessionId;
+    const epoch = flowEpoch.current;
+    const streamsOfTake = (takeId: string): string[] =>
+      state.deskStatus.filter((s) => s.takeId === takeId && s.complete).map((s) => s.streamId);
+    const channelOf = (streamId: string) => peerByStreamRef.current.get(streamId) ?? streamId;
+    void runAlignFlow(scopes, {
+      loadedTakeId: () => getPlayer().snapshot().loadedTakeId,
+      cancelled: () => recordingRef.current || flowEpoch.current !== epoch,
+      // Steps enqueue with NO busy pre-check, deliberately: a step's
+      // settle signal fires inside the queue's drain loop (before
+      // inFlight releases), so the very next enqueue lands in the pending
+      // slot of our OWN drain — the queue's designed serialization, not a
+      // race. Foreign requests keep winning through the queue's own
+      // signals: one landing mid-step flips superseded() (the step
+      // reports it, the flow aborts), and one REPLACING a still-pending
+      // step surfaces through the dropped-pending signal — either way the
+      // flow yields; it never silently stomps a fresher intent.
+      runStep: (takeId, streamIds) =>
+        new Promise((resolve) => {
+          requestTakeLoad({
+            sessionId: flowSessionId,
+            takeId,
+            streamIds: streamsOfTake(takeId), // the LOAD is whole-take…
+            channelOf,
+            align: false,
+            forceAlignScope: streamIds, // …the MEASUREMENT is the selection
+            onSettled: resolve,
+          });
+        }),
+      restore: (takeId) => {
+        requestTakeLoad({
+          sessionId: flowSessionId,
+          takeId,
+          streamIds: streamsOfTake(takeId),
+          channelOf,
+          align: true, // restore persisted verdict; align() no-ops on it
+        });
+      },
+      onProgress: (done, total) => setAlignFlow({ done, total }),
+    }).finally(() => setAlignFlow(null));
+  }
+
   /** Click-to-seek (W4-C): `sec` is an ARRANGEMENT-timeline position — any
    * x on the surface counts, loaded or not. The playhead parks at the
    * clicked spot immediately; when the spot lies inside another take's
@@ -1097,11 +1247,15 @@ function Desk({ sessionId }: { sessionId: string }) {
   //     content there never plays (it is what alignment trims) — audio
   //     parks at room zero (base) while the pin honestly keeps the
   //     clicked spot;
-  //   · anywhere else (gaps, other takes — drawn at capture placement,
-  //     W6-C's loaded-take-only scope) → X verbatim: playable silence or
-  //     a neighbor take, expressible while inside the session; a park
-  //     beyond the session end keeps the pin and Play from there follows
-  //     the one end rule (F12, session-scoped).
+  //   · anywhere else (gaps, beyond the end) → X verbatim: playable
+  //     silence, expressible while inside the session; a park beyond the
+  //     session end keeps the pin and Play from there follows the one end
+  //     rule (F12, session-scoped). A click inside ANOTHER take's drawn
+  //     boxes never reaches this mapping un-retargeted: seekTimeline
+  //     re-picks that take (W4-C), so by the time the pin reconciles the
+  //     take is the selected one and its own anchor rules apply — the
+  //     W7-A per-take drawing (neighbors compose their persisted shifts)
+  //     stays consistent with the click math by construction.
   //
   // W6-C QA F1: the align verdict lands AFTER the load (align() runs
   // post-load; a persisted verdict restores moments later), and an applied
@@ -1159,13 +1313,37 @@ function Desk({ sessionId }: { sessionId: string }) {
   // Playhead position on the shared timeline: the live take's write head
   // while recording; else the parked click (W4-C — it exists even with
   // nothing loaded); else the player position — arrangement time (W6-B),
-  // plus the anchor exactly while the audio comes from the SELECTED
-  // take's shifted boxes (the composition invariant above): the playhead
-  // rides the drawn waveforms it is playing, and never lies by the loaded
-  // take's anchor over an unshifted neighbor take or a gap.
+  // plus the anchor of WHATEVER take the audio comes from (the composition
+  // invariant above, W7-A): the selected take's LIVE anchor while inside
+  // its span, a neighbor take's PERSISTED anchor while inside that
+  // neighbor's, zero over the gaps — the playhead always rides the drawn
+  // waveforms it is playing.
   const positionInSelectedTake =
     playerSnap.positionSec >= selectedBaseSec &&
     playerSnap.positionSec <= selectedBaseSec + playerSnap.takeDurationSec;
+  // Neighbor takes' AUDIO spans with their persisted anchors (anchorAtSec
+  // input). Ends use declared stream lengths — the drawing domain's
+  // yardstick; the aligned end lands fractionally earlier, so the anchor
+  // holds a beat past the last audible sample. Cosmetic, and honest: the
+  // drawn boxes extend exactly this far too.
+  const neighborAnchorSpans = useMemo(() => {
+    const spans: TakeAnchorSpan[] = [];
+    for (const [takeId, slot] of takes) {
+      if (takeId === selectedTakeId || slot.live) continue;
+      const persisted = persistedShiftsByTake.get(takeId);
+      if (!persisted || persisted.anchorSec === 0) continue;
+      const streams = state.deskStatus.filter((s) => s.takeId === takeId);
+      if (streams.length === 0) continue;
+      const starts = streams.map((s) => clipStartOverrides[s.streamId] ?? slot.offsetSec);
+      const ends = streams.map((s, i) => (starts[i] as number) + s.totalSamples / SAMPLE_RATE);
+      spans.push({
+        startSec: Math.min(...starts),
+        endSec: Math.max(...ends),
+        anchorSec: persisted.anchorSec,
+      });
+    }
+    return spans;
+  }, [takes, selectedTakeId, persistedShiftsByTake, state.deskStatus, clipStartOverrides]);
   const playheadSec = recording
     ? state.activeTakeId && takes.has(state.activeTakeId)
       ? (takes.get(state.activeTakeId) as TakeSlot).offsetSec + elapsed
@@ -1173,7 +1351,10 @@ function Desk({ sessionId }: { sessionId: string }) {
     : parkedSeekSec !== null
       ? parkedSeekSec
       : playerLoaded && selectedTakeId
-        ? playerSnap.positionSec + (positionInSelectedTake ? alignView.anchorSec : 0)
+        ? playerSnap.positionSec +
+          (positionInSelectedTake
+            ? alignView.anchorSec
+            : anchorAtSec(neighborAnchorSpans, playerSnap.positionSec))
         : null;
 
   // ---- presence (W3-A) -------------------------------------------------------
@@ -1433,10 +1614,14 @@ function Desk({ sessionId }: { sessionId: string }) {
         errors={state.errors}
         exportError={exportError}
         zoom={zoom}
+        selectionCount={selection.length}
+        alignFlow={alignFlow}
+        alignNote={alignNote}
         laneNameOf={(channelKey) =>
           rows.find((row) => row.key === channelKey)?.name ?? channelKey.slice(0, 8)
         }
         onZoom={setZoom}
+        onAutoAlign={autoAlign}
         onAddMarker={addMarkerAtPlayhead}
         onOpenComments={openCommentComposer}
         onDismissError={(index) => getDeskSession(sessionId).dismissError(index)}

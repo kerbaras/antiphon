@@ -10,20 +10,29 @@ export class LoadQueue<T> {
   private pending: T | null = null;
   private readonly run: (req: T, superseded: () => boolean) => Promise<void>;
   private readonly onError: (error: unknown, req: T) => void;
+  private readonly onDropped: (req: T) => void;
 
   constructor(
     run: (req: T, superseded: () => boolean) => Promise<void>,
     onError: (error: unknown, req: T) => void = () => {},
+    // A replaced PENDING request never runs (latest wins) — callers that
+    // await a settle signal (the W7-A align flow) must hear about the
+    // drop or they would wait forever.
+    onDropped: (req: T) => void = () => {},
   ) {
     this.run = run;
     this.onError = onError;
+    this.onDropped = onDropped;
   }
 
   /** Enqueue a request. Runs immediately when idle; otherwise replaces any
-   * queued request (latest wins) and runs after the in-flight one. */
+   * queued request (latest wins, the replaced one reported dropped) and
+   * runs after the in-flight one. */
   request(req: T): void {
     if (this.inFlight) {
+      const replaced = this.pending;
       this.pending = req;
+      if (replaced !== null) this.onDropped(replaced);
       return;
     }
     void this.drain(req);

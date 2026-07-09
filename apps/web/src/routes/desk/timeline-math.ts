@@ -136,6 +136,66 @@ export function alignShifts(lags: AlignLag[], repeatIntervalSec: number): AlignS
   return { shiftSec, anchorSec };
 }
 
+// ---- W7-A — every take draws aligned (fold-in of the parked W6 follow-up) --------
+// The loaded take composes its shifts from LIVE player state; every other
+// take composes them from its PERSISTED verdict (alignment-persist.ts).
+// These are the pure conversions: stored entries → the same AlignShifts
+// the live path produces, and "which take's anchor is the playhead
+// inside?" for the per-take playhead mapping.
+
+/** One stream's persisted verdict as the drawing layer consumes it — the
+ * alignment-persist entry shape, structurally (no import cycle with
+ * player.ts). Lags are in stream samples at the desk's capture rate. */
+export interface PersistedAlignmentLag {
+  alignment: { lagSamples: number; applied: boolean; method?: AlignMethod };
+}
+
+/** AlignShifts of a take that is NOT loaded, from its persisted verdict:
+ * the exact alignShifts composition the loaded take gets from live track
+ * state, fed by stored lags at `sampleRate` (the capture rate every other
+ * drawn duration on the timeline already uses). Unapplied/absent entries
+ * contribute nothing — their clips fall to the anchor at draw time,
+ * exactly like live unmeasured streams. A declined take yields the empty
+ * shifts (anchor 0): it draws unshifted, honestly. */
+export function persistedAlignShifts(
+  entries: Readonly<Record<string, PersistedAlignmentLag>>,
+  sampleRate: number,
+  repeatIntervalSec: number,
+): AlignShifts {
+  const lags: AlignLag[] = Object.entries(entries)
+    .filter(([, entry]) => entry.alignment.applied)
+    .map(([streamId, entry]) => ({
+      streamId,
+      lagSamples: entry.alignment.lagSamples,
+      sampleRate,
+      method: entry.alignment.method ?? "chirp",
+    }));
+  return alignShifts(lags, repeatIntervalSec);
+}
+
+/** One take's AUDIO span on the arrangement (un-shifted positions — the
+ * player's clock domain) with the drawing anchor its verdict composes. */
+export interface TakeAnchorSpan {
+  startSec: number;
+  endSec: number;
+  anchorSec: number;
+}
+
+/** The drawing anchor in force at an arrangement position: the containing
+ * take's anchor, 0 in the gaps and beyond the session. The playhead rides
+ * the drawn (shifted) waveforms of WHATEVER take its audio comes from and
+ * never lies by another take's anchor over a gap — the W7-A promotion of
+ * the W6-C per-take rule from "selected take only" to every take with a
+ * verdict. Takes never overlap on the room clock by construction (the
+ * desk lays them out sequentially); first match wins as the defensive
+ * tie-break should a dragged arrangement overlap two spans. */
+export function anchorAtSec(spans: readonly TakeAnchorSpan[], posSec: number): number {
+  for (const span of spans) {
+    if (posSec >= span.startSec && posSec <= span.endSec) return span.anchorSec;
+  }
+  return 0;
+}
+
 // ---- W6-B — session spans and the look-ahead scheduler ---------------------------
 // The transport runs the whole SESSION timeline now: takes at their room
 // offsets, silence in the gaps. These helpers are the pure half of the

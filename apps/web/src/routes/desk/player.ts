@@ -795,10 +795,37 @@ export class SessionPlayer {
    * cross-correlation against a reference stream — near-identical clips
    * align without any calibration sweep. Idempotent unless `force`:
    * auto-align triggers ride on status polls, and both the correlation
-   * cost and the final re-schedule must not repeat. */
-  async align(force = false): Promise<void> {
+   * cost and the final re-schedule must not repeat.
+   *
+   * `scope` (W7-A, selection-aware align): re-measure ONLY these streams,
+   * leaving every other loaded track's verdict untouched. The scoped
+   * content fallback chains fresh lags onto the take's KEPT applied
+   * verdicts (see alignContentFallback's reference policy), and a fresh
+   * chirp hit over a pure-content kept domain demotes and re-chains via
+   * content (the domain guard in the run body), so mixed old+new
+   * verdicts stay in one lag domain and the audible residual between any
+   * two applied streams stays ≈ 0 — THE consistency invariant, in every
+   * path. A scope covering every loaded track, and a scope over a
+   * take with no other measured verdict to preserve, both normalize to
+   * the whole-take run: same outcome, one code path, and a never-aligned
+   * take gets its first full measurement instead of an artificial
+   * decline. Unknown/unloaded ids are dropped (the desk filters
+   * eligibility; this is the backstop). */
+  async align(force = false, scope?: readonly string[]): Promise<void> {
     if (this.loadedTracks().length === 0 || this.aligning) return;
     if (!force && this.loadedTracks().every((t) => t.alignment !== null)) return;
+    const loadedIds = new Set(this.loadedTracks().map((t) => t.streamId));
+    const scoped = scope?.filter((id) => loadedIds.has(id)) ?? [];
+    let scopeSet: Set<string> | null =
+      scope === undefined || scoped.length === loadedIds.size ? null : new Set(scoped);
+    if (scopeSet !== null && scopeSet.size === 0) return; // nothing eligible in scope
+    if (scopeSet !== null) {
+      const set = scopeSet;
+      const keptMeasured = this.loadedTracks().some(
+        (t) => !set.has(t.streamId) && t.alignment !== null,
+      );
+      if (!keptMeasured) scopeSet = null; // nothing to preserve → whole take
+    }
     const takeId = this.loadedTakeId;
     this.aligning = true;
     this.alignError = null;
@@ -815,6 +842,8 @@ export class SessionPlayer {
       await initWasm();
       const spec = DEFAULT_CHIRP_SPEC;
       for (const track of this.loadedTracks()) {
+        // Scoped run (W7-A): out-of-scope tracks keep their verdicts.
+        if (scopeSet !== null && !scopeSet.has(track.streamId)) continue;
         const rate = track.buffer.sampleRate;
         const window = Math.min(track.buffer.length, Math.round(rate * ALIGN_WINDOW_SECONDS));
         const head = track.buffer.getChannelData(0).slice(0, window);
@@ -842,7 +871,37 @@ export class SessionPlayer {
           track.alignment = { lagSamples: 0, confidence: 0, applied: false, method: "chirp" };
         }
       }
-      await this.alignContentFallback();
+      // Scoped-run domain guard (W7-A QA HIGH): a fresh chirp hit carries
+      // its RAW sweep-position lag — the chirp's own absolute domain.
+      // When the run KEEPS applied anchors and none of them are chirp,
+      // the take's standing domain is pure content, whose origin is the
+      // arbitrary lag-0 of its anchored reference — the two domains share
+      // no origin, so an applied raw chirp lag would tear every pairwise
+      // offset (normalizeAlignDeltas would take it as THE wrap base and
+      // read the kept content lags against it). Demote such hits to
+      // unapplied — the measurement survives for diagnostics — and let
+      // the content fallback below place those tracks against the kept
+      // reference instead; if content can't lock, they stay honestly
+      // unaligned rather than confidently torn. Kept chirp anchors (pure
+      // or mixed domains) keep fresh chirp hits as-is: all chirp lags
+      // share the sweep's absolute domain by construction, and the kept
+      // content lags were chained onto it when they were measured.
+      if (scopeSet !== null) {
+        const set = scopeSet;
+        const keptApplied = this.loadedTracks().filter(
+          (t) => !set.has(t.streamId) && t.alignment?.applied,
+        );
+        const keptChirp = keptApplied.some((t) => (t.alignment?.method ?? "chirp") === "chirp");
+        if (keptApplied.length > 0 && !keptChirp) {
+          for (const track of this.loadedTracks()) {
+            if (!set.has(track.streamId)) continue;
+            if (track.alignment?.applied && (track.alignment.method ?? "chirp") === "chirp") {
+              track.alignment = { ...track.alignment, applied: false };
+            }
+          }
+        }
+      }
+      await this.alignContentFallback(scopeSet);
       // Alignment offsets fix the take head; drift keeps it fixed for 45 min.
       await this.estimateDrift();
       // Re-schedule if currently playing AND the run changed any track's
@@ -880,34 +939,75 @@ export class SessionPlayer {
    * chirp-lag domain — the reference's own (wrapped) chirp lag plus the
    * measured signed pre-roll offset — so chirp- and content-aligned
    * tracks share one domain and the existing delta/persistence/render
-   * math applies unchanged. Reference policy: the longest chirp-applied
-   * track when any exist (content rescues the stragglers into the chirp
-   * anchor), otherwise the longest track overall (pure content mode).
-   * A failed content measurement KEEPS the honest chirp decline — the
-   * verdict never fabricates. */
-  private async alignContentFallback(): Promise<void> {
+   * math applies unchanged.
+   *
+   * `scope` (W7-A): a scoped run measures only in-scope tracks and may
+   * therefore hold KEPT applied verdicts it must stay consistent with.
+   * Reference policy, in order:
+   *   1. the take's persisted reference stream, when its verdict is KEPT
+   *      this run (out of scope, drift.isReference) — the stream the old
+   *      verdicts were measured against;
+   *   2. the longest chirp-applied anchor (chirp is the calibrated
+   *      domain — content rescues stragglers INTO it; the whole-take
+   *      rule, unchanged);
+   *   3. the longest applied anchor of any kind (a kept content verdict
+   *      already lives in the virtual domain — its stored lag IS the
+   *      chain base);
+   *   4. no applied verdict anywhere → pure content mode over the run's
+   *      own tracks, longest first (whole-take: the pre-W7-A rule
+   *      verbatim).
+   * Chaining onto ANY applied verdict lands the fresh lag in the take's
+   * one virtual domain, so every pairwise offset — old×old, old×new,
+   * new×new — agrees to measurement accuracy: the W7-A consistency
+   * invariant. A failed content measurement KEEPS the honest chirp
+   * decline — the verdict never fabricates. */
+  private async alignContentFallback(scope: Set<string> | null): Promise<void> {
     const tracks = this.loadedTracks();
     if (tracks.length < 2) return; // nothing to align against
-    const chirpApplied = tracks.filter((t) => t.alignment?.applied);
-    if (chirpApplied.length === tracks.length) return; // chirp placed everything
-    const anchors = chirpApplied.length > 0 ? chirpApplied : tracks;
-    const reference = anchors.reduce((a, b) => (b.buffer.length > a.buffer.length ? b : a));
+    const inScope = (t: Track) => scope === null || scope.has(t.streamId);
+    // Tracks content must place: in scope (theirs is this run's verdict
+    // to write) and not already chirp-placed.
+    const pending = tracks.filter((t) => inScope(t) && !t.alignment?.applied);
+    if (pending.length === 0) return; // chirp placed everything in scope
+    // Anchor pool: every applied verdict this run keeps — fresh in-scope
+    // chirp hits plus (scoped runs) the untouched out-of-scope verdicts.
+    const anchors = tracks.filter((t) => t.alignment?.applied);
+    const chirpAnchors = anchors.filter((t) => (t.alignment?.method ?? "chirp") === "chirp");
+    const longest = (pool: Track[]): Track =>
+      pool.reduce((a, b) => (b.buffer.length > a.buffer.length ? b : a));
+    const keptReference =
+      scope === null
+        ? undefined
+        : anchors.find((t) => !scope.has(t.streamId) && t.drift?.isReference);
+    const reference =
+      keptReference ??
+      (chirpAnchors.length > 0
+        ? longest(chirpAnchors)
+        : anchors.length > 0
+          ? longest(anchors)
+          : longest(scope === null ? tracks : pending));
     const spec = DEFAULT_CHIRP_SPEC;
     const rate = reference.buffer.sampleRate;
-    // Content lags chain onto the reference's chirp lag, wrapped exactly
-    // as normalizeAlignDeltas wraps it against the applied chirp set — the
-    // two computations must agree or restored deltas would tear apart.
+    // Content lags chain onto the reference's virtual lag. A content
+    // reference's stored lag already IS virtual-domain; a chirp reference
+    // wraps exactly as normalizeAlignDeltas wraps it against the applied
+    // chirp set — the two computations must agree or restored deltas
+    // would tear apart.
     let refVirtualLag = 0;
     if (reference.alignment?.applied) {
-      const base = Math.min(...chirpApplied.map((t) => t.alignment?.lagSamples ?? 0));
-      const interval = Math.round(((spec.durationMs + spec.gapMs) / 1_000) * rate);
-      refVirtualLag = base + wrapLag(reference.alignment.lagSamples - base, interval);
+      if ((reference.alignment.method ?? "chirp") === "content") {
+        refVirtualLag = reference.alignment.lagSamples;
+      } else {
+        const base = Math.min(...chirpAnchors.map((t) => t.alignment?.lagSamples ?? 0));
+        const interval = Math.round(((spec.durationMs + spec.gapMs) / 1_000) * rate);
+        refVirtualLag = base + wrapLag(reference.alignment.lagSamples - base, interval);
+      }
     }
     const refWindow = Math.min(reference.buffer.length, Math.round(rate * CONTENT_WINDOW_SECONDS));
     const refHead = reference.buffer.getChannelData(0).slice(0, refWindow);
     let bestConfidence = 0;
-    for (const track of tracks) {
-      if (track === reference || track.alignment?.applied) continue;
+    for (const track of pending) {
+      if (track === reference) continue;
       const trackRate = track.buffer.sampleRate;
       const window = Math.min(track.buffer.length, Math.round(trackRate * CONTENT_WINDOW_SECONDS));
       const head = track.buffer.getChannelData(0).slice(0, window);
@@ -1142,11 +1242,14 @@ export class SessionPlayer {
    * box shifts + the room-zero anchor, derived from the SAME lag set the
    * schedule trims with (timeline-math.alignShifts) — the timeline draws
    * exactly what plays. Empty/zero until a verdict applies. Scope note
-   * (W6-B × W6-C): the anchor is a DRAWING transform of the selected
-   * take only — the session clock itself is anchor-free (every take's
-   * aligned audio starts at its clip's arrangement position; see the
-   * timing() contract), and mounted-but-unselected takes draw at capture
-   * placement, W6-C's documented scope. */
+   * (W6-B × W6-C, revised by W7-A): the anchor is a DRAWING transform —
+   * the session clock itself is anchor-free (every take's aligned audio
+   * starts at its clip's arrangement position; see the timing()
+   * contract). This accessor serves the LOADED take's live verdict;
+   * every other take's boxes compose the SAME transform from their
+   * persisted verdict on the desk side (timeline-math
+   * persistedAlignShifts via use-desk useTakeAlignShifts — the W7-A
+   * fold-in), identical values once a run settles. */
   alignShifts(): AlignShifts {
     const spec = DEFAULT_CHIRP_SPEC;
     return alignShifts(

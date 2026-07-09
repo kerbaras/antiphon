@@ -7,7 +7,7 @@
 // incomplete (it never receives a stream-final), while the new stream
 // converges normally at take stop.
 
-import { expect, type Page, test } from "@playwright/test";
+import { expect, test } from "@playwright/test";
 import {
   deskStatus,
   expectTakeConverged,
@@ -18,18 +18,8 @@ import {
   serverTakeStreams,
   startTake,
   stopTake,
+  uiSelection,
 } from "./helpers/session";
-
-async function uiSelection(desk: Page): Promise<string[]> {
-  return await desk.evaluate(() => {
-    const hook = (
-      globalThis as unknown as {
-        __antiphonDesk?: { ui(): { selection: string[] } | null };
-      }
-    ).__antiphonDesk;
-    return [...(hook?.ui()?.selection ?? [])].sort();
-  });
-}
 
 test.describe("phone reload mid-take", () => {
   test.skip(({ browserName }) => browserName !== "chromium", "fake mic is Chromium-only");

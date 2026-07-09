@@ -1,12 +1,15 @@
 import { describe, expect, it } from "vitest";
 import {
   alignShifts,
+  anchorAtSec,
   normalizeAlignDeltas,
+  persistedAlignShifts,
   planSource,
   resolveRange,
   type SessionTakeSpan,
   sessionEndSec,
   sessionStartSec,
+  type TakeAnchorSpan,
   type TrackTiming,
   takesToMount,
   takesToRelease,
@@ -190,6 +193,86 @@ describe("alignShifts (W6-C visual composition)", () => {
     }
     // Every shift is a rightward (≥ 0) move — never off the left edge.
     for (const shift of shiftSec.values()) expect(shift).toBeGreaterThanOrEqual(0);
+  });
+});
+
+// ---- W7-A — persisted shifts (all takes draw aligned) + per-take anchor ----------
+
+describe("persistedAlignShifts (W7-A)", () => {
+  it("reproduces the live composition from stored entries — applied lags only", () => {
+    // The same lag pair the live path composes (1.5 s content stagger),
+    // plus a declined entry that must contribute nothing.
+    const shifts = persistedAlignShifts(
+      {
+        ref: { alignment: { lagSamples: 0, applied: true, method: "content" } },
+        b: { alignment: { lagSamples: 72_000, applied: true, method: "content" } },
+        declined: { alignment: { lagSamples: 999, applied: false, method: "content" } },
+      },
+      48_000,
+      1,
+    );
+    const live = alignShifts(
+      [
+        { streamId: "ref", lagSamples: 0, sampleRate: 48_000, method: "content" },
+        { streamId: "b", lagSamples: 72_000, sampleRate: 48_000, method: "content" },
+      ],
+      1,
+    );
+    expect(shifts.anchorSec).toBeCloseTo(live.anchorSec, 12);
+    expect([...shifts.shiftSec.entries()].sort()).toEqual([...live.shiftSec.entries()].sort());
+    expect(shifts.shiftSec.has("declined")).toBe(false); // falls to the anchor at draw time
+  });
+
+  it("legacy entries without a method wrap as chirp — parity with the restore path", () => {
+    // One repeat interval (48 000) of lock ambiguity between two chirp
+    // lags: the persisted composition must wrap exactly like the live one.
+    const { shiftSec, anchorSec } = persistedAlignShifts(
+      {
+        a: { alignment: { lagSamples: 1_000, applied: true } },
+        b: { alignment: { lagSamples: 49_400, applied: true } },
+      },
+      48_000,
+      1,
+    );
+    expect(anchorSec).toBeCloseTo(400 / 48_000, 12);
+    expect(shiftSec.get("b")).toBe(0);
+    expect(shiftSec.get("a")).toBeCloseTo(400 / 48_000, 12);
+  });
+
+  it("a declined take composes the empty shifts — draws unshifted, honestly", () => {
+    expect(
+      persistedAlignShifts({ a: { alignment: { lagSamples: 100, applied: false } } }, 48_000, 1),
+    ).toEqual({ shiftSec: new Map(), anchorSec: 0 });
+    expect(persistedAlignShifts({}, 48_000, 1)).toEqual({ shiftSec: new Map(), anchorSec: 0 });
+  });
+});
+
+describe("anchorAtSec (W7-A per-take playhead anchor)", () => {
+  const spans: TakeAnchorSpan[] = [
+    { startSec: 1, endSec: 5, anchorSec: 1.5 },
+    { startSec: 7, endSec: 12, anchorSec: 0.4 },
+  ];
+
+  it("returns the containing take's anchor, span edges included", () => {
+    expect(anchorAtSec(spans, 3)).toBe(1.5);
+    expect(anchorAtSec(spans, 1)).toBe(1.5);
+    expect(anchorAtSec(spans, 5)).toBe(1.5);
+    expect(anchorAtSec(spans, 7.5)).toBe(0.4);
+  });
+
+  it("is 0 in the gaps, before the first take, and beyond the session", () => {
+    expect(anchorAtSec(spans, 0.5)).toBe(0);
+    expect(anchorAtSec(spans, 6)).toBe(0);
+    expect(anchorAtSec(spans, 99)).toBe(0);
+    expect(anchorAtSec([], 3)).toBe(0);
+  });
+
+  it("first match wins on (defensive) overlap — takes are laid out disjoint", () => {
+    const overlapping: TakeAnchorSpan[] = [
+      { startSec: 0, endSec: 10, anchorSec: 2 },
+      { startSec: 5, endSec: 15, anchorSec: 3 },
+    ];
+    expect(anchorAtSec(overlapping, 7)).toBe(2);
   });
 });
 

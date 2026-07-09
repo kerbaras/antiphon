@@ -479,6 +479,311 @@ describe("content-alignment fallback (W4-B)", () => {
   });
 });
 
+// ---- W7-A: scoped (selection-aware) align ---------------------------------------
+// The consistency invariant under test: a scoped run's fresh verdicts must
+// land in the SAME virtual lag domain as the kept (out-of-scope) verdicts,
+// so normalizeAlignDeltas over the mixed set reproduces every true pairwise
+// offset — the audible residual between any two applied streams stays ≈ 0.
+
+describe("scoped align (W7-A)", () => {
+  beforeEach(() => {
+    vi.mocked(find_chirp_offset).mockClear();
+    vi.mocked(align_content).mockClear();
+  });
+
+  it("re-measures only the scope and chains onto the kept persisted reference", async () => {
+    const { player } = await loadedPlayer(2, ["s1", "s2"]);
+    expect(player.restoreAlignment("take-1", appliedEntries())).toBe(true);
+    // Content places s2 100 samples past the kept reference s1 (chirp lag
+    // 0 → virtual base 0): the fresh lag lands in the kept domain.
+    vi.mocked(align_content).mockReturnValueOnce(
+      JSON.stringify({ lagSamples: 100, peak: 0.9, confidence: 6.0 }),
+    );
+    await player.align(true, ["s2"]);
+    // Only s2 was measured (one chirp probe, one content probe)…
+    expect(find_chirp_offset).toHaveBeenCalledTimes(1);
+    expect(align_content).toHaveBeenCalledTimes(1);
+    const tracks = player.snapshot().tracks;
+    // …s1's kept verdict is byte-identical to what restore applied…
+    expect(tracks.find((t) => t.streamId === "s1")?.alignment).toEqual({
+      lagSamples: 0,
+      confidence: 5,
+      applied: true,
+      method: "chirp",
+    });
+    // …and s2's fresh content lag chains onto s1's virtual lag (0 + 100).
+    expect(tracks.find((t) => t.streamId === "s2")?.alignment).toEqual({
+      lagSamples: 100,
+      confidence: 6.0,
+      applied: true,
+      method: "content",
+    });
+    expect([...player.alignDeltas().entries()].sort()).toEqual([
+      ["s1", 0],
+      ["s2", 100],
+    ]);
+    expect(player.snapshot().alignmentOutcome).toMatchObject({
+      kind: "aligned",
+      trackCount: 2,
+      referenceStreamId: "s1",
+      method: "mixed",
+    });
+  });
+
+  it("falls to the longest kept applied anchor when the reference itself is in scope", async () => {
+    const { player } = await loadedPlayer(2, ["s1", "s2"]);
+    // Pure-content history: s1 was the anchored reference (lag 0), s2
+    // locked on at 4 800 — both lags already live in the virtual domain.
+    const entries: Record<string, StoredTrackAlignment> = {
+      s1: {
+        alignment: { lagSamples: 0, confidence: 5, applied: true, method: "content" },
+        drift: {
+          ratio: 1,
+          ppm: 0,
+          initialOffsetSamples: 0,
+          confidence: 1,
+          windowsUsed: 0,
+          applied: false,
+          isReference: true,
+        },
+      },
+      s2: {
+        alignment: { lagSamples: 4_800, confidence: 5, applied: true, method: "content" },
+        drift: null,
+      },
+    };
+    expect(player.restoreAlignment("take-1", entries)).toBe(true);
+    // Re-measuring s1 against the kept s2: s1 holds 4 800 samples LESS
+    // pre-roll, so its fresh lag = s2's stored lag (4 800) − 4 800 = 0.
+    vi.mocked(align_content).mockReturnValueOnce(
+      JSON.stringify({ lagSamples: -4_800, peak: 0.9, confidence: 5.5 }),
+    );
+    await player.align(true, ["s1"]);
+    const tracks = player.snapshot().tracks;
+    // The kept s2 verdict is untouched; the fresh s1 lag reproduces the
+    // original domain exactly — the deltas match the pre-run state.
+    expect(tracks.find((t) => t.streamId === "s2")?.alignment).toEqual({
+      lagSamples: 4_800,
+      confidence: 5,
+      applied: true,
+      method: "content",
+    });
+    expect(tracks.find((t) => t.streamId === "s1")?.alignment).toEqual({
+      lagSamples: 0,
+      confidence: 5.5,
+      applied: true,
+      method: "content",
+    });
+    expect([...player.alignDeltas().entries()].sort()).toEqual([
+      ["s1", 0],
+      ["s2", 4_800],
+    ]);
+  });
+
+  it("widens to the whole take when no out-of-scope verdict exists to preserve", async () => {
+    const { player } = await loadedPlayer(2, ["s1", "s2"]);
+    vi.mocked(align_content).mockReturnValueOnce(
+      JSON.stringify({ lagSamples: 4_800, peak: 0.92, confidence: 6.1 }),
+    );
+    // A never-aligned take: a scoped run has nothing to stay consistent
+    // with, so it runs whole-take — first full measurement, no artificial
+    // single-stream decline.
+    await player.align(true, ["s2"]);
+    expect(find_chirp_offset).toHaveBeenCalledTimes(2); // BOTH tracks probed
+    expect(player.snapshot().alignmentOutcome).toEqual({
+      kind: "aligned",
+      trackCount: 2,
+      referenceStreamId: "s1",
+      method: "content",
+    });
+    expect([...player.alignDeltas().entries()].sort()).toEqual([
+      ["s1", 0],
+      ["s2", 4_800],
+    ]);
+  });
+
+  it("declines honestly when only kept DECLINED verdicts exist — never fabricates", async () => {
+    const { player } = await loadedPlayer(2, ["s1", "s2"]);
+    await player.align(true); // both measured, both declined (mock defaults)
+    vi.mocked(find_chirp_offset).mockClear();
+    vi.mocked(align_content).mockClear();
+    await player.align(true, ["s2"]);
+    // s1's declined verdict is kept state (the verdict IS the state), so
+    // the run stays scoped — but with no applied anchor and a one-stream
+    // scope there is nothing to correlate against: honest decline.
+    expect(find_chirp_offset).toHaveBeenCalledTimes(1);
+    expect(align_content).not.toHaveBeenCalled();
+    expect(player.snapshot().alignmentOutcome).toMatchObject({ kind: "declined" });
+    expect(player.alignDeltas().size).toBe(0);
+  });
+
+  it("ignores unknown ids and no-ops on an empty effective scope", async () => {
+    const { player } = await loadedPlayer(2, ["s1", "s2"]);
+    await player.align(true, ["ghost"]);
+    expect(find_chirp_offset).not.toHaveBeenCalled();
+    expect(player.snapshot().alignmentOutcome).toBeNull();
+  });
+
+  // ---- the scoped-run domain guard (QA HIGH) ------------------------------------
+  // A fresh chirp lag is a RAW sweep position; a pure-content kept domain
+  // has an arbitrary origin (its reference anchored at lag 0). Mixing the
+  // two raw would hand normalizeAlignDeltas a chirp wrap base the kept
+  // content lags were never measured against — garbage pairwise offsets,
+  // persisted and drawn. The guard demotes such hits and re-chains them
+  // via content; kept chirp anchors (pure or mixed) keep fresh chirp hits
+  // raw, because every chirp lag shares the sweep's absolute domain.
+
+  /** QA's probe fixture: a persisted pure-content pair (s1 the anchored
+   * reference at lag 0, s2 locked on at 4 800), s3 never measured. */
+  function contentPairEntries(): Record<string, StoredTrackAlignment> {
+    return {
+      s1: {
+        alignment: { lagSamples: 0, confidence: 5, applied: true, method: "content" },
+        drift: {
+          ratio: 1,
+          ppm: 0,
+          initialOffsetSamples: 0,
+          confidence: 1,
+          windowsUsed: 0,
+          applied: false,
+          isReference: true,
+        },
+      },
+      s2: {
+        alignment: { lagSamples: 4_800, confidence: 5, applied: true, method: "content" },
+        drift: null,
+      },
+    };
+  }
+
+  it("demotes a fresh chirp hit over a pure-content kept domain and re-chains it via content (QA HIGH probe)", async () => {
+    const { player } = await loadedPlayer(2, ["s1", "s2", "s3"]);
+    expect(player.restoreAlignment("take-1", contentPairEntries())).toBe(true);
+    // s3 holds a findable chirp at raw sweep position 250 000 (conf 6.0)
+    // — an absolute-domain lag the kept content pair knows nothing about.
+    vi.mocked(find_chirp_offset).mockReturnValueOnce(
+      JSON.stringify({ lagSamples: 250_000, confidence: 6.0 }),
+    );
+    // Content places s3 100 samples past the kept reference s1.
+    vi.mocked(align_content).mockReturnValueOnce(
+      JSON.stringify({ lagSamples: 100, peak: 0.9, confidence: 5.0 }),
+    );
+    await player.align(true, ["s3"]);
+    // The chirp hit did NOT stand in its raw domain: s3 carries a CONTENT
+    // verdict chained onto the kept reference, and every pairwise offset
+    // stays true — pre-fix this read {s1:0, s2:4800, s3:250000}, a 5.2 s
+    // head-trim never measured against the kept pair.
+    const s3 = player.snapshot().tracks.find((t) => t.streamId === "s3");
+    expect(s3?.alignment).toEqual({
+      lagSamples: 100,
+      confidence: 5.0,
+      applied: true,
+      method: "content",
+    });
+    expect([...player.alignDeltas().entries()].sort()).toEqual([
+      ["s1", 0],
+      ["s2", 4_800],
+      ["s3", 100],
+    ]);
+  });
+
+  it("a demoted chirp hit content can't place stays honestly unaligned — never confidently torn", async () => {
+    const { player } = await loadedPlayer(2, ["s1", "s2", "s3"]);
+    expect(player.restoreAlignment("take-1", contentPairEntries())).toBe(true);
+    vi.mocked(find_chirp_offset).mockReturnValueOnce(
+      JSON.stringify({ lagSamples: 250_000, confidence: 6.0 }),
+    );
+    // align_content default mock: no shared content located → no chain.
+    await player.align(true, ["s3"]);
+    const s3 = player.snapshot().tracks.find((t) => t.streamId === "s3");
+    // The measurement survives for diagnostics, unapplied — and the kept
+    // pair's deltas are exactly what they were.
+    expect(s3?.alignment).toEqual({
+      lagSamples: 250_000,
+      confidence: 6.0,
+      applied: false,
+      method: "chirp",
+    });
+    expect([...player.alignDeltas().entries()].sort()).toEqual([
+      ["s1", 0],
+      ["s2", 4_800],
+    ]);
+    expect(player.snapshot().alignmentOutcome).toMatchObject({
+      kind: "aligned",
+      trackCount: 2,
+    });
+  });
+
+  it("kept chirp anchors keep a fresh chirp hit raw — one absolute sweep domain", async () => {
+    const { player } = await loadedPlayer(2, ["s1", "s2", "s3"]);
+    const entries: Record<string, StoredTrackAlignment> = {
+      s1: {
+        alignment: { lagSamples: 1_000, confidence: 5, applied: true, method: "chirp" },
+        drift: {
+          ratio: 1,
+          ppm: 0,
+          initialOffsetSamples: 0,
+          confidence: 1,
+          windowsUsed: 0,
+          applied: false,
+          isReference: true,
+        },
+      },
+      s2: {
+        alignment: { lagSamples: 1_400, confidence: 5, applied: true, method: "chirp" },
+        drift: null,
+      },
+    };
+    expect(player.restoreAlignment("take-1", entries)).toBe(true);
+    vi.mocked(find_chirp_offset).mockReturnValueOnce(
+      JSON.stringify({ lagSamples: 1_900, confidence: 5.0 }),
+    );
+    await player.align(true, ["s3"]);
+    // No demotion, no content probe: chirp lags interoperate raw.
+    expect(align_content).not.toHaveBeenCalled();
+    expect([...player.alignDeltas().entries()].sort()).toEqual([
+      ["s1", 0],
+      ["s2", 400],
+      ["s3", 900],
+    ]);
+  });
+
+  it("kept MIXED anchors keep a fresh chirp hit raw too — the kept content lag was chained onto the chirp domain", async () => {
+    const { player } = await loadedPlayer(2, ["s1", "s2", "s3"]);
+    const entries: Record<string, StoredTrackAlignment> = {
+      s1: {
+        alignment: { lagSamples: 48_000, confidence: 5, applied: true, method: "chirp" },
+        drift: {
+          ratio: 1,
+          ppm: 0,
+          initialOffsetSamples: 0,
+          confidence: 1,
+          windowsUsed: 0,
+          applied: false,
+          isReference: true,
+        },
+      },
+      s2: {
+        // Content lag in the VIRTUAL chirp domain (48 000 + 500), exactly
+        // how alignContentFallback stores a rescued straggler.
+        alignment: { lagSamples: 48_500, confidence: 4, applied: true, method: "content" },
+        drift: null,
+      },
+    };
+    expect(player.restoreAlignment("take-1", entries)).toBe(true);
+    vi.mocked(find_chirp_offset).mockReturnValueOnce(
+      JSON.stringify({ lagSamples: 48_200, confidence: 5.0 }),
+    );
+    await player.align(true, ["s3"]);
+    expect(align_content).not.toHaveBeenCalled();
+    expect([...player.alignDeltas().entries()].sort()).toEqual([
+      ["s1", 0],
+      ["s2", 500],
+      ["s3", 200],
+    ]);
+  });
+});
+
 // ---- W6-B: session transport — plan, boundary handoff, mount window ---------------
 
 /** Two-take session plan: take-1 at [1, 2), take-2 at [4, 5). */

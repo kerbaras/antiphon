@@ -2,6 +2,7 @@
 // server-side archive polling for the sink-convergence table.
 
 import { encode_flac_mono, init as initWasm } from "@antiphon/core-wasm";
+import { DEFAULT_CHIRP_SPEC } from "@antiphon/protocol";
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
 import { type CollabClient, getCollab } from "../../net/collab";
 import {
@@ -16,6 +17,7 @@ import { DeskSession, type DeskSessionState } from "../../net/desk-session";
 import {
   bindAlignmentToCollab,
   persistTakeAlignment,
+  readDocAlignment,
   readTakeAlignment,
   restoreTakeAlignment,
   type TakeAlignment,
@@ -64,8 +66,14 @@ import {
   renderSessionMaster,
   renderStems,
 } from "./render";
-import { type RenderRange, resolveRange, type TrackTiming } from "./timeline-math";
-import { fileSafe } from "./track-model";
+import {
+  type AlignShifts,
+  persistedAlignShifts,
+  type RenderRange,
+  resolveRange,
+  type TrackTiming,
+} from "./timeline-math";
+import { fileSafe, SAMPLE_RATE } from "./track-model";
 import { bindMixToCollab } from "./use-collab";
 import { encodeWav } from "./wav";
 import { buildZip, type ZipEntry } from "./zip";
@@ -136,6 +144,9 @@ export function getDeskSession(sessionId: string): DeskSession {
           persistTakeAlignment(getDeskCollab(sessionId), sessionId, takeId, entries);
         }
       },
+      // Diagnostics/e2e: a take's persisted verdict record straight from
+      // the shared doc — `at` is the freshness stamp the W7-A specs read.
+      alignmentRecord: (takeId: string) => readDocAlignment(getDeskCollab(sessionId).doc, takeId),
     };
   }
   return session;
@@ -184,6 +195,51 @@ export function usePlayer(): PlayerSnapshot {
   return useSyncExternalStore(subscribe, () => playerSnap ?? getPlayer().snapshot());
 }
 
+// ---- persisted align shifts for the timeline (W7-A) -----------------------------
+// The fold-in of the parked W6 follow-up: EVERY take with a persisted
+// verdict draws aligned, not just the loaded one. This hook materializes
+// takeId → AlignShifts from the shared doc's alignment map (localStorage
+// reconciled through the same newest-wins read the engine's look-ahead
+// mounts use) and refreshes when any verdict lands — local settles and
+// remote desks' runs alike. Lags convert at the CAPTURE rate (48 kHz), the
+// same rate every other drawn duration on the timeline uses; the loaded
+// take should prefer the player's live alignShifts (identical after a
+// restore, fresher mid-run) — the caller owns that override.
+
+/** `takeIdsKey`: comma-joined take ids (stable-string dep, the
+ * selectedStreamKey pattern) — the takes the timeline currently draws. */
+export function useTakeAlignShifts(
+  sessionId: string,
+  takeIdsKey: string,
+): Map<string, AlignShifts> {
+  const [shifts, setShifts] = useState<Map<string, AlignShifts>>(new Map());
+  useEffect(() => {
+    const collab = getDeskCollab(sessionId);
+    const spec = DEFAULT_CHIRP_SPEC;
+    const recompute = () => {
+      const next = new Map<string, AlignShifts>();
+      for (const takeId of takeIdsKey ? takeIdsKey.split(",") : []) {
+        const entries = readTakeAlignment(collab, sessionId, takeId);
+        if (!entries) continue;
+        const composed = persistedAlignShifts(
+          entries,
+          SAMPLE_RATE,
+          (spec.durationMs + spec.gapMs) / 1_000,
+        );
+        // Declined-only verdicts compose nothing — same as no verdict.
+        if (composed.shiftSec.size > 0) next.set(takeId, composed);
+      }
+      setShifts(next);
+    };
+    recompute();
+    const map = collab.doc.getMap("alignment");
+    const observer = () => recompute();
+    map.observe(observer);
+    return () => map.unobserve(observer);
+  }, [sessionId, takeIdsKey]);
+  return shifts;
+}
+
 /** Load a take into the player from the desk's OPFS store (idempotent).
  * `channelOf` maps streams to mixer lanes so strip state follows the
  * performer, not the take. */
@@ -224,17 +280,37 @@ export interface TakeLoadRequest {
   /** Auto-align after a successful load (chirp first, content fallback —
    * see player.align). Skipped when a persisted verdict already restored. */
   align: boolean;
+  /** W7-A: FORCE-align these streams after the load (persisted verdicts
+   * restore first, so a scoped run keeps its out-of-scope anchors). Takes
+   * precedence over `align`; a scope covering the whole take is a
+   * whole-take force run (player normalization). */
+  forceAlignScope?: readonly string[];
+  /** W7-A: the flow's settle signal. "ok" = loaded (+aligned);
+   * "superseded" = a newer request replaced this one (mid-run or while
+   * still pending — either way it must not be awaited further);
+   * "failed" = the load failed (error already on the transport strip). */
+  onSettled?: (status: "ok" | "superseded" | "failed") => void;
 }
 
 const takeLoadQueue = new LoadQueue<TakeLoadRequest>(
   async (req, superseded) => {
     const ok = await loadTakeIntoPlayer(req.sessionId, req.takeId, req.streamIds, req.channelOf);
-    if (!ok || superseded()) return;
+    if (!ok || superseded()) {
+      req.onSettled?.(ok ? "superseded" : "failed");
+      return;
+    }
     // F7b: a persisted verdict reapplies BEFORE any auto-align — restored
     // tracks satisfy align()'s idempotence check, so nothing re-measures
     // and the reloaded take plays with the exact stored schedule offsets.
+    // A W7-A scoped FORCE run needs this order too: the restored
+    // out-of-scope verdicts are the anchors it chains onto.
     restoreTakeAlignment(getDeskCollab(req.sessionId), getPlayer(), req.sessionId, req.takeId);
-    if (req.align) await getPlayer().align();
+    if (req.forceAlignScope) {
+      await getPlayer().align(true, req.forceAlignScope);
+    } else if (req.align) {
+      await getPlayer().align();
+    }
+    req.onSettled?.(superseded() ? "superseded" : "ok");
   },
   (error, req) => {
     // Load/align failures surface on the transport error strip — a stuck
@@ -242,7 +318,11 @@ const takeLoadQueue = new LoadQueue<TakeLoadRequest>(
     getPlayer().reportError(
       `take ${req.takeId.slice(0, 8)} load failed: ${error instanceof Error ? error.message : String(error)}`,
     );
+    req.onSettled?.("failed");
   },
+  // A pending request replaced before it ever ran (latest wins): the
+  // align flow treats it exactly like a mid-run supersession.
+  (req) => req.onSettled?.("superseded"),
 );
 
 /** Load the selected take through the latest-wins queue (F5). */

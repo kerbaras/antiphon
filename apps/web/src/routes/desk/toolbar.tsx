@@ -7,7 +7,6 @@ import type { FatalSignalingError } from "../../net/signaling-client";
 import { Button, MonoReadout, Panel, SectionLabel, StatusPill } from "../../ui/kit";
 import { SnapGrid, ToolGroup, ViewTabs, ZoomControl } from "./daw";
 import type { PlayerSnapshot } from "./player";
-import { getPlayer } from "./use-desk";
 
 /** Auto-align control state (F7a) — also the e2e observation surface. */
 type AlignState = "aligning" | "aligned" | "declined" | "failed" | "idle";
@@ -37,8 +36,12 @@ export function DeskToolbar({
   errors,
   exportError,
   zoom,
+  selectionCount,
+  alignFlow,
+  alignNote,
   laneNameOf,
   onZoom,
+  onAutoAlign,
   onAddMarker,
   onOpenComments,
   onDismissError,
@@ -51,15 +54,24 @@ export function DeskToolbar({
   errors: string[];
   exportError: string | null;
   zoom: number;
+  /** Selected clips (W7-A): scopes the align button + its copy. */
+  selectionCount: number;
+  /** Multi-take align flow progress (W7-A) — non-null while running. */
+  alignFlow: { done: number; total: number } | null;
+  /** Transient align note (W7-A): "manual offsets reset · N clips". */
+  alignNote: string | null;
   /** Mixer-lane display name (nickname when set) for the align readout. */
   laneNameOf: (channelKey: string) => string;
   onZoom: (zoom: number) => void;
+  /** Selection-aware auto-align (W7-A) — index.tsx owns the flow. */
+  onAutoAlign: () => void;
   onAddMarker: () => void;
   onOpenComments: () => void;
   onDismissError: (index: number) => void;
 }) {
   const outcome = playerSnap.alignmentOutcome;
-  const alignState: AlignState = playerSnap.aligning ? "aligning" : (outcome?.kind ?? "idle");
+  const alignState: AlignState =
+    playerSnap.aligning || alignFlow !== null ? "aligning" : (outcome?.kind ?? "idle");
   // Reference lane of the aligned outcome, named for humans.
   const referenceName =
     outcome?.kind === "aligned" && outcome.referenceStreamId
@@ -99,13 +111,15 @@ export function DeskToolbar({
           type="button"
           aria-label="Auto-align"
           title={
-            alignState === "idle" && !lastChirpAt
-              ? "Align tracks: chirp correlation, falling back to waveform cross-correlation (run Chirp during a take for best precision)"
-              : "Re-run alignment on the loaded take (chirp, then waveform fallback)"
+            selectionCount > 0
+              ? `Re-align the ${selectionCount} selected clip${selectionCount === 1 ? "" : "s"} by waveform (chirp first when present) — clears their manual moves`
+              : alignState === "idle" && !lastChirpAt
+                ? "Align tracks: chirp correlation, falling back to waveform cross-correlation (run Chirp during a take for best precision)"
+                : "Re-run alignment on the loaded take (chirp, then waveform fallback) — clears manual clip moves"
           }
           data-align-state={alignState}
-          disabled={!playerLoaded || playerSnap.aligning || recording}
-          onClick={() => void getPlayer().align(true)}
+          disabled={!playerLoaded || playerSnap.aligning || recording || alignFlow !== null}
+          onClick={onAutoAlign}
           // whitespace-nowrap (W5-B seam): under flex squeeze the pill used
           // to two-line ("align / declined") and break the 40px row — the
           // verdict CHIP is the row's designated flexible child, not this.
@@ -118,9 +132,21 @@ export function DeskToolbar({
           <span className="text-[8px]">●</span>
           {ALIGN_BUTTON_LABELS[alignState]}
         </button>
+        {/* Multi-take flow progress (W7-A) rides the outcome chip's slot:
+            "aligning take 2/3…" while the flow walks the selection's
+            takes through the load queue. Single-take runs keep the plain
+            "aligning…" button state — a 1/1 counter is noise. */}
+        {alignFlow && alignFlow.total > 1 && (
+          <span
+            data-testid="align-outcome"
+            className="min-w-0 max-w-[300px] truncate font-mono text-[9px] text-accent/80"
+          >
+            aligning take {Math.min(alignFlow.done + 1, alignFlow.total)}/{alignFlow.total}…
+          </span>
+        )}
         {/* Compact outcome readout (F7a): aligned / declined / failed are
             visibly distinct from "never ran" — no more silent decline. */}
-        {!playerSnap.aligning && outcome && (
+        {!playerSnap.aligning && !alignFlow && outcome && (
           <span
             data-testid="align-outcome"
             title={
@@ -145,6 +171,17 @@ export function DeskToolbar({
               : outcome.kind === "declined"
                 ? `declined · confidence ${outcome.confidence.toFixed(2)} < ${outcome.threshold}`
                 : `failed: ${outcome.message}`}
+          </span>
+        )}
+        {/* Transient align note (W7-A): a forced re-align that cleared
+            manual clip moves says so — quietly, next to the verdict. */}
+        {alignNote && (
+          <span
+            data-testid="align-note"
+            title="Auto-align returns clips to their recorded positions plus the fresh alignment shift — manual drags on the realigned clips were discarded (all desks)."
+            className="whitespace-nowrap font-mono text-[9px] text-text-faint"
+          >
+            {alignNote}
           </span>
         )}
         <button

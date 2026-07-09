@@ -28,6 +28,7 @@ import {
   joinAsRecorder,
   startTake,
   stopTake,
+  uiSelection,
 } from "./helpers/session";
 
 // Default zoom (24 px/sec); the first take sits at +1 s on the arrangement.
@@ -44,17 +45,6 @@ async function uiPlayhead(desk: Page): Promise<number | null> {
       }
     ).__antiphonDesk;
     return hook?.ui()?.playheadSec ?? null;
-  });
-}
-
-async function uiSelection(desk: Page): Promise<string[]> {
-  return await desk.evaluate(() => {
-    const hook = (
-      globalThis as unknown as {
-        __antiphonDesk?: { ui(): { selection: string[] } | null };
-      }
-    ).__antiphonDesk;
-    return [...(hook?.ui()?.selection ?? [])].sort();
   });
 }
 

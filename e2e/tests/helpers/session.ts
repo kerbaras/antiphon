@@ -116,6 +116,20 @@ export async function recorderSamples(page: Page): Promise<number> {
   });
 }
 
+/** The desk's clip selection through the ui mirror, SORTED (deterministic
+ * regardless of click/marquee order) — lifted from five spec-local copies
+ * on the W7-C "lift on next touch" note. */
+export async function uiSelection(desk: Page): Promise<string[]> {
+  return await desk.evaluate(() => {
+    const hook = (
+      globalThis as unknown as {
+        __antiphonDesk?: { ui(): { selection: string[] } | null };
+      }
+    ).__antiphonDesk;
+    return [...(hook?.ui()?.selection ?? [])].sort();
+  });
+}
+
 // ---- journey drivers -----------------------------------------------------------
 
 /** Enable the (fake) mic on an already-loaded /join page and wait for the

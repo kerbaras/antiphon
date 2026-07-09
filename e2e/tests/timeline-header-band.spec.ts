@@ -19,7 +19,13 @@
 // lane-x presses below the last lane still seek.
 
 import { expect, type Page, test } from "@playwright/test";
-import { expectTakeConverged, joinAsRecorder, startTake, stopTake } from "./helpers/session";
+import {
+  expectTakeConverged,
+  joinAsRecorder,
+  startTake,
+  stopTake,
+  uiSelection,
+} from "./helpers/session";
 
 test.skip(({ browserName }) => browserName !== "chromium", "fake mic is Chromium-only");
 
@@ -90,15 +96,6 @@ async function scrollTimeline(
     if (target.top !== undefined) viewport.scrollTop = target.top;
     return { left: viewport.scrollLeft, top: viewport.scrollTop };
   }, to);
-}
-
-async function uiSelection(desk: Page): Promise<string[]> {
-  return await desk.evaluate(() => {
-    const hook = (
-      globalThis as unknown as { __antiphonDesk?: { ui(): { selection: string[] } | null } }
-    ).__antiphonDesk;
-    return [...(hook?.ui()?.selection ?? [])].sort();
-  });
 }
 
 async function playerPosition(desk: Page): Promise<number> {

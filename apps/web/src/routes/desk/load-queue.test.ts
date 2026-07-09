@@ -11,6 +11,7 @@ function harness() {
   const resolvers: Array<() => void> = [];
   const supersededSeen: boolean[] = [];
   const errors: Array<{ error: unknown; req: string }> = [];
+  const dropped: string[] = [];
   const queue = new LoadQueue<string>(
     (req, superseded) =>
       new Promise<void>((resolve) => {
@@ -21,13 +22,14 @@ function harness() {
         });
       }),
     (error, req) => errors.push({ error, req }),
+    (req) => dropped.push(req),
   );
   const finishNext = async () => {
     resolvers.shift()?.();
     await Promise.resolve(); // let the drain loop advance
     await Promise.resolve();
   };
-  return { queue, ran, errors, supersededSeen, finishNext };
+  return { queue, ran, errors, supersededSeen, dropped, finishNext };
 }
 
 describe("LoadQueue", () => {
@@ -50,17 +52,21 @@ describe("LoadQueue", () => {
     expect(h.queue.busy).toBe(false);
   });
 
-  it("latest wins: intermediate requests are collapsed", async () => {
+  it("latest wins: intermediate requests are collapsed and reported dropped", async () => {
     const h = harness();
     h.queue.request("a");
     h.queue.request("b");
     h.queue.request("c");
     h.queue.request("d");
     await h.finishNext();
-    // b and c never ran; the queue jumped straight to the latest.
+    // b and c never ran; the queue jumped straight to the latest — and
+    // each replaced pending request was reported (W7-A: an awaiting align
+    // flow must hear the drop or it would wait forever).
     expect(h.ran).toEqual(["a", "d"]);
+    expect(h.dropped).toEqual(["b", "c"]);
     await h.finishNext();
     expect(h.ran).toEqual(["a", "d"]);
+    expect(h.dropped).toEqual(["b", "c"]);
   });
 
   it("reports supersession so a stale job can skip follow-up work", async () => {

@@ -263,15 +263,21 @@ test.describe("clip arrangement over alignment (W6-C)", () => {
     const finalPos = (await sample()).position;
     expect(Math.abs(anchorSec + finalPos - clickSec)).toBeLessThan(0.06);
 
-    // ---- W6-B × W6-C invariant pin: the playhead applies the anchor ----
-    // PER TAKE. Session playback (W6-B) rolls from inside the loaded,
-    // ANCHORED take 1 across the gap into take 2 — an unloaded neighbor
-    // whose boxes draw at capture placement (W6-C's loaded-take-only
-    // scope). While the audio comes from take 1's shifted boxes the drawn
-    // playhead reads position + anchor; over the neighbor it must read
-    // the RAW session position — never lying by the loaded take's anchor
-    // (> 1.4 s here, so the two readings are unambiguous even with the
-    // ~0.1 s mirror-vs-engine sampling skew).
+    // ---- W6-B × W6-C invariant pin (W7-A shape): the playhead applies ----
+    // the anchor PER TAKE. Session playback (W6-B) rolls from inside the
+    // loaded, ANCHORED take 1 across into take 2 — an unloaded neighbor
+    // whose boxes now compose THEIR OWN persisted verdict (W7-A
+    // draw-all-aligned; the pre-W7-A pin asserted raw position over the
+    // neighbor because neighbors drew unshifted — that scope is gone).
+    // While the audio comes from take 1's shifted boxes the drawn playhead
+    // reads position + take 1's anchor; over take 2 it must read position
+    // + TAKE 2's persisted anchor (read from the doc record — take 2 is
+    // ~4.4 s of mid-file music, so whether its content verdict accepted or
+    // declined is its own run's business; the pin asserts against
+    // whichever anchor was actually persisted, 0 included); over any gap,
+    // the raw position. Take 1's anchor is > 1.4 s, so a playhead lying by
+    // the LOADED take's anchor over the neighbor stays unambiguous even
+    // with the ~0.1 s mirror-vs-engine sampling skew.
     // take 1's audio spans [1, 1 + takeDuration] on the session axis;
     // the ALIGNED end depends on which lane the +2 s drag hit (the
     // trimmed-head lane ends ~2 s earlier than the zero-trim one, and the
@@ -317,20 +323,84 @@ test.describe("clip arrangement over alignment (W6-C)", () => {
       if (!s.playing) break; // end-of-session auto-pause
       if (s.playhead !== null) pairs.push({ playhead: s.playhead, position: s.position });
     }
+    // Take 2's persisted anchor + audio span, straight from the layers the
+    // desk itself draws from (doc record; session plan).
+    const take2Anchor = await desk.evaluate((tid) => {
+      const hook = (
+        globalThis as unknown as {
+          __antiphonDesk?: {
+            alignmentRecord(takeId: string): {
+              entries: Record<string, { alignment: { lagSamples: number; applied: boolean } }>;
+            } | null;
+          };
+        }
+      ).__antiphonDesk;
+      const record = hook?.alignmentRecord(tid);
+      if (!record) return 0;
+      const lags = Object.values(record.entries)
+        .filter((e) => e.alignment.applied)
+        .map((e) => e.alignment.lagSamples);
+      if (lags.length < 2) return 0; // declined / single-applied: no shift composes
+      return (Math.max(...lags) - Math.min(...lags)) / 48_000;
+    }, take2Id);
+    const take2Span = await desk.evaluate((tid) => {
+      const hook = (
+        globalThis as unknown as {
+          __antiphonDesk?: {
+            player: {
+              sessionRenderPlan(): Array<{
+                takeId: string;
+                baseSec: number;
+                declaredEndSec: number;
+              }>;
+            };
+          };
+        }
+      ).__antiphonDesk;
+      const span = hook?.player.sessionRenderPlan().find((p) => p.takeId === tid);
+      return span ? { baseSec: span.baseSec, endSec: span.declaredEndSec } : null;
+    }, take2Id);
+    expect(take2Span).not.toBeNull();
+    const { baseSec: take2Base, endSec: take2End } = take2Span as {
+      baseSec: number;
+      endSec: number;
+    };
     const inTake1 = pairs.filter((p) => p.position <= take1EndSec - 1);
-    const beyondTake1 = pairs.filter((p) => p.position >= take1EndSec + 0.5);
+    // Margins keep every bucket clear of the drawn boundaries (and of the
+    // dragged clip's possible overlap into take 2's slot): a sample must
+    // be unambiguously inside ONE take's audio span to assert its anchor.
+    const inGap = pairs.filter(
+      (p) => p.position >= take1EndSec + 0.3 && p.position <= take2Base - 0.3,
+    );
+    const inTake2 = pairs.filter(
+      (p) => p.position >= Math.max(take2Base, take1EndSec) + 0.3 && p.position <= take2End - 0.3,
+    );
     expect(inTake1.length).toBeGreaterThanOrEqual(3);
-    expect(beyondTake1.length).toBeGreaterThanOrEqual(3);
+    expect(inTake2.length).toBeGreaterThanOrEqual(3);
+    // The gap's WIDTH is layout-dependent (which lane the +2 s drag hit is
+    // a streamId-sort coin flip: the trimmed lane leaves ~2 s of gap, the
+    // zero-trim one none) — but when the layout DOES leave a samplable gap
+    // (bucket margins 2×0.3 s + the 150 ms sampling period), the bucket
+    // must hold samples, or its anchor-free assertion passes vacuously.
+    if (take2Base - take1EndSec > 1) {
+      expect(inGap.length).toBeGreaterThanOrEqual(1);
+    }
     for (const p of inTake1) {
       expect(
         Math.abs(p.playhead - (p.position + anchorSec)),
         `selected-take playhead ${p.playhead} vs pos ${p.position} + anchor ${anchorSec}`,
       ).toBeLessThan(0.35);
     }
-    for (const p of beyondTake1) {
+    for (const p of inGap) {
       expect(
         Math.abs(p.playhead - p.position),
-        `neighbor playhead ${p.playhead} vs raw pos ${p.position}`,
+        `gap playhead ${p.playhead} vs raw pos ${p.position}`,
+      ).toBeLessThan(0.35);
+    }
+    for (const p of inTake2) {
+      expect(
+        Math.abs(p.playhead - (p.position + take2Anchor)),
+        `neighbor playhead ${p.playhead} vs pos ${p.position} + take-2 anchor ${take2Anchor}`,
       ).toBeLessThan(0.35);
     }
 
