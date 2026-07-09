@@ -51,13 +51,14 @@ export function midiDataBytes(status: number): 1 | 2 {
 }
 
 /**
- * Per-take event cap. Measured: one serialized event is ~55–65 bytes of
- * JSON ("{"atSec":123.456789,…}"), so 50k events ≈ 3.2 MB — inside the
- * usual 5 MB/origin localStorage budget with headroom for markers/comments/
- * prefs, but too close to gamble higher. On overflow the EARLIEST events
- * are kept (the take's head is the performance; a tail-biased buffer would
- * silently rewrite history) and the UI warns. OPFS storage is the parked
- * follow-up that removes the cap.
+ * Per-take event cap FOR THE LOCALSTORAGE PATH. Measured: one serialized
+ * event is ~55–65 bytes of JSON ("{"atSec":123.456789,…}"), so 50k events
+ * ≈ 3.2 MB — inside the usual 5 MB/origin localStorage budget with headroom
+ * for markers/comments/prefs, but too close to gamble higher. On overflow
+ * the EARLIEST events are kept (the take's head is the performance; a
+ * tail-biased buffer would silently rewrite history) and the UI warns.
+ * The OPFS store (midi-store.ts, W5-D) has no cap — captures there pass
+ * Infinity to appendMidiEvent.
  */
 export const MIDI_EVENT_CAP = 50_000;
 
@@ -87,9 +88,14 @@ export function takeRelativeSeconds(timeStampMs: number, anchorMs: number): numb
 }
 
 /** Append in place (event lists are big — no copying per event) honoring
- * the cap. Returns false when the event was dropped (cap reached). */
-export function appendMidiEvent(events: MidiEvent[], event: MidiEvent): boolean {
-  if (events.length >= MIDI_EVENT_CAP) return false;
+ * the cap (Infinity on the OPFS path — no cap there). Returns false when
+ * the event was dropped (cap reached). */
+export function appendMidiEvent(
+  events: MidiEvent[],
+  event: MidiEvent,
+  cap: number = MIDI_EVENT_CAP,
+): boolean {
+  if (events.length >= cap) return false;
   events.push(event);
   return true;
 }
@@ -157,9 +163,10 @@ export interface TakeMidi {
   overflow: boolean;
 }
 
-type KVStore = Pick<Storage, "getItem" | "setItem">;
+/** Exported for midi-store.ts (migration reads/deletes localStorage keys). */
+export type KVStore = Pick<Storage, "getItem" | "setItem" | "removeItem">;
 
-function defaultStore(): KVStore | null {
+export function defaultMidiKV(): KVStore | null {
   try {
     return globalThis.localStorage ?? null;
   } catch {
@@ -173,13 +180,49 @@ export function midiKey(sessionId: string, takeId: string): string {
 
 const EMPTY: TakeMidi = { events: [], overflow: false };
 
+/** Validate one persisted entry back into a MidiEvent, or null. Shared by
+ * the localStorage doc decoder and the OPFS JSONL decoder (midi-store.ts) —
+ * one gate for what counts as a storable event. */
+export function decodeMidiEventEntry(entry: unknown): MidiEvent | null {
+  if (typeof entry !== "object" || entry === null) return null;
+  const e = entry as Record<string, unknown>;
+  if (typeof e.atSec !== "number" || !Number.isFinite(e.atSec) || e.atSec < 0) return null;
+  if (typeof e.status !== "number" || typeof e.data1 !== "number") return null;
+  const data2 = typeof e.data2 === "number" ? e.data2 : 0;
+  const norm = normalizeMidiMessage(
+    midiDataBytes(e.status) === 2 ? [e.status, e.data1, data2] : [e.status, e.data1],
+  );
+  return norm ? { atSec: e.atSec, ...norm } : null;
+}
+
+/** Decode a raw localStorage document. `null` = nothing usable (malformed
+ * JSON, unknown schema version, wrong shape); otherwise keep what parses,
+ * reporting how many entries were dropped so migration can warn honestly. */
+export function decodeMidiDoc(raw: string): { midi: TakeMidi; dropped: number } | null {
+  try {
+    const doc = JSON.parse(raw) as Partial<MidiDoc> | null;
+    if (doc?.v !== SCHEMA_VERSION || !Array.isArray(doc.events)) return null;
+    const valid: MidiEvent[] = [];
+    for (const entry of doc.events as unknown[]) {
+      const e = decodeMidiEventEntry(entry);
+      if (e) valid.push(e);
+    }
+    return {
+      midi: { events: sortMidiEvents(valid), overflow: doc.overflow === true },
+      dropped: doc.events.length - valid.length,
+    };
+  } catch {
+    return null;
+  }
+}
+
 /** Load a take's MIDI. Malformed JSON, unknown schema versions and invalid
  * entries all degrade to "no events" — never a throw (markers.ts rule: a
  * side-store must not be able to take the desk down). */
 export function loadMidi(
   sessionId: string,
   takeId: string,
-  store: KVStore | null = defaultStore(),
+  store: KVStore | null = defaultMidiKV(),
 ): TakeMidi {
   let raw: string | null = null;
   try {
@@ -188,32 +231,14 @@ export function loadMidi(
     return { ...EMPTY };
   }
   if (!raw) return { ...EMPTY };
-  try {
-    const doc = JSON.parse(raw) as Partial<MidiDoc> | null;
-    if (doc?.v !== SCHEMA_VERSION || !Array.isArray(doc.events)) return { ...EMPTY };
-    const valid: MidiEvent[] = [];
-    for (const entry of doc.events as unknown[]) {
-      if (typeof entry !== "object" || entry === null) continue;
-      const e = entry as Record<string, unknown>;
-      if (typeof e.atSec !== "number" || !Number.isFinite(e.atSec) || e.atSec < 0) continue;
-      if (typeof e.status !== "number" || typeof e.data1 !== "number") continue;
-      const data2 = typeof e.data2 === "number" ? e.data2 : 0;
-      const norm = normalizeMidiMessage(
-        midiDataBytes(e.status) === 2 ? [e.status, e.data1, data2] : [e.status, e.data1],
-      );
-      if (norm) valid.push({ atSec: e.atSec, ...norm });
-    }
-    return { events: sortMidiEvents(valid), overflow: doc.overflow === true };
-  } catch {
-    return { ...EMPTY };
-  }
+  return decodeMidiDoc(raw)?.midi ?? { ...EMPTY };
 }
 
 export function saveMidi(
   sessionId: string,
   takeId: string,
   midi: TakeMidi,
-  store: KVStore | null = defaultStore(),
+  store: KVStore | null = defaultMidiKV(),
 ): void {
   const doc: MidiDoc = {
     v: SCHEMA_VERSION,
@@ -224,6 +249,20 @@ export function saveMidi(
     store?.setItem(midiKey(sessionId, takeId), JSON.stringify(doc));
   } catch {
     // quota / private mode: the in-memory events still serve this page load
+  }
+}
+
+/** Drop a take's localStorage entry — after OPFS migration and on take
+ * deletion. Same never-throw rule as load/save. */
+export function removeMidi(
+  sessionId: string,
+  takeId: string,
+  store: KVStore | null = defaultMidiKV(),
+): void {
+  try {
+    store?.removeItem(midiKey(sessionId, takeId));
+  } catch {
+    // storage denied: nothing to remove that could have been stored
   }
 }
 
@@ -238,7 +277,7 @@ export interface MidiInputPrefs {
   inputLabel: string;
 }
 
-export function loadMidiPrefs(store: KVStore | null = defaultStore()): MidiInputPrefs | null {
+export function loadMidiPrefs(store: KVStore | null = defaultMidiKV()): MidiInputPrefs | null {
   try {
     const raw = store?.getItem(MIDI_PREFS_KEY);
     if (!raw) return null;
@@ -252,7 +291,10 @@ export function loadMidiPrefs(store: KVStore | null = defaultStore()): MidiInput
   }
 }
 
-export function saveMidiPrefs(prefs: MidiInputPrefs, store: KVStore | null = defaultStore()): void {
+export function saveMidiPrefs(
+  prefs: MidiInputPrefs,
+  store: KVStore | null = defaultMidiKV(),
+): void {
   try {
     store?.setItem(MIDI_PREFS_KEY, JSON.stringify(prefs));
   } catch {

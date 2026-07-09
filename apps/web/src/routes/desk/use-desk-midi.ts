@@ -3,7 +3,16 @@
 // protocol stays audio-only; nothing here touches packets/streams. While a
 // take rolls, incoming channel messages are timestamped against the take
 // (anchor = performance.now() at the desk's take-start observation; mapping
-// + precision documented in midi.ts) and persisted per take on stop.
+// + precision documented in midi.ts) and persisted per take.
+//
+// PERSISTENCE (W5-D): the in-memory event list is the source of truth; the
+// MidiStore (midi-store.ts — OPFS, or localStorage where OPFS is missing)
+// trails it. Mid-take writes are debounced ~2s and flushed when the tab
+// hides/unloads and on take stop — so the ACCEPTED LOSS BOUND is an
+// unflushed tail younger than the debounce window, and only if the tab
+// dies without firing its lifecycle events (pagehide's async OPFS write is
+// itself best-effort). On the OPFS path capture is UNCAPPED; the 50k cap
+// applies only on the localStorage fallback.
 //
 // Playback renders NOTHING audible on purpose: the piano was audible in the
 // room, so the audio lanes already carry it — this is a data lane, exported
@@ -15,17 +24,22 @@
 import { useCallback, useSyncExternalStore } from "react";
 import {
   appendMidiEvent,
-  loadMidi,
   loadMidiPrefs,
+  MIDI_EVENT_CAP,
   type MidiEvent,
   type MidiInputPrefs,
   normalizeMidiMessage,
-  saveMidi,
+  removeMidi,
   saveMidiPrefs,
   type TakeMidi,
   takeRelativeSeconds,
 } from "./midi";
+import { defaultMidiStore, loadTakeMidi, type MidiStore } from "./midi-store";
 import { getDeskSession } from "./use-desk";
+
+/** Mid-take write debounce — the codebase's debounce scale. Also the loss
+ * bound (see the persistence note above). */
+export const MIDI_SAVE_DEBOUNCE_MS = 2_000;
 
 // Structural slices of the Web MIDI API (the manager's working types).
 // Real MIDIAccess/MIDIInput satisfy them; tests inject scripted doubles —
@@ -127,18 +141,47 @@ export class DeskMidi {
    * events/s and must not become hundreds of React renders/s. */
   private countFlush: number | null = null;
   private knownTakeId: string | null;
-  /** Loaded/finished takes' events, by takeId (localStorage-backed). */
+  /** Loaded/finished takes' events, by takeId (MidiStore-backed). */
   private readonly takes = new Map<string, TakeMidi>();
+  /** The page's MidiStore (feature detection is async — awaited per op). */
+  private readonly storeReady: Promise<MidiStore>;
+  /** Capture cap: none on OPFS; the W3-C cap on the localStorage fallback.
+   * Starts capped — flips only after the store proves to be OPFS. */
+  private cap: number = MIDI_EVENT_CAP;
+  /** Debounced mid-take write (see the loss-bound note up top). */
+  private saveTimer: number | null = null;
+  /** Serializes writes per manager: whole-file rewrites must land in
+   * schedule order or an older debounced write could outlive a newer one. */
+  private saveChain: Promise<void> = Promise.resolve();
 
   constructor(
     readonly sessionId: string,
     private readonly requestAccess: MidiAccessFactory = midiAccess,
+    storePromise: Promise<MidiStore> = defaultMidiStore(),
   ) {
     // Take lifecycle rides the desk session (fires synchronously on patch,
     // so the anchor is sampled the instant the desk learns of take-start).
     const session = getDeskSession(sessionId);
     this.knownTakeId = session.snapshot().activeTakeId; // pre-rolling take: never capture a partial tail
     session.subscribe((s) => this.onTake(s.activeTakeId));
+    // A take deleted from every sink takes its MIDI with it — the desk is
+    // this data's only home, so a dangling file would be an orphan forever.
+    session.onStreamsDeleted((_streamIds, deletedTakeIds) => {
+      for (const takeId of deletedTakeIds) this.deleteTakeMidi(takeId);
+    });
+    this.storeReady = storePromise;
+    void storePromise.then((store) => {
+      if (store.kind === "opfs") this.cap = Number.POSITIVE_INFINITY;
+    });
+    // Flush points: an unflushed tail must not ride on the tab surviving
+    // the next MIDI_SAVE_DEBOUNCE_MS. pagehide's async write is
+    // best-effort by nature — the debounce is the honest loss bound.
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "hidden") this.flushCapture();
+      });
+      window.addEventListener("pagehide", () => this.flushCapture());
+    }
   }
 
   subscribe(listener: Listener): () => void {
@@ -157,14 +200,96 @@ export class DeskMidi {
   }
 
   /** A take's stored MIDI: finished captures this page load, else the
-   * persisted document (tolerant load). Cached per take. */
+   * persisted document. Storage reads are async now (OPFS), so a first
+   * touch returns an empty placeholder, hydrates in the background, and
+   * bumps `revision` when the real events land — the UI re-reads, exactly
+   * the path a finishing capture already exercises. */
   takeMidi(takeId: string): TakeMidi {
     let midi = this.takes.get(takeId);
     if (!midi) {
-      midi = loadMidi(this.sessionId, takeId);
+      midi = { events: [], overflow: false };
       this.takes.set(takeId, midi);
+      void this.hydrate(takeId, midi);
     }
     return midi;
+  }
+
+  private async hydrate(takeId: string, placeholder: TakeMidi): Promise<void> {
+    try {
+      const store = await this.storeReady;
+      const loaded = await loadTakeMidi(store, this.sessionId, takeId);
+      // A capture that finished while we read owns the entry now — keep it.
+      if (this.takes.get(takeId) !== placeholder) return;
+      this.takes.set(takeId, loaded.midi);
+      // Storage refusals surface on the MIDI error strip (QA F2), not just
+      // the console — the store already said WHY there.
+      this.patch({
+        revision: this.state.revision + 1,
+        ...(loaded.oversize
+          ? { error: "a take's stored MIDI exceeds the 64 MB guard — not loaded (see console)" }
+          : loaded.unreadable
+            ? {
+                error:
+                  "a take's stored MIDI is unreadable — kept on disk, not loaded (see console)",
+              }
+            : {}),
+      });
+    } catch (e) {
+      // markers.ts rule: a side-store must not take the desk down.
+      console.warn(`antiphon: MIDI load failed for take ${takeId}: ${String(e)}`);
+    }
+  }
+
+  /** Queue a write. The chain serializes whole-file rewrites; the store
+   * serializes the events synchronously at write time, so passing the live
+   * capture buffer is sound (newer events only make the write fresher). */
+  private persist(takeId: string, midi: TakeMidi): void {
+    this.saveChain = this.saveChain.then(async () => {
+      const store = await this.storeReady;
+      try {
+        await store.save(this.sessionId, takeId, midi);
+      } catch (e) {
+        // Visible, not console-only (QA F3): the operator should know the
+        // performance data is riding memory until a write lands.
+        console.warn(`antiphon: MIDI save failed for take ${takeId}: ${String(e)}`);
+        this.patch({
+          error: "MIDI save failed — events held in memory this page load (see console)",
+        });
+      }
+    });
+  }
+
+  /** Flush the pending debounced write NOW — visibilitychange/pagehide and
+   * take stop. `saveTimer` doubles as the dirty flag. */
+  private flushCapture(): void {
+    if (this.saveTimer === null) return;
+    window.clearTimeout(this.saveTimer);
+    this.saveTimer = null;
+    const capture = this.capture;
+    if (capture) {
+      this.persist(capture.takeId, { events: capture.events, overflow: this.state.overflowed });
+    }
+  }
+
+  /** Take-level cleanup: a server-confirmed deletion removed the take's
+   * last stream, so its MIDI goes too — cache, stored file, and any legacy
+   * localStorage key. Chained behind pending saves so a debounced write
+   * can't resurrect the file. */
+  deleteTakeMidi(takeId: string): void {
+    this.takes.delete(takeId);
+    // A pending debounced write for THIS take would queue behind the
+    // remove and resurrect the file — cancel it (QA F4). Another take's
+    // pending write (the rolling capture) is not ours to drop.
+    if (this.capture?.takeId === takeId && this.saveTimer !== null) {
+      window.clearTimeout(this.saveTimer);
+      this.saveTimer = null;
+    }
+    this.saveChain = this.saveChain.then(async () => {
+      const store = await this.storeReady;
+      await store.remove(this.sessionId, takeId);
+    });
+    removeMidi(this.sessionId, takeId); // pre-migration copies, either store kind
+    this.patch({ revision: this.state.revision + 1 });
   }
 
   /** Probe permission + enumerate inputs (requestMIDIAccess prompts on
@@ -274,9 +399,13 @@ export class DeskMidi {
       window.clearTimeout(this.countFlush);
       this.countFlush = null;
     }
+    if (this.saveTimer !== null) {
+      window.clearTimeout(this.saveTimer);
+      this.saveTimer = null;
+    }
     const midi: TakeMidi = { events: done.events, overflow: this.state.overflowed };
     this.takes.set(done.takeId, midi);
-    if (midi.events.length > 0) saveMidi(this.sessionId, done.takeId, midi);
+    if (midi.events.length > 0) this.persist(done.takeId, midi); // take-stop flush point
     this.patch({
       capturing: false,
       liveEventCount: done.events.length,
@@ -290,13 +419,21 @@ export class DeskMidi {
     const norm = normalizeMidiMessage(e.data);
     if (!norm) return; // sysex/realtime/aftertouch — dropped in v1
     const event: MidiEvent = { atSec: takeRelativeSeconds(e.timeStamp, capture.anchorMs), ...norm };
-    if (appendMidiEvent(capture.events, event)) {
+    if (appendMidiEvent(capture.events, event, this.cap)) {
       this.countFlush ??= window.setTimeout(() => {
         this.countFlush = null;
         this.patch({ liveEventCount: this.capture?.events.length ?? this.state.liveEventCount });
       }, 120);
+      // Coalesced mid-take write: at most one per MIDI_SAVE_DEBOUNCE_MS
+      // (schedule-once, not trailing-reset — continuous input must not
+      // postpone the write forever). This window is the loss bound.
+      this.saveTimer ??= window.setTimeout(() => {
+        this.saveTimer = null;
+        const c = this.capture;
+        if (c) this.persist(c.takeId, { events: c.events, overflow: this.state.overflowed });
+      }, MIDI_SAVE_DEBOUNCE_MS);
     } else if (!this.state.overflowed) {
-      this.patch({ overflowed: true }); // cap reached: earliest kept, warn once
+      this.patch({ overflowed: true }); // localStorage-fallback cap: earliest kept, warn once
     }
   };
 

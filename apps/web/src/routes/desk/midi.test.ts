@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   appendMidiEvent,
+  decodeMidiDoc,
   loadMidi,
   loadMidiPrefs,
   MIDI_EVENT_CAP,
@@ -9,6 +10,7 @@ import {
   midiKey,
   normalizeMidiMessage,
   noteSpansOf,
+  removeMidi,
   saveMidi,
   saveMidiPrefs,
   sortMidiEvents,
@@ -23,12 +25,15 @@ const ev = (atSec: number, status = 0x90, data1 = 60, data2 = 100): MidiEvent =>
 });
 
 /** Minimal Storage double for the persistence round-trip tests. */
-function memStore(): Pick<Storage, "getItem" | "setItem"> & { map: Map<string, string> } {
+function memStore(): Pick<Storage, "getItem" | "setItem" | "removeItem"> & {
+  map: Map<string, string>;
+} {
   const map = new Map<string, string>();
   return {
     map,
     getItem: (k) => map.get(k) ?? null,
     setItem: (k, v) => void map.set(k, v),
+    removeItem: (k) => void map.delete(k),
   };
 }
 
@@ -92,6 +97,13 @@ describe("event buffer", () => {
     expect(events).toHaveLength(MIDI_EVENT_CAP);
     expect(events[0]?.atSec).toBe(0); // head intact, newcomer dropped
     expect(events[events.length - 1]?.atSec).not.toBe(999);
+  });
+
+  it("appendMidiEvent takes an explicit cap — Infinity on the OPFS path", () => {
+    const events: MidiEvent[] = [ev(0), ev(1)];
+    expect(appendMidiEvent(events, ev(2), 2)).toBe(false);
+    expect(appendMidiEvent(events, ev(2), Number.POSITIVE_INFINITY)).toBe(true);
+    expect(events).toHaveLength(3);
   });
 
   it("sortMidiEvents orders by time, stable for simultaneous events", () => {
@@ -199,16 +211,37 @@ describe("persistence", () => {
   });
 
   it("survives a throwing store (private mode) by degrading to empty", () => {
-    const throwing: Pick<Storage, "getItem" | "setItem"> = {
+    const throwing: Pick<Storage, "getItem" | "setItem" | "removeItem"> = {
       getItem: () => {
         throw new Error("denied");
       },
       setItem: () => {
         throw new Error("denied");
       },
+      removeItem: () => {
+        throw new Error("denied");
+      },
     };
     expect(loadMidi("s", "t", throwing)).toEqual({ events: [], overflow: false });
     expect(() => saveMidi("s", "t", { events: [ev(1)], overflow: false }, throwing)).not.toThrow();
+    expect(() => removeMidi("s", "t", throwing)).not.toThrow();
+  });
+
+  it("removeMidi drops exactly the (session, take) entry", () => {
+    const store = memStore();
+    saveMidi("s", "t1", { events: [ev(1)], overflow: false }, store);
+    saveMidi("s", "t2", { events: [ev(2)], overflow: false }, store);
+    removeMidi("s", "t1", store);
+    expect(store.map.has(midiKey("s", "t1"))).toBe(false);
+    expect(store.map.has(midiKey("s", "t2"))).toBe(true);
+  });
+
+  it("decodeMidiDoc reports dropped entries (migration warns on these)", () => {
+    const decoded = decodeMidiDoc(JSON.stringify({ v: 1, events: [ev(1), null, "junk"] }));
+    expect(decoded?.midi.events).toEqual([ev(1)]);
+    expect(decoded?.dropped).toBe(2);
+    expect(decodeMidiDoc("not json{")).toBeNull();
+    expect(decodeMidiDoc(JSON.stringify({ v: 999, events: [] }))).toBeNull();
   });
 });
 

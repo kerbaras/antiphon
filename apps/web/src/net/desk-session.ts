@@ -99,7 +99,9 @@ export class DeskSession {
   >();
   private nextRequestId = 1;
   private audioContext: AudioContext | null = null;
-  private readonly deletedListeners = new Set<(streamIds: string[]) => void>();
+  private readonly deletedListeners = new Set<
+    (streamIds: string[], deletedTakeIds: string[]) => void
+  >();
   /** The active take exactly as started, kept for re-assertion (A14): a
    * reconnect welcome from a rebooted server carries activeTake=null while
    * recorders keep rolling — the desk (control authority, §3) re-sends
@@ -252,8 +254,10 @@ export class DeskSession {
     this.patch({ errors: this.state.errors.filter((_, i) => i !== index) });
   }
 
-  /** Fires with the stream ids removed after a server-confirmed deletion. */
-  onStreamsDeleted(listener: (streamIds: string[]) => void): () => void {
+  /** Fires after a server-confirmed deletion with the stream ids removed
+   * and the take ids the server dropped entirely (last stream gone) — the
+   * signal for take-scoped side stores (desk MIDI) to clean up too. */
+  onStreamsDeleted(listener: (streamIds: string[], deletedTakeIds: string[]) => void): () => void {
     this.deletedListeners.add(listener);
     return () => this.deletedListeners.delete(listener);
   }
@@ -409,7 +413,7 @@ export class DeskSession {
           streams: this.state.streams.filter((s) => !ids.has(s.streamId)),
           liveLevels,
         });
-        for (const listener of this.deletedListeners) listener([...ids]);
+        for (const listener of this.deletedListeners) listener([...ids], msg.deletedTakeIds);
         break;
       }
       case "ice-offer": {

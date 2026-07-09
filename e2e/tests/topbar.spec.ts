@@ -21,10 +21,64 @@
 // declined verdict across the full width sweep. At 430 (below the floor)
 // the bar keeps its shape and the page scrolls.
 
+import { writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { expect, type Locator, type Page, test } from "@playwright/test";
 import { expectTakeConverged, joinAsRecorder, startTake, stopTake } from "./helpers/session";
 
 test.skip(({ browserName }) => browserName !== "chromium", "desktop layout guard");
+
+// A pure, constant-amplitude 440 Hz sine for the fake mics — the verdict
+// sweep below needs a DETERMINISTIC decline, and Chromium's default fake
+// device (a 0.5 s beep grid) doesn't give one: its envelope has edges, and
+// the partial beep at each capture's head is genuine aperiodic evidence
+// that sometimes hands the content correlator an honest lag (measured
+// ~1/4 aligned on main). A flat sine has no envelope feature anywhere —
+// mean removal leaves nothing to match and every period is a tie, the
+// exact fixture dsp content.rs pins sub-threshold
+// (periodic_content_is_ambiguous_and_declined); the chirp path declines
+// trivially (no chirp is ever emitted). 440 × 30 s is an integer cycle
+// count, so the file loops seamlessly — no splice transient to betray it.
+function sineWav(): Buffer {
+  const rate = 48_000;
+  const n = rate * 30;
+  const data = Buffer.alloc(n * 2);
+  for (let i = 0; i < n; i++) {
+    const v = 0.5 * Math.sin(2 * Math.PI * 440 * (i / rate));
+    data.writeInt16LE(Math.round(v * 26000), i * 2);
+  }
+  const header = Buffer.alloc(44);
+  header.write("RIFF", 0, "latin1");
+  header.writeUInt32LE(36 + data.length, 4);
+  header.write("WAVE", 8, "latin1");
+  header.write("fmt ", 12, "latin1");
+  header.writeUInt32LE(16, 16); // fmt chunk size
+  header.writeUInt16LE(1, 20); // integer PCM
+  header.writeUInt16LE(1, 22); // mono
+  header.writeUInt32LE(rate, 24);
+  header.writeUInt32LE(rate * 2, 28); // byte rate
+  header.writeUInt16LE(2, 32); // block align
+  header.writeUInt16LE(16, 34); // bit depth
+  header.write("data", 36, "latin1");
+  header.writeUInt32LE(data.length, 40);
+  return Buffer.concat([header, data]);
+}
+
+// Written at module load: the browser (and its flags) launches per worker
+// AFTER the spec file is imported, so the path exists before capture.
+const sinePath = path.join(os.tmpdir(), `antiphon-topbar-sine-${process.pid}.wav`);
+writeFileSync(sinePath, sineWav());
+
+test.use({
+  launchOptions: {
+    args: [
+      "--use-fake-device-for-media-stream",
+      "--use-fake-ui-for-media-stream",
+      `--use-file-for-fake-audio-capture=${sinePath}`,
+    ],
+  },
+});
 
 interface Box {
   x: number;
@@ -153,10 +207,18 @@ test("top bar: below the 520px floor the bar keeps its shape and the page scroll
 // the toolbar's ONE flexible child; every returning tier of inert chrome
 // is a chance to squash it (it happened twice: 980-1200 in the first cut,
 // then 1200-1345 in the "fix" — 4px at 1200, 84px at 1280). So the guard
-// is a SWEEP with a live declined verdict (the longest chip string, what
-// two sine-tone fake mics deterministically produce), not spot widths:
-// every guarded width ≥ 700 including both sides of every tier boundary
-// and QA's measured five, asserting ≥170px AND visually untruncated.
+// is a SWEEP with a live declined verdict, not spot widths: every guarded
+// width ≥ 700 including both sides of every tier boundary and QA's
+// measured five, asserting ≥170px AND visually untruncated.
+//
+// WHY declined, and why the sine file (W5-D QA F5): "declined ·
+// confidence 0.xx < 0.5" (~178px) is the longest string that must render
+// WHOLE — aligned-with-ref strings can run longer but truncate into the
+// chip's own max-w-[300px] by design (the title attr carries the full
+// text); the sweep's contract is that the FLEX ROW never squeezes the
+// chip below the declined string's natural width. The default fake-mic
+// beep grid made that verdict nondeterministic (see sineWav above); the
+// flat sine declines by construction, so the assertion stays strict.
 test("toolbar: the live declined verdict chip keeps ≥170px across the width sweep", async ({
   browser,
 }) => {
@@ -178,8 +240,9 @@ test("toolbar: the live declined verdict chip keeps ≥170px across the width sw
   await stopTake(desk);
   await expectTakeConverged(desk, sessionId, takeId, 2);
 
-  // Auto-load + align-on-load (W4-B): the periodic sine correlates without
-  // consensus → a declined verdict, the longest live chip copy.
+  // Auto-load + align-on-load (W4-B): the flat sine is a tie at every
+  // period — decline by construction (see sineWav) — so the chip carries
+  // the longest live copy that must render whole.
   const chip = desk.getByTestId("align-outcome");
   await expect(chip).toBeVisible({ timeout: 60_000 });
   await expect(chip).toContainText("declined");

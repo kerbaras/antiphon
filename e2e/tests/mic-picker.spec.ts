@@ -243,8 +243,18 @@ test.describe("phone mic picker (W4-F)", () => {
     );
 
     // The orphan keeps take 3 from auto-selecting (it never completes) —
-    // load it the operator's way, double-clicking the audible clip.
-    await desk.locator(`[data-clip="${freshStreamId}"]`).dblclick();
+    // load it by double-clicking the audible clip. Dispatched, not
+    // .dblclick(): both take-3 clips share one lane and their drawn spans
+    // vary with reload timing, so hit-testing at the fresh clip's center
+    // sometimes finds the orphan (or the sticky lane header) on top and
+    // retries until the test times out — reproduces on pure main whenever
+    // this spec runs under parallel load. The clip handler reads only its
+    // own takeId (no event geometry), so the dispatch is semantically the
+    // landed double-click; the operator's escape hatch is the clip tail
+    // the orphan never covers.
+    const freshClip = desk.locator(`[data-clip="${freshStreamId}"]`);
+    await expect(freshClip).toBeVisible();
+    await freshClip.dispatchEvent("dblclick");
     await expect(chip).toHaveAttribute("data-take-mic", /Fake Default Audio Input/, {
       timeout: 30_000,
     });
