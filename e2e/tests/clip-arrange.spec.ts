@@ -81,8 +81,11 @@ test.describe("clip arrangement over alignment (W6-C)", () => {
     const deltas = await alignDeltas(desk);
     expect(deltas).toHaveLength(2);
 
-    // Baseline: aligned lanes render with ≈ zero residual offset.
-    const baseline = await measureLaneOffset(desk, 6);
+    // Baseline: aligned lanes render with ≈ zero residual offset. W6-B
+    // domain note: play() takes SESSION (arrangement) seconds now — the
+    // take sits at +1 s, so "from the take head" is fromSec 1 (the
+    // helper's both-lanes-content-full rule, translated).
+    const baseline = await measureLaneOffset(desk, 6, 1);
     expect(Math.abs(baseline.lagSec)).toBeLessThanOrEqual(0.05);
     expect(baseline.r).toBeGreaterThan(0.9);
 
@@ -119,10 +122,11 @@ test.describe("clip arrangement over alignment (W6-C)", () => {
     // The drag reached the schedule AND composed ON TOP of the align
     // delta: the dragged (second-sorted) lane now renders 2 s late — the
     // tap reads −2 by its sign convention. Measured from PAST the new
-    // clip delay so both lanes stay content-full (helper note), and pinned
+    // clip delay so both lanes stay content-full (helper note; session
+    // seconds — the dragged clip now starts at arrangement 3), and pinned
     // away from the two failure shapes: |2±stagger| is what a drag that
     // double-applied or clobbered the alignment would read.
-    const dragged = await measureLaneOffset(desk, 6, 2.5);
+    const dragged = await measureLaneOffset(desk, 6, 3.5);
     expect(dragged.lagSec).toBeLessThan(-1.8);
     expect(dragged.lagSec).toBeGreaterThan(-2.2);
     const stagger =
@@ -156,7 +160,7 @@ test.describe("clip arrangement over alignment (W6-C)", () => {
       .toEqual(overrides);
     const reloadedX = (await clipLefts(desk)).get(dragId) as number;
     expect(Math.abs(reloadedX - afterX)).toBeLessThan(2);
-    const reloaded = await measureLaneOffset(desk, 6, 2.5);
+    const reloaded = await measureLaneOffset(desk, 6, 3.5);
     expect(Math.abs(reloaded.lagSec - dragged.lagSec)).toBeLessThanOrEqual(0.05);
 
     // ---- QA F1: cross-take click-to-seek lands EXACTLY on the click. ----
@@ -240,9 +244,13 @@ test.describe("clip arrangement over alignment (W6-C)", () => {
         0.1,
       );
     }
-    // Exact final mapping: click = take-1 base (1 s slot; the dragged clip
-    // sits right of it) + ANCHOR + player position. Anchorless mapping
-    // would miss by the whole anchor (> 1.4 s, asserted real).
+    // Exact final mapping: the transport clock is SESSION-absolute and
+    // anchor-free (W6-B), so the audio target of a click inside the
+    // selected take's DRAWN region is click − ANCHOR — position + anchor
+    // must read the click back exactly. An anchorless mapping would miss
+    // by the whole anchor (> 1.4 s, asserted real). (Pre-W6-B this read
+    // base + anchor + take-local position; the base now lives inside the
+    // session position itself.)
     const anchorSec = await desk.evaluate(() => {
       const hook = (
         globalThis as unknown as {
@@ -253,7 +261,78 @@ test.describe("clip arrangement over alignment (W6-C)", () => {
     });
     expect(anchorSec).toBeGreaterThan(1.4);
     const finalPos = (await sample()).position;
-    expect(Math.abs(1 + anchorSec + finalPos - clickSec)).toBeLessThan(0.06);
+    expect(Math.abs(anchorSec + finalPos - clickSec)).toBeLessThan(0.06);
+
+    // ---- W6-B × W6-C invariant pin: the playhead applies the anchor ----
+    // PER TAKE. Session playback (W6-B) rolls from inside the loaded,
+    // ANCHORED take 1 across the gap into take 2 — an unloaded neighbor
+    // whose boxes draw at capture placement (W6-C's loaded-take-only
+    // scope). While the audio comes from take 1's shifted boxes the drawn
+    // playhead reads position + anchor; over the neighbor it must read
+    // the RAW session position — never lying by the loaded take's anchor
+    // (> 1.4 s here, so the two readings are unambiguous even with the
+    // ~0.1 s mirror-vs-engine sampling skew).
+    // take 1's audio spans [1, 1 + takeDuration] on the session axis;
+    // the ALIGNED end depends on which lane the +2 s drag hit (the
+    // trimmed-head lane ends ~2 s earlier than the zero-trim one, and the
+    // streamId sort that picked the drag target is random) — so the
+    // play-from point and the sample buckets both derive from the
+    // measured end, with margins the mirror-vs-engine sampling skew
+    // can't misfile across.
+    const take1EndSec =
+      1 +
+      (await desk.evaluate(() => {
+        const hook = (
+          globalThis as unknown as {
+            __antiphonDesk?: { playerSnapshot(): { takeDurationSec: number } | null };
+          }
+        ).__antiphonDesk;
+        return hook?.playerSnapshot()?.takeDurationSec ?? -1;
+      }));
+    expect(take1EndSec).toBeGreaterThan(12.5);
+    const pairs: Array<{ playhead: number; position: number }> = [];
+    await desk.evaluate((fromSec) => {
+      const hook = (
+        globalThis as unknown as { __antiphonDesk?: { player: { play(sec: number): void } } }
+      ).__antiphonDesk;
+      hook?.player.play(fromSec); // inside take 1, 3.5 s before its aligned end
+    }, take1EndSec - 3.5);
+    for (let i = 0; i < 80; i++) {
+      await desk.waitForTimeout(150);
+      const s = await desk.evaluate(() => {
+        const hook = (
+          globalThis as unknown as {
+            __antiphonDesk?: {
+              ui(): { playheadSec: number | null } | null;
+              playerSnapshot(): { positionSec: number; playing: boolean } | null;
+            };
+          }
+        ).__antiphonDesk;
+        return {
+          playhead: hook?.ui()?.playheadSec ?? null,
+          position: hook?.playerSnapshot()?.positionSec ?? -1,
+          playing: hook?.playerSnapshot()?.playing ?? false,
+        };
+      });
+      if (!s.playing) break; // end-of-session auto-pause
+      if (s.playhead !== null) pairs.push({ playhead: s.playhead, position: s.position });
+    }
+    const inTake1 = pairs.filter((p) => p.position <= take1EndSec - 1);
+    const beyondTake1 = pairs.filter((p) => p.position >= take1EndSec + 0.5);
+    expect(inTake1.length).toBeGreaterThanOrEqual(3);
+    expect(beyondTake1.length).toBeGreaterThanOrEqual(3);
+    for (const p of inTake1) {
+      expect(
+        Math.abs(p.playhead - (p.position + anchorSec)),
+        `selected-take playhead ${p.playhead} vs pos ${p.position} + anchor ${anchorSec}`,
+      ).toBeLessThan(0.35);
+    }
+    for (const p of beyondTake1) {
+      expect(
+        Math.abs(p.playhead - p.position),
+        `neighbor playhead ${p.playhead} vs raw pos ${p.position}`,
+      ).toBeLessThan(0.35);
+    }
 
     await phoneA.close();
     await phoneB.close();

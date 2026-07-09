@@ -14,10 +14,16 @@
 //      count and its beep cadence is unbent (capture → archive gapless);
 //   2. the tapped real-time output reproduces the archive's beep intervals
 //      sample-tight (scheduling adds no seams, stalls, or restarts);
-//   3. scheduleCount stays 1 for the whole run (no re-schedule storm);
+//   3. scheduleCount stays 1 for the whole run (no re-schedule storm).
+//      W6-B: the invariant's honest form is now 1 + one handoff schedule
+//      per take boundary crossed — this session has ONE take, so it stays
+//      exactly 1 here; session-playback.spec.ts pins the boundary case;
 //   4. the exported master WAV carries the same onsets at the same
 //      positions (offline render parity — the TODO's "rendered output of
-//      a known signal is gapless" checkbox).
+//      a known signal is gapless" checkbox). W6-B: "Master mix" renders
+//      the SESSION now, but the session render's timeline starts at the
+//      first clip's start — with a single take that is byte-identical to
+//      the old per-take master, so the sample-exact assertions stand.
 
 import { readFile } from "node:fs/promises";
 import { expect, type Page, test } from "@playwright/test";
@@ -221,7 +227,10 @@ test.describe("playback gapless (W4-A)", () => {
 
         player.play(0);
         const t0 = performance.now();
-        // Wait for the end-of-take auto-pause (with a safety cap).
+        // Wait for the end-of-SESSION auto-pause (with a safety cap).
+        // W6-B: play(0) is session zero — the take sits at +1 s on the
+        // arrangement, so the tap opens with that second of silence
+        // (onset-free; the interval assertions below are unaffected).
         await new Promise<void>((resolve) => {
           const poll = () => {
             const snap = player.snapshot();

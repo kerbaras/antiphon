@@ -10,6 +10,11 @@
 //     through the retarget load (paused, no auto-resume — QA W4-C major),
 //     and an explicit foreign seek (⏮) always clears a parked pin, even
 //     when the player's position value doesn't move (QA W4-C minor).
+//     W6-B: the player's clock IS the arrangement timeline now — position
+//     assertions are session-absolute (take base included), any in-session
+//     click (gaps included) is directly expressible by the engine, and ⏮
+//     returns to SESSION zero. The pin-over-clamp scenario (QA W4-C minor)
+//     now needs a park BEYOND the session end to arise at all.
 // 2 · Marquee from empty vertical space: the interactive layer spans the
 //     full scrollable container, so a selection drag can start below the
 //     last lane and still select every clip its rectangle crosses.
@@ -174,7 +179,8 @@ test.describe("timeline interactions (W4-C)", () => {
 
     // --- 1b · click inside take 1's span (in the empty space BELOW the lane:
     // the surface is one time axis) retargets the player — no dblclick dance —
-    // and plays from the clicked take-time once loaded --------------------------
+    // and parks at the clicked SESSION time once loaded (W6-B: the engine
+    // clock is the arrangement axis, so position == clicked x) ------------------
     await desk.mouse.click(laneX(TAKE_BASE_SEC + 1.5), belowLanesY);
     await expect
       .poll(async () => {
@@ -183,7 +189,9 @@ test.describe("timeline interactions (W4-C)", () => {
       })
       .toBe(true); // playhead parks immediately, before the load settles
     await expect.poll(async () => await loadedTakeId(desk), { timeout: 30_000 }).toBe(take1);
-    await expect.poll(async () => Math.abs((await playerPosition(desk)) - 1.5)).toBeLessThan(0.1);
+    await expect
+      .poll(async () => Math.abs((await playerPosition(desk)) - (TAKE_BASE_SEC + 1.5)))
+      .toBeLessThan(0.1);
 
     // --- 1c · click in the bare gap between the takes: the playhead parks at
     // the clicked spot, the loaded take does NOT change -------------------------
@@ -202,17 +210,21 @@ test.describe("timeline interactions (W4-C)", () => {
     const take2BaseSec = (box2.x - rulerBox.x) / PX_PER_SEC;
     await ruler.click({ position: { x: (take2BaseSec + 1) * PX_PER_SEC, y: 22 } });
     await expect.poll(async () => await loadedTakeId(desk), { timeout: 30_000 }).toBe(take2);
-    await expect.poll(async () => Math.abs((await playerPosition(desk)) - 1)).toBeLessThan(0.1);
+    await expect
+      .poll(async () => Math.abs((await playerPosition(desk)) - (take2BaseSec + 1)))
+      .toBeLessThan(0.1);
 
     // --- 1e · a click DURING PLAYBACK into another take's span keeps the
     // clicked point through the retarget (QA W4-C major): the pin must not
     // yield to the OLD take's motion — the new take comes up PAUSED at the
     // clicked spot (double-click load parity, no auto-resume) ------------------
-    await desk.keyboard.press("Space"); // play take 2 from ~1 s
+    await desk.keyboard.press("Space"); // play take 2 from within its span
     await expect.poll(async () => await playerPlaying(desk)).toBe(true);
     await desk.mouse.click(laneX(TAKE_BASE_SEC + 1.5), belowLanesY);
     await expect.poll(async () => await loadedTakeId(desk), { timeout: 30_000 }).toBe(take1);
-    await expect.poll(async () => Math.abs((await playerPosition(desk)) - 1.5)).toBeLessThan(0.1);
+    await expect
+      .poll(async () => Math.abs((await playerPosition(desk)) - (TAKE_BASE_SEC + 1.5)))
+      .toBeLessThan(0.1);
     expect(await playerPlaying(desk)).toBe(false);
     await expect
       .poll(async () => {
@@ -221,22 +233,27 @@ test.describe("timeline interactions (W4-C)", () => {
       })
       .toBe(true); // the playhead sits at the CLICKED point, not the take start
 
-    // --- 1f · ⏮ clears a BEFORE-start pin even though the player's position
-    // value doesn't move (pin clamped to 0, ⏮ seeks to 0 — QA W4-C minor) ------
-    await desk.mouse.click(laneX(0.4), rowY); // bare lane left of take 1's clip
+    // --- 1f · ⏮ clears a BEYOND-END pin even though the player's position
+    // value doesn't have to move to the pin (QA W4-C minor, W6-B shape: the
+    // engine expresses every in-session position now, so the only park it
+    // CANNOT express is one past the session end — the pin holds the clicked
+    // spot there, and ⏮'s foreign seek must still tear it down) ---------------
+    const beyondEndX = box2.x + box2.width + 3 * PX_PER_SEC; // ~3 s past the last clip
+    const beyondEndSec = (beyondEndX - rulerBox.x) / PX_PER_SEC;
+    await desk.mouse.click(beyondEndX, rowY);
     await expect
       .poll(async () => {
         const at = await uiPlayhead(desk);
-        return at === null ? "none" : Math.abs(at - 0.4) < 0.1;
+        return at === null ? "none" : Math.abs(at - beyondEndSec) < 0.1;
       })
-      .toBe(true);
+      .toBe(true); // pin holds the honest clicked spot (audio parked at session end)
     await desk.getByRole("button", { name: "Return to start" }).click();
     await expect
       .poll(async () => {
         const at = await uiPlayhead(desk);
-        return at === null ? "none" : Math.abs(at - TAKE_BASE_SEC) < 0.1;
+        return at === null ? "none" : Math.abs(at) < 0.1;
       })
-      .toBe(true); // pin yielded: playhead = take 1's base + position 0
+      .toBe(true); // pin yielded: ⏮ = SESSION zero (W6-B), engine expresses it
 
     // --- 2 · marquee STARTED below the last lane still selects the clips its
     // rectangle crosses (the interactive layer spans the whole container) ------

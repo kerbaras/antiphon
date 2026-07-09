@@ -11,7 +11,7 @@
 // renders from the sibling modules (top-bar, toolbar, timeline, right-rail
 // panels, mixer-dock).
 
-import { useEffect, useMemo, useReducer, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useParams } from "react-router";
 import type { DeskStreamStatus } from "../../audio/sink-worker-protocol";
 import { recordRecentSession } from "../home/recent-sessions";
@@ -62,6 +62,7 @@ import {
   exportMasterWav,
   exportMidiFile,
   exportProjectPackage,
+  exportSessionMasterWav,
   exportSongsZip,
   exportStemsZip,
   getCachedWaveform,
@@ -440,10 +441,50 @@ function Desk({ sessionId }: { sessionId: string }) {
     return map;
   }, [playerSnap.tracks]);
 
+  // Clip arrangement lives in the shared doc (W3-A): local drags write
+  // through, remote desks' drags land here live. Same updater shape as the
+  // useState it replaced. Declared up here (not with the other timeline
+  // editing state) because the take-local↔session conversions below need
+  // the selected take's base during render (W6-B).
+  const [clipStartOverrides, setClipStartOverrides] = useCollabArrange(collab);
+
+  /** The selected take's ARRANGEMENT base: leftmost of its clips in the
+   * audio-domain (un-shifted) positions — the zero the take-local domains
+   * (markers, comments, MIDI, render ranges) are measured from, and the
+   * session position of the take's aligned audio head. */
+  const selectedBaseSec = useMemo(() => {
+    if (!selectedTakeId) return 0;
+    const starts = state.deskStatus
+      .filter((s) => s.takeId === selectedTakeId)
+      .map((s) => clipStartOverrides[s.streamId] ?? takes.get(selectedTakeId)?.offsetSec ?? 0);
+    return starts.length > 0 ? Math.min(...starts) : 0;
+  }, [selectedTakeId, state.deskStatus, clipStartOverrides, takes]);
+  // ---- THE W6-B × W6-C composition invariant --------------------------------
+  // The SESSION clock (player position/seek/duration) is ANCHOR-FREE:
+  // every take's aligned audio starts at its clips' arrangement positions
+  // — schedule-identical whether the take is selected or a mounted
+  // neighbor. The anchor is a DRAWING transform, scoped exactly where the
+  // drawn geometry shifts: the SELECTED take's boxes (W6-C draws only the
+  // loaded take aligned today). So:
+  //   · audio at session t INSIDE the selected take draws at t + anchor;
+  //   · everywhere else (gaps, other takes) drawn x == session t;
+  //   · the playhead and the drawn↔audio click mapping apply the anchor
+  //     per-take (see playheadSec and the pin reconciliation below) — a
+  //     session playhead crossing an UNSHIFTED neighbor take must never
+  //     lie by the loaded take's anchor.
+  /** Where the selected take's room-time ZERO draws on the arrangement
+   * (W6-C): base + anchor. Room-timeline DRAWING (marker flags, comment
+   * ticks, MIDI lane, active-song strip) maps through this; audio-domain
+   * seeks use selectedBaseSec. */
+  const timelineBaseSec = selectedBaseSec + alignView.anchorSec;
+
   // ---- song markers (W2-B) -------------------------------------------------
-  // Marker positions live in the TAKE's room-timeline domain — exactly
-  // player.position()/seek() — so seeks and per-song render ranges need no
-  // conversion; only drawing adds the arrangement offset (timelineBaseSec).
+  // Marker positions stay in the TAKE's room-timeline domain (0 = take
+  // head): they are properties of one recording, and the per-song render
+  // ranges consume them unchanged. The transport clock is session-absolute
+  // (W6-B) and anchor-free, so seeks ADD selectedBaseSec and playhead
+  // reads SUBTRACT it; only drawing adds the anchored timelineBaseSec
+  // (W6-C).
   const takeMarkers = useTakeMarkers(sessionId, selectedTakeId);
   // Display-level positional renumbering for auto-named songs (QA low:
   // delete "Song 1" and the panel used to read "01 Song 2"). The stored
@@ -455,18 +496,33 @@ function Desk({ sessionId }: { sessionId: string }) {
   );
   const songs = useMemo(() => songsOf(displayMarkers), [displayMarkers]);
   const markersUsable = playerLoaded && !recording;
+  // Take-local position of the playhead (markers/comments/songs domain):
+  // the transport clock is session-absolute now (W6-B), the take-scoped
+  // surfaces subtract the selected take's base. Clamped into the take —
+  // the session playhead can honestly sit outside it (a gap, another
+  // take), and a marker dropped then belongs to the nearest take edge.
+  const takeLocalPlayhead = useCallback(
+    () =>
+      Math.max(0, Math.min(getPlayer().position() - selectedBaseSec, getPlayer().takeDuration())),
+    [selectedBaseSec],
+  );
   // The song under the playhead (panel highlight); the ruler's accent
-  // strip additionally requires the transport to be rolling.
-  const currentSongId = markersUsable
-    ? (songs.findLast((s) => playerSnap.positionSec >= s.startSec)?.id ?? null)
-    : null;
+  // strip additionally requires the transport to be rolling. QA M-2: a
+  // session position OUTSIDE the selected take (the transport rolls
+  // through neighbors and gaps now, W6-B) is under NO song of this take —
+  // without the upper bound the last song stayed "current" forever.
+  const takeLocalPositionSec = playerSnap.positionSec - selectedBaseSec;
+  const currentSongId =
+    markersUsable && takeLocalPositionSec <= playerSnap.takeDurationSec
+      ? (songs.findLast((s) => takeLocalPositionSec >= s.startSec)?.id ?? null)
+      : null;
   const activeSong = playerSnap.playing
     ? (songs.find((s) => s.id === currentSongId) ?? null)
     : null;
 
   function addMarkerAtPlayhead() {
     if (!markersUsable) return;
-    takeMarkers.addAt(getPlayer().position());
+    takeMarkers.addAt(takeLocalPlayhead());
   }
 
   // ---- comments (W2-F) -------------------------------------------------------
@@ -599,10 +655,6 @@ function Desk({ sessionId }: { sessionId: string }) {
     takeId: string;
     streamId: string;
   }> | null>(null);
-  // Clip arrangement lives in the shared doc (W3-A): local drags write
-  // through, remote desks' drags land here live. Same updater shape as the
-  // useState it replaced.
-  const [clipStartOverrides, setClipStartOverrides] = useCollabArrange(collab);
   const [marquee, setMarquee] = useState<Marquee | null>(null);
   // W4-C click-to-seek: the operator's parked playhead, in ARRANGEMENT
   // seconds. Any bare-surface/ruler click parks it — even with nothing
@@ -693,24 +745,6 @@ function Desk({ sessionId }: { sessionId: string }) {
     }),
   );
 
-  /** The selected take's ARRANGEMENT base: leftmost of its clips in the
-   * audio-domain (un-shifted) positions — the zero the clip delays are
-   * measured from. */
-  const selectedBaseSec = useMemo(() => {
-    if (!selectedTakeId) return 0;
-    const starts = state.deskStatus
-      .filter((s) => s.takeId === selectedTakeId)
-      .map((s) => clipStartOverrides[s.streamId] ?? takes.get(selectedTakeId)?.offsetSec ?? 0);
-    return starts.length > 0 ? Math.min(...starts) : 0;
-    // eslint-style deps handled below in the delays effect
-  }, [selectedTakeId, state.deskStatus, clipStartOverrides, takes]);
-  /** Where room-time ZERO draws on the arrangement (W6-C): the base plus
-   * the alignment anchor. Every room-timeline drawing — playhead, marker
-   * flags, comment ticks, MIDI lane, the parked-pin seek math — maps
-   * through THIS value, so it stays consistent with the shifted clip
-   * boxes above; only the clip-delay feed keeps the raw base. */
-  const timelineBaseSec = selectedBaseSec + alignView.anchorSec;
-
   // ---- captured MIDI (W3-C) --------------------------------------------------
   // The selected take's events, in the same room-timeline domain as markers
   // (drawing adds timelineBaseSec). `revision` bumps when a capture lands.
@@ -728,27 +762,40 @@ function Desk({ sessionId }: { sessionId: string }) {
     return {
       notes: noteSpansOf(takeMidi.events),
       eventCount: takeMidi.events.length,
+      // Drawing base: the ANCHORED one (W6-C) — MIDI events live in the
+      // same take-local room domain as markers; the take-scoped span
+      // stays takeDurationSec (W6-B).
       baseSec: timelineBaseSec,
-      durationSec: Math.max(playerSnap.durationSec, lastSec),
+      durationSec: Math.max(playerSnap.takeDurationSec, lastSec),
       // Next palette slot after the audio lanes — the lane reads as a
       // sibling track, not a duplicate of one.
       color: TRACK_COLORS[rows.length % TRACK_COLORS.length] as string,
       overflow: takeMidi.overflow,
     };
-  }, [takeMidi, timelineBaseSec, playerSnap.durationSec, rows.length]);
+  }, [takeMidi, timelineBaseSec, playerSnap.takeDurationSec, rows.length]);
 
-  // Feed arrangement offsets into the playback engine.
+  // Feed the SESSION PLAN into the engine (W6-B): every non-live take's
+  // complete streams with their absolute arrangement starts and declared
+  // lengths. This is the transport's whole-session map — duration, the
+  // look-ahead decode window, and the session master render all read it.
+  // The engine diffs internally, so the per-second status polls that
+  // rebuild these arrays cost nothing when nothing changed.
   useEffect(() => {
-    if (!selectedTakeId || !playerLoaded) return;
-    const delays: Record<string, number> = {};
-    for (const s of state.deskStatus) {
-      if (s.takeId !== selectedTakeId) continue;
-      delays[s.streamId] =
-        (clipStartOverrides[s.streamId] ?? takes.get(selectedTakeId)?.offsetSec ?? 0) -
-        selectedBaseSec;
-    }
-    getPlayer().setClipDelays(delays);
-  }, [selectedTakeId, playerLoaded, clipStartOverrides, state.deskStatus, takes, selectedBaseSec]);
+    const plan = [...takes.keys()]
+      .filter((takeId) => takeId !== state.activeTakeId)
+      .map((takeId) => ({
+        takeId,
+        streams: state.deskStatus
+          .filter((s) => s.takeId === takeId && s.complete)
+          .map((s) => ({
+            streamId: s.streamId,
+            channelKey: peerByStream.get(s.streamId) ?? s.streamId,
+            clipStartSec: clipStartOverrides[s.streamId] ?? takes.get(takeId)?.offsetSec ?? 0,
+            declaredDurationSec: s.totalSamples / SAMPLE_RATE,
+          })),
+      }));
+    getPlayer().setSessionPlan(plan);
+  }, [state.activeTakeId, clipStartOverrides, state.deskStatus, takes, peerByStream]);
 
   /** Clip drag: pressing an unselected clip selects it; dragging moves every
    * selected clip together. A press without movement is just selection —
@@ -926,7 +973,7 @@ function Desk({ sessionId }: { sessionId: string }) {
           getPlayer().toggleChannelMute(laneKey);
           return;
         }
-        if (playerLoaded && !recording) takeMarkers.addAt(getPlayer().position());
+        if (playerLoaded && !recording) takeMarkers.addAt(takeLocalPlayhead());
         return;
       }
       // C: open the comments composer focused at the playhead (W2-F).
@@ -962,6 +1009,7 @@ function Desk({ sessionId }: { sessionId: string }) {
     state.deskStatus,
     state.activeTakeId,
     takeMarkers.addAt,
+    takeLocalPlayhead,
   ]);
 
   /** Confirmed deletion (F2): the existing server-authoritative protocol
@@ -1024,33 +1072,52 @@ function Desk({ sessionId }: { sessionId: string }) {
     setParkedSeekSec(Math.max(0, sec));
   }
 
-  // Parked-seek reconciliation: once the selected take is loaded, map the
-  // parked arrangement position into its room timeline. player.seek clamps
-  // into [0, duration]: a park on empty space parks the AUDIO at the
-  // nearest end of the take while the visual playhead honestly keeps the
-  // clicked spot — and Play from a beyond-the-end park then follows the
-  // transport's one end rule (F12) and restarts from the top. An in-span
-  // park is exactly expressed by the player, so the pin hands over to the
-  // player's own position.
+  // Parked-seek reconciliation — the composed W6-B × W6-C mapping (the
+  // invariant lives above timelineBaseSec). The player's clock is the
+  // arrangement timeline (W6-B), anchor-free; the click landed on DRAWN
+  // geometry, which shifts by the anchor only inside the selected take.
+  // Mapping a park X to its audio target:
+  //   · X inside the selected take's DRAWN audio region
+  //     [base+anchor, base+anchor+takeDur] → X − anchor: exactly
+  //     expressible, the pin hands over;
+  //   · X inside the trimmed-head strip [base, base+anchor): the drawn
+  //     content there never plays (it is what alignment trims) — audio
+  //     parks at room zero (base) while the pin honestly keeps the
+  //     clicked spot;
+  //   · anywhere else (gaps, other takes — drawn at capture placement,
+  //     W6-C's loaded-take-only scope) → X verbatim: playable silence or
+  //     a neighbor take, expressible while inside the session; a park
+  //     beyond the session end keeps the pin and Play from there follows
+  //     the one end rule (F12, session-scoped).
   //
   // W6-C QA F1: the align verdict lands AFTER the load (align() runs
   // post-load; a persisted verdict restores moments later), and an applied
-  // verdict moves timelineBaseSec right by the anchor. The seek re-runs on
-  // every base change, but the pin only CLEARS once the verdict settled —
-  // a cross-take click used to reconcile against the anchorless base and
-  // hand over, then the anchor landed and the playhead visibly jumped
-  // right by it. Settled = a non-null outcome with no run in flight
+  // verdict moves the drawn mapping right by the anchor. The seek re-runs
+  // on every anchor/base change, but the pin only CLEARS once the verdict
+  // settled — a cross-take click used to reconcile against the anchorless
+  // mapping and hand over, then the anchor landed and the playhead visibly
+  // jumped right by it. Settled = a non-null outcome with no run in flight
   // (aligned/declined/failed all settle; align() measures every loaded
-  // track, so a completed run can never leave the outcome null).
+  // track, so a completed run can never leave the outcome null — and a
+  // look-ahead-mounted take PROMOTES with its persisted verdict already on
+  // its tracks, then runs the same queue restore/align follow-ups, so a
+  // promoted selection settles like a decoded one: no permanently-parked
+  // pin).
   const alignSettled = !playerSnap.aligning && playerSnap.alignmentOutcome !== null;
   useEffect(() => {
     if (parkedSeekSec === null || !playerLoaded) return;
-    getPlayer().seek(parkedSeekSec - timelineBaseSec);
+    const anchor = alignView.anchorSec;
+    const drawnHeadSec = selectedBaseSec + anchor; // room zero, as drawn
+    const drawnEndSec = drawnHeadSec + getPlayer().takeDuration();
+    const inDrawnTake = parkedSeekSec >= drawnHeadSec && parkedSeekSec <= drawnEndSec;
+    const inTrimStrip = parkedSeekSec >= selectedBaseSec && parkedSeekSec < drawnHeadSec;
+    getPlayer().seek(
+      inDrawnTake ? parkedSeekSec - anchor : inTrimStrip ? selectedBaseSec : parkedSeekSec,
+    );
     parkedAppliedSeek.current = getPlayer().snapshot().seekCount;
-    const inSpan =
-      parkedSeekSec >= timelineBaseSec && parkedSeekSec <= timelineBaseSec + getPlayer().duration();
-    if (alignSettled && inSpan) setParkedSeekSec(null);
-  }, [parkedSeekSec, playerLoaded, timelineBaseSec, alignSettled]);
+    const expressible = inDrawnTake || (!inTrimStrip && parkedSeekSec <= getPlayer().duration());
+    if (alignSettled && expressible) setParkedSeekSec(null);
+  }, [parkedSeekSec, playerLoaded, selectedBaseSec, alignView.anchorSec, alignSettled]);
   // A parked pin is a promise about the NEXT play, not the current one: it
   // yields when the transport rolls, a take starts recording, or any
   // FOREIGN seek (marker flag, comment tick, songs panel, ⏮ — counted by
@@ -1078,7 +1145,14 @@ function Desk({ sessionId }: { sessionId: string }) {
 
   // Playhead position on the shared timeline: the live take's write head
   // while recording; else the parked click (W4-C — it exists even with
-  // nothing loaded); else the player position.
+  // nothing loaded); else the player position — arrangement time (W6-B),
+  // plus the anchor exactly while the audio comes from the SELECTED
+  // take's shifted boxes (the composition invariant above): the playhead
+  // rides the drawn waveforms it is playing, and never lies by the loaded
+  // take's anchor over an unshifted neighbor take or a gap.
+  const positionInSelectedTake =
+    playerSnap.positionSec >= selectedBaseSec &&
+    playerSnap.positionSec <= selectedBaseSec + playerSnap.takeDurationSec;
   const playheadSec = recording
     ? state.activeTakeId && takes.has(state.activeTakeId)
       ? (takes.get(state.activeTakeId) as TakeSlot).offsetSec + elapsed
@@ -1086,7 +1160,7 @@ function Desk({ sessionId }: { sessionId: string }) {
     : parkedSeekSec !== null
       ? parkedSeekSec
       : playerLoaded && selectedTakeId
-        ? timelineBaseSec + playerSnap.positionSec
+        ? playerSnap.positionSec + (positionInSelectedTake ? alignView.anchorSec : 0)
         : null;
 
   // ---- presence (W3-A) -------------------------------------------------------
@@ -1147,6 +1221,7 @@ function Desk({ sessionId }: { sessionId: string }) {
       waveformsCached: waveformCacheSize(),
       markers: displayMarkers,
       comments: takeComments.comments,
+      currentSongId,
       lanes: rows.map((row) => ({ key: row.key, name: row.name })),
     });
   });
@@ -1161,8 +1236,10 @@ function Desk({ sessionId }: { sessionId: string }) {
       const live = activeStream ? state.liveLevels[activeStream.streamId] : undefined;
       return live && Date.now() - live.at < 1_200 ? live.peak : 0;
     }
-    if (playerLoaded && playerSnap.playing) {
-      return playerSnap.tracks.find((t) => t.channelKey === row.key)?.level ?? 0;
+    if (playerSnap.playing) {
+      // Per-lane peak across ALL mounted takes (W6-B): during a boundary
+      // handoff the audible track may not belong to the selected take.
+      return playerSnap.channelLevels[row.key] ?? 0;
     }
     return 0;
   }
@@ -1213,6 +1290,13 @@ function Desk({ sessionId }: { sessionId: string }) {
       setExportBusy(null);
     }
   }
+
+  // THE master (W6-B, the operator's ask): the whole session at its room
+  // offsets. The per-take mix stays available as its own row below.
+  const exportSessionMaster = () =>
+    runExport("master", () =>
+      exportSessionMasterWav(`session-${sessionId.slice(0, 8)}-master.wav`),
+    );
 
   const exportMaster = () => runExport("master", () => exportMasterWav(`${takeTag}-master.wav`));
 
@@ -1286,11 +1370,12 @@ function Desk({ sessionId }: { sessionId: string }) {
     canRender: canRenderTake,
     canFlac: convergedCount > 0,
     songs,
-    takeDurationSec: playerSnap.durationSec,
+    takeDurationSec: playerSnap.takeDurationSec,
     midiEventCount: takeMidi.events.length,
     stemFormat,
     onStemFormat: setStemFormat,
-    onMaster: () => void exportMaster(),
+    onMaster: () => void exportSessionMaster(),
+    onTakeMaster: () => void exportMaster(),
     onStems: () => void exportStems(),
     onSong: (song) => void exportSong(song),
     onSongStems: (song) => void exportSongStems(song),
@@ -1360,8 +1445,9 @@ function Desk({ sessionId }: { sessionId: string }) {
           recording={recording}
           markersUsable={markersUsable}
           activeSong={activeSong}
-          durationSec={playerSnap.durationSec}
+          durationSec={playerSnap.takeDurationSec}
           timelineBaseSec={timelineBaseSec}
+          takeBaseSec={selectedBaseSec}
           markers={displayMarkers}
           comments={takeComments.comments}
           midiLane={midiLane}
@@ -1401,13 +1487,15 @@ function Desk({ sessionId }: { sessionId: string }) {
           ) : tab === "songs" ? (
             <SongsPanel
               songs={songs}
-              takeDurationSec={playerSnap.durationSec}
+              takeDurationSec={playerSnap.takeDurationSec}
               currentSongId={currentSongId}
               usable={markersUsable}
               canRender={canRenderTake && exportBusy === null}
               fileNameOf={(song) => `${songTag(song)}.wav`}
               onAdd={addMarkerAtPlayhead}
-              onSeek={(song) => getPlayer().seek(song.startSec)}
+              // Song starts are take-local; the transport clock is session
+              // time (W6-B) — seeks add the take's base.
+              onSeek={(song) => getPlayer().seek(selectedBaseSec + song.startSec)}
               onRename={takeMarkers.rename}
               onRemove={takeMarkers.remove}
               onRender={(song) => void exportSong(song)}
@@ -1417,12 +1505,22 @@ function Desk({ sessionId }: { sessionId: string }) {
               comments={takeComments.comments}
               usable={markersUsable}
               lanes={commentLanes}
-              playheadSec={playerLoaded ? playerSnap.positionSec : 0}
+              // Comments live take-local (W2-F): hand the panel the
+              // playhead in ITS domain, add the base back on seeks (W6-B).
+              // Clamped into the take exactly like markers (QA M-1): a
+              // session playhead rolling in a neighbor take must not mint
+              // a comment beyond this take's span into the shared doc —
+              // it lands at the nearest take edge instead.
+              playheadSec={
+                playerLoaded
+                  ? Math.max(0, Math.min(takeLocalPositionSec, playerSnap.takeDurationSec))
+                  : 0
+              }
               author={commentAuthor}
               focusToken={composerFocus}
               onAuthorChange={changeCommentAuthor}
               onAdd={(input) => takeComments.add({ ...input, author: commentAuthor })}
-              onSeek={(atSec) => getPlayer().seek(atSec)}
+              onSeek={(atSec) => getPlayer().seek(selectedBaseSec + atSec)}
               onEditText={takeComments.editText}
               onResolve={takeComments.resolve}
               onUnresolve={takeComments.unresolve}

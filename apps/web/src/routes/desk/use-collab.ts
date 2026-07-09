@@ -16,7 +16,7 @@ import {
   writeLaneOrder,
   writeMixIfChanged,
 } from "../../net/collab-doc";
-import type { ChannelStrip, TakePlayer } from "./player";
+import type { ChannelStrip, SessionPlayer } from "./player";
 
 /** Two-way mixer sync. The player stays the AUDIO authority (all gains/EQ
  * still flow through its graph); the doc is the STATE source. Local knob
@@ -26,7 +26,7 @@ import type { ChannelStrip, TakePlayer } from "./player";
  * doc→player application sets `applying` so the resulting player notify
  * can't echo — plus writeMixIfChanged never writes an equal state, so the
  * cycle terminates by construction. */
-export function bindMixToCollab(collab: CollabClient, player: TakePlayer): () => void {
+export function bindMixToCollab(collab: CollabClient, player: SessionPlayer): () => void {
   let applying = false;
   const mixMap = collab.doc.getMap<MixStripState>("mix");
 

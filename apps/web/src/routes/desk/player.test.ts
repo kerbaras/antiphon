@@ -1,4 +1,4 @@
-// TakePlayer transport regressions (QA F12 / sweep QA-2 B1+B2) and the
+// SessionPlayer transport regressions (QA F12 / sweep QA-2 B1+B2) and the
 // F7 alignment surfaces (outcome derivation, verdict restore parity).
 //
 // The engine under test is pure transport bookkeeping (startPos /
@@ -11,7 +11,7 @@
 
 import { align_content, find_chirp_offset, init as initWasm } from "@antiphon/core-wasm";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { type PlayerSnapshot, type StoredTrackAlignment, TakePlayer } from "./player";
+import { type PlayerSnapshot, SessionPlayer, type StoredTrackAlignment } from "./player";
 
 vi.mock("@antiphon/core-wasm", () => ({
   init: vi.fn(() => Promise.resolve()),
@@ -165,14 +165,14 @@ afterEach(() => {
 // ---- helpers --------------------------------------------------------------------
 
 interface Loaded {
-  player: TakePlayer;
+  player: SessionPlayer;
   ctx: FakeAudioContext;
   snaps: PlayerSnapshot[];
 }
 
 async function loadedPlayer(durationSec = 1, streamIds: string[] = ["s1"]): Promise<Loaded> {
   FakeAudioContext.nextBuffer = fakeBuffer(durationSec);
-  const player = new TakePlayer();
+  const player = new SessionPlayer();
   const snaps: PlayerSnapshot[] = [];
   player.subscribe((s) => snaps.push(s));
   const ok = await player.load("take-1", streamIds, () => Promise.resolve(new ArrayBuffer(4)));
@@ -476,6 +476,225 @@ describe("content-alignment fallback (W4-B)", () => {
       confidence: 0.3,
       threshold: 2.5,
     });
+  });
+});
+
+// ---- W6-B: session transport — plan, boundary handoff, mount window ---------------
+
+/** Two-take session plan: take-1 at [1, 2), take-2 at [4, 5). */
+function twoTakePlan() {
+  return [
+    {
+      takeId: "take-1",
+      streams: [{ streamId: "s1", channelKey: "lane-a", clipStartSec: 1, declaredDurationSec: 1 }],
+    },
+    {
+      takeId: "take-2",
+      streams: [{ streamId: "s2", channelKey: "lane-a", clipStartSec: 4, declaredDurationSec: 1 }],
+    },
+  ];
+}
+
+describe("session transport (W6-B)", () => {
+  it("duration is the SESSION end; the loaded take keeps its own span", async () => {
+    FakeAudioContext.nextBuffer = fakeBuffer(1);
+    const player = new SessionPlayer();
+    player.setSessionPlan(twoTakePlan());
+    const ok = await player.load("take-1", ["s1"], () => Promise.resolve(new ArrayBuffer(4)));
+    expect(ok).toBe(true);
+    // Transport spans the whole session (last take's declared end)…
+    expect(player.duration()).toBeCloseTo(5, 6);
+    // …while the take-scoped surfaces keep the loaded take's span.
+    expect(player.snapshot().takeDurationSec).toBeCloseTo(1, 6);
+    // Loading parks the transport at the take's arrangement base — the
+    // spot the old take-local domain called position 0.
+    expect(player.position()).toBeCloseTo(1, 6);
+    // renderModel stays take-local: the clip delay rebases onto the head.
+    const model = player.renderModel();
+    expect(model?.durationSec).toBeCloseTo(1, 6);
+    expect(model?.tracks[0]?.timing.clipDelaySec).toBeCloseTo(0, 9);
+  });
+
+  it("plays THROUGH a take boundary: look-ahead mounts the next take, one handoff schedule, no end-stop until the session end", async () => {
+    FakeAudioContext.nextBuffer = fakeBuffer(1);
+    const player = new SessionPlayer();
+    player.setSessionPlan(twoTakePlan());
+    await player.load("take-1", ["s1"], () => Promise.resolve(new ArrayBuffer(4)));
+    const assembled: string[] = [];
+    player.setSessionSources({
+      assemble: (takeId, streamId) => {
+        assembled.push(`${takeId}:${streamId}`);
+        return Promise.resolve(new ArrayBuffer(4));
+      },
+      storedAlignment: () => null,
+    });
+    const ctx = FakeAudioContext.instances.at(-1) as FakeAudioContext;
+
+    player.play(1);
+    expect(player.snapshot().scheduleCount).toBe(1);
+    // play() kicked the look-ahead: take-2 decodes and mounts in the
+    // background, then hands off onto the running clock — exactly ONE
+    // extra schedule pass (the honest evolution of the W4-A invariant).
+    await vi.waitFor(() => {
+      expect(player.snapshot().mountedTakeIds.sort()).toEqual(["take-1", "take-2"]);
+    });
+    expect(assembled).toEqual(["take-2:s2"]);
+    expect(player.snapshot().scheduleCount).toBe(2);
+
+    // Past take-1's end (2 s) the transport keeps rolling — the gap is
+    // playable silence, not an end-stop.
+    ctx.currentTime = 1.5 + 0.06; // position ≈ 2.5, inside the gap
+    tickFrame();
+    expect(player.snapshot().playing).toBe(true);
+    expect(player.position()).toBeCloseTo(2.5, 2);
+
+    // The end-stop fires at the SESSION end (5 s), parking there.
+    ctx.currentTime = 4.2 + 0.06;
+    tickFrame();
+    ctx.currentTime = 5.3 + 0.06;
+    tickFrame();
+    expect(player.snapshot().playing).toBe(false);
+    expect(player.position()).toBeCloseTo(5, 6);
+  });
+
+  it("a resume with the window already mounted schedules everything in ONE pass", async () => {
+    FakeAudioContext.nextBuffer = fakeBuffer(1);
+    const player = new SessionPlayer();
+    player.setSessionPlan(twoTakePlan());
+    await player.load("take-1", ["s1"], () => Promise.resolve(new ArrayBuffer(4)));
+    player.setSessionSources({
+      assemble: () => Promise.resolve(new ArrayBuffer(4)),
+      storedAlignment: () => null,
+    });
+    player.play(1);
+    await vi.waitFor(() => {
+      expect(player.snapshot().mountedTakeIds).toHaveLength(2);
+    });
+    player.pause();
+    player.play(3.5);
+    // Both takes' sources plan in the single schedule() pass (future
+    // starts via planSource whenSec) — no per-take churn on resume.
+    expect(player.snapshot().scheduleCount).toBe(1);
+  });
+
+  it("promotes an already-mounted take on load — no re-decode, parked at its base", async () => {
+    FakeAudioContext.nextBuffer = fakeBuffer(1);
+    const player = new SessionPlayer();
+    player.setSessionPlan(twoTakePlan());
+    await player.load("take-1", ["s1"], () => Promise.resolve(new ArrayBuffer(4)));
+    player.setSessionSources({
+      assemble: () => Promise.resolve(new ArrayBuffer(4)),
+      storedAlignment: () => ({
+        s2: { alignment: { lagSamples: 0, confidence: 5, applied: true }, drift: null },
+      }),
+    });
+    player.play(1);
+    await vi.waitFor(() => {
+      expect(player.snapshot().mountedTakeIds).toHaveLength(2);
+    });
+    player.pause();
+    // Explicit selection of the look-ahead-mounted take: the load path
+    // promotes WITHOUT calling assemble again…
+    const assemble = vi.fn(() => Promise.resolve(new ArrayBuffer(4)));
+    const ok = await player.load("take-2", ["s2"], assemble);
+    expect(ok).toBe(true);
+    expect(assemble).not.toHaveBeenCalled();
+    expect(player.snapshot().loadedTakeId).toBe("take-2");
+    // …parks at take-2's base, releases take-1's mount, and carries the
+    // persisted verdict the mount applied (F7b through the window path).
+    expect(player.position()).toBeCloseTo(4, 6);
+    expect(player.snapshot().mountedTakeIds).toEqual(["take-2"]);
+    expect(player.snapshot().tracks[0]?.alignment?.applied).toBe(true);
+    // W6-C seam: the desk's parked pin clears only when the verdict has
+    // SETTLED (!aligning && outcome !== null). A promoted take must
+    // satisfy that gate immediately — its tracks carry the verdict the
+    // mount applied, so the outcome derives non-null with no run in
+    // flight (a promote that read "never ran" would park the pin forever).
+    expect(player.snapshot().aligning).toBe(false);
+    expect(player.snapshot().alignmentOutcome).not.toBeNull();
+    // And the follow-up align() the load queue always issues is a no-op
+    // against the restored verdict — no re-measure, still settled.
+    await player.align();
+    expect(player.snapshot().aligning).toBe(false);
+    expect(player.snapshot().alignmentOutcome).not.toBeNull();
+  });
+
+  it("a seek re-points the mount window immediately — paused seeks pre-mount (QA M-3)", async () => {
+    FakeAudioContext.nextBuffer = fakeBuffer(1);
+    const player = new SessionPlayer();
+    player.setSessionPlan(twoTakePlan());
+    await player.load("take-1", ["s1"], () => Promise.resolve(new ArrayBuffer(4)));
+    player.setSessionSources({
+      assemble: () => Promise.resolve(new ArrayBuffer(4)),
+      storedAlignment: () => null,
+    });
+    // PAUSED seek into unmounted take-2's span: the kick decodes it now —
+    // no meter loop is running to poll the window — so the next play
+    // starts complete at the target, not ~0.5 s into the take.
+    player.seek(4.2);
+    expect(player.snapshot().playing).toBe(false);
+    await vi.waitFor(() => {
+      expect(player.snapshot().mountedTakeIds.sort()).toEqual(["take-1", "take-2"]);
+    });
+    expect(player.snapshot().playing).toBe(false);
+    // Resume covers the whole mounted window in ONE schedule pass.
+    player.play();
+    expect(player.snapshot().scheduleCount).toBe(1);
+    expect(player.position()).toBeCloseTo(4.2, 6);
+  });
+
+  it("releases a passed take once safely behind the playhead (not the selected one)", async () => {
+    FakeAudioContext.nextBuffer = fakeBuffer(1);
+    const player = new SessionPlayer();
+    const plan = [
+      ...twoTakePlan(),
+      {
+        takeId: "take-3",
+        streams: [
+          { streamId: "s3", channelKey: "lane-a", clipStartSec: 20, declaredDurationSec: 1 },
+        ],
+      },
+    ];
+    player.setSessionPlan(plan);
+    await player.load("take-3", ["s3"], () => Promise.resolve(new ArrayBuffer(4)));
+    player.setSessionSources({
+      assemble: () => Promise.resolve(new ArrayBuffer(4)),
+      storedAlignment: () => null,
+    });
+    player.play(1); // mounts take-1's neighbourhood
+    await vi.waitFor(() => {
+      expect(player.snapshot().mountedTakeIds).toContain("take-1");
+    });
+    player.pause();
+    // Re-play far past take-1 (end 2, margin 5): play()'s look-ahead kick
+    // releases it; the SELECTED take-3 stays mounted whatever the position.
+    player.play(12);
+    await vi.waitFor(() => {
+      expect(player.snapshot().mountedTakeIds).not.toContain("take-1");
+    });
+    expect(player.snapshot().mountedTakeIds).toContain("take-3");
+  });
+
+  it("re-publishing an identical plan is a strict no-op (no notify, no re-schedule)", async () => {
+    FakeAudioContext.nextBuffer = fakeBuffer(1);
+    const player = new SessionPlayer();
+    player.setSessionPlan(twoTakePlan());
+    await player.load("take-1", ["s1"], () => Promise.resolve(new ArrayBuffer(4)));
+    const snaps: PlayerSnapshot[] = [];
+    player.subscribe((s) => snaps.push(s));
+    const before = snaps.length;
+    player.setSessionPlan(twoTakePlan()); // fresh arrays, same content
+    expect(snaps.length).toBe(before);
+    // A clip MOVE on the mounted take re-schedules a rolling transport.
+    player.play(1);
+    const scheduled = player.snapshot().scheduleCount;
+    const movedPlan = twoTakePlan();
+    const movedStream = (movedPlan[0] as { streams: Array<{ clipStartSec: number }> })
+      .streams[0] as { clipStartSec: number };
+    movedStream.clipStartSec = 1.5;
+    player.setSessionPlan(movedPlan);
+    expect(player.snapshot().scheduleCount).toBe(scheduled + 1);
+    expect(player.duration()).toBeCloseTo(5, 6);
   });
 });
 

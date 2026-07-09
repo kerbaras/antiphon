@@ -62,7 +62,7 @@ async function playerSnap(desk: Page): Promise<{
   loadedTakeId: string | null;
   tracks: number;
   positionSec: number;
-  durationSec: number;
+  takeDurationSec: number;
 }> {
   return await desk.evaluate(() => {
     const hook = (
@@ -72,7 +72,7 @@ async function playerSnap(desk: Page): Promise<{
             loadedTakeId: string | null;
             tracks: unknown[];
             positionSec: number;
-            durationSec: number;
+            takeDurationSec: number;
           } | null;
         };
       }
@@ -82,7 +82,9 @@ async function playerSnap(desk: Page): Promise<{
       loadedTakeId: snap?.loadedTakeId ?? null,
       tracks: snap?.tracks.length ?? 0,
       positionSec: snap?.positionSec ?? -1,
-      durationSec: snap?.durationSec ?? 0,
+      // W6-B: song spans live in the TAKE's domain — the session-wide
+      // transport duration is a different (longer) number.
+      takeDurationSec: snap?.takeDurationSec ?? 0,
     };
   });
 }
@@ -164,18 +166,22 @@ test.describe("song markers (W2-B)", () => {
     await expect(desk.getByRole("button", { name: "Marker Kyrie", exact: true })).toBeVisible();
 
     // --- click-to-seek: ruler flag and panel row move the playhead ----------
+    // (W6-B: the transport clock is session-absolute — a marker at
+    // take-time at2 parks the engine at TAKE_BASE_SEC + at2.)
     await desk.getByRole("button", { name: "Marker Song 2", exact: true }).click();
     await expect
-      .poll(async () => Math.abs((await playerSnap(desk)).positionSec - at2))
+      .poll(async () => Math.abs((await playerSnap(desk)).positionSec - (TAKE_BASE_SEC + at2)))
       .toBeLessThan(0.05);
-    // The transport timecode readout followed the seek.
-    await expect(desk.getByText(new RegExp(`^00:00:0${Math.floor(at2)}`))).toBeVisible();
+    // The transport timecode readout followed the seek (session time).
+    await expect(
+      desk.getByText(new RegExp(`^00:00:0${Math.floor(TAKE_BASE_SEC + at2)}`)),
+    ).toBeVisible();
     // M at an already-marked spot must NOT stack a third marker.
     await desk.keyboard.press("m");
     expect(await uiMarkers(desk)).toHaveLength(2);
     await desk.getByRole("button", { name: "Kyrie", exact: true }).click();
     await expect
-      .poll(async () => Math.abs((await playerSnap(desk)).positionSec - at1))
+      .poll(async () => Math.abs((await playerSnap(desk)).positionSec - (TAKE_BASE_SEC + at1)))
       .toBeLessThan(0.05);
 
     // --- per-song master render: "NN <name>.wav" spanning marker→marker -----
@@ -197,7 +203,7 @@ test.describe("song markers (W2-B)", () => {
     expect(song.hasSignal).toBe(true);
 
     // --- all songs in one ZIP -------------------------------------------------
-    const takeDurationSec = (await playerSnap(desk)).durationSec;
+    const takeDurationSec = (await playerSnap(desk)).takeDurationSec;
     await expect(exportButton).toBeEnabled({ timeout: 30_000 }); // busy cleared
     await exportButton.click();
     const allItem = desk.getByRole("menuitem", { name: /^All songs/ });

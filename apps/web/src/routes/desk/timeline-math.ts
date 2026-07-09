@@ -136,6 +136,77 @@ export function alignShifts(lags: AlignLag[], repeatIntervalSec: number): AlignS
   return { shiftSec, anchorSec };
 }
 
+// ---- W6-B — session spans and the look-ahead scheduler ---------------------------
+// The transport runs the whole SESSION timeline now: takes at their room
+// offsets, silence in the gaps. These helpers are the pure half of the
+// engine's memory-bounded decode: which takes must be mounted for the next
+// stretch of playback, and which mounted takes are safely behind us. Takes
+// never overlap on the room clock by construction (the desk lays them out
+// sequentially), so at most one take is audible at any instant — the whole
+// reason a rolling mount window is enough.
+
+/** One take's extent on the session (arrangement) timeline. `endSec` is the
+ * best current estimate: the aligned end for a mounted take, the declared
+ * stream length otherwise (head-trims move it by fractions of a second). */
+export interface SessionTakeSpan {
+  takeId: string;
+  startSec: number;
+  endSec: number;
+}
+
+/** Where session playback stops: the last take's end (0 with no takes). */
+export function sessionEndSec(spans: readonly SessionTakeSpan[]): number {
+  let end = 0;
+  for (const span of spans) end = Math.max(end, span.endSec);
+  return end;
+}
+
+/** Where session content begins: the first clip's start (0 with none).
+ * The session master render starts HERE, not at arrangement zero — the
+ * leading second is desk furniture, not recorded silence. */
+export function sessionStartSec(spans: readonly SessionTakeSpan[]): number {
+  let start = Number.POSITIVE_INFINITY;
+  for (const span of spans) start = Math.min(start, span.startSec);
+  return Number.isFinite(start) ? start : 0;
+}
+
+/** Takes that must be decoded for playback to continue seamlessly: spans
+ * intersecting [posSec, posSec + aheadSec) that are not mounted yet, in
+ * start order — the caller decodes them one at a time, nearest first. */
+export function takesToMount(
+  spans: readonly SessionTakeSpan[],
+  isMounted: (takeId: string) => boolean,
+  posSec: number,
+  aheadSec: number,
+): string[] {
+  return [...spans]
+    .filter(
+      (span) =>
+        !isMounted(span.takeId) && span.endSec > posSec && span.startSec < posSec + aheadSec,
+    )
+    .sort((a, b) => a.startSec - b.startSec)
+    .map((span) => span.takeId);
+}
+
+/** Mounted takes whose audio is safely behind the playhead: ended more than
+ * `marginSec` ago and not the protected (selected) take. Their buffers can
+ * be released — a backwards seek re-decodes through the mount path. */
+export function takesToRelease(
+  spans: readonly SessionTakeSpan[],
+  mountedTakeIds: readonly string[],
+  posSec: number,
+  keepTakeId: string | null,
+  marginSec: number,
+): string[] {
+  const endOf = new Map(spans.map((span) => [span.takeId, span.endSec]));
+  return mountedTakeIds.filter((takeId) => {
+    if (takeId === keepTakeId) return false;
+    const end = endOf.get(takeId);
+    // A mounted take the plan no longer knows is stale — release it too.
+    return end === undefined || end < posSec - marginSec;
+  });
+}
+
 /** Optional export range on the take's room timeline — the same domain as
  * player positions/seeks (0 = take head after alignment). W2-B song
  * markers render ranges through this; omitted bounds mean whole-take. */

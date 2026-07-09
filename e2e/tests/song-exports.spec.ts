@@ -37,7 +37,7 @@ async function uiMarkers(desk: Page): Promise<UiMarker[]> {
 async function playerSnap(desk: Page): Promise<{
   loadedTakeId: string | null;
   tracks: number;
-  durationSec: number;
+  takeDurationSec: number;
 }> {
   return await desk.evaluate(() => {
     const hook = (
@@ -46,7 +46,7 @@ async function playerSnap(desk: Page): Promise<{
           playerSnapshot(): {
             loadedTakeId: string | null;
             tracks: unknown[];
-            durationSec: number;
+            takeDurationSec: number;
           } | null;
         };
       }
@@ -55,7 +55,8 @@ async function playerSnap(desk: Page): Promise<{
     return {
       loadedTakeId: snap?.loadedTakeId ?? null,
       tracks: snap?.tracks.length ?? 0,
-      durationSec: snap?.durationSec ?? 0,
+      // W6-B: whole-take stems span the TAKE, not the session transport.
+      takeDurationSec: snap?.takeDurationSec ?? 0,
     };
   });
 }
@@ -242,7 +243,7 @@ test.describe("song exports (W5-C)", () => {
     ]);
 
     // ---- 4. whole-take stems honor the sticky FLAC choice ---------------------
-    const takeDurationSec = (await playerSnap(desk)).durationSec;
+    const takeDurationSec = (await playerSnap(desk)).takeDurationSec;
     await openExportMenu(desk);
     // QA M-2: the hover chips are focusable BEFORE the reveal (opacity
     // overlay, not display:none), so Shift+Tab from the row below lands on

@@ -170,13 +170,16 @@ test("the tracks band is opaque and full-height at every scroll position", async
   expect(await playheadX()).toBe(x0);
 
   // The lane side of the filler row is still W4-C timeline: a click below
-  // the last lane inside the take's span seeks to that take-time.
+  // the last lane inside the take's span seeks there (W6-B: the transport
+  // clock is session-absolute — the clicked arrangement second itself).
   await desk.mouse.click(
     vp.left + TRACK_HEADER_W + (TAKE_BASE_SEC + 1.5) * PX_PER_SEC,
     belowLanesY,
   );
   await expect
-    .poll(async () => Math.abs((await playerPosition(desk)) - 1.5), { timeout: 30_000 })
+    .poll(async () => Math.abs((await playerPosition(desk)) - (TAKE_BASE_SEC + 1.5)), {
+      timeout: 30_000,
+    })
     .toBeLessThan(0.1);
 
   // --- vertical axis: squash the viewport so the lanes overflow --------------

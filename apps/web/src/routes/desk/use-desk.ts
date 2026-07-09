@@ -1,4 +1,4 @@
-// One DeskSession + one TakePlayer per page, bridged into React, plus
+// One DeskSession + one SessionPlayer per page, bridged into React, plus
 // server-side archive polling for the sink-convergence table.
 
 import { encode_flac_mono, init as initWasm } from "@antiphon/core-wasm";
@@ -16,6 +16,7 @@ import { DeskSession, type DeskSessionState } from "../../net/desk-session";
 import {
   bindAlignmentToCollab,
   persistTakeAlignment,
+  readTakeAlignment,
   restoreTakeAlignment,
   type TakeAlignment,
 } from "./alignment-persist";
@@ -53,9 +54,16 @@ import {
 } from "./markers";
 import type { MidiEvent } from "./midi";
 import { encodeMidiFile } from "./midi-file";
-import { computeWaveform, dbToLinear, type PlayerSnapshot, TakePlayer } from "./player";
+import { computeWaveform, dbToLinear, type PlayerSnapshot, SessionPlayer } from "./player";
 import { buildProjectManifest, type ProjectManifest } from "./project-manifest";
-import { RENDER_SAMPLE_RATE, type RenderModel, renderMaster, renderStems } from "./render";
+import {
+  estimateSessionWavBytes,
+  RENDER_SAMPLE_RATE,
+  type RenderModel,
+  renderMaster,
+  renderSessionMaster,
+  renderStems,
+} from "./render";
 import { type RenderRange, resolveRange, type TrackTiming } from "./timeline-math";
 import { fileSafe } from "./track-model";
 import { bindMixToCollab } from "./use-collab";
@@ -64,7 +72,7 @@ import { buildZip, type ZipEntry } from "./zip";
 
 let session: DeskSession | null = null;
 let latest: DeskSessionState | null = null;
-let player: TakePlayer | null = null;
+let player: SessionPlayer | null = null;
 let playerSnap: PlayerSnapshot | null = null;
 
 export interface DeskUiMirror {
@@ -81,6 +89,9 @@ export interface DeskUiMirror {
   markers: Marker[];
   /** Comments of the selected take (W2-F), timeline-sorted. */
   comments: TakeComment[];
+  /** The song under the playhead (W2-B panel highlight), null when the
+   * session position sits outside the selected take (QA M-2). */
+  currentSongId: string | null;
   /** Track rows in render order (F8 regression hook: this order must
    * never change within a session — EXCEPT through the operator's own
    * context-menu Move up/down, the W4-E sanctioned reorder). */
@@ -145,13 +156,20 @@ export function getDeskCollab(sessionId: string): CollabClient {
     // F7b: settled align() runs persist to the doc (+ localStorage shadow);
     // remote verdicts reapply to the loaded take at schedule time.
     bindAlignmentToCollab(collab, getPlayer(), sessionId);
+    // W6-B: the engine's look-ahead mounts and the session render need
+    // OPFS assembly + persisted verdicts WITHOUT a selection in the loop.
+    // Re-wired per collab client, so a session switch repoints both.
+    getPlayer().setSessionSources({
+      assemble: (takeId, streamId) => getDeskSession(sessionId).assembleFlac(takeId, streamId),
+      storedAlignment: (takeId) => readTakeAlignment(collab, sessionId, takeId),
+    });
   }
   return collab;
 }
 
-export function getPlayer(): TakePlayer {
+export function getPlayer(): SessionPlayer {
   if (!player) {
-    player = new TakePlayer();
+    player = new SessionPlayer();
     player.subscribe((s) => {
       playerSnap = s;
     });
@@ -250,6 +268,41 @@ export async function exportMasterWav(fileName: string, range?: RenderRange): Pr
     new Blob([encodeWav(channelData(buffer), buffer.sampleRate)], {
       type: "audio/wav",
     }),
+  );
+}
+
+/** Ask before rendering something enormous. Injectable for tests; the
+ * default is the browser's own modal — an export is already a click-and-
+ * wait interaction, a native confirm doesn't break its grammar. */
+export const SESSION_RENDER_CONFIRM_BYTES = 500 * 1024 * 1024;
+
+/** Render the ENTIRE session's master mix (W6-B — the operator's ask):
+ * every take at its room offset, silence in the gaps, one sequential
+ * per-take pass through the same planSource math as playback. Long
+ * sessions are guarded: above ~500 MB of 24-bit WAV the operator confirms
+ * first (a silent multi-GB allocation would be hostile). */
+export async function exportSessionMasterWav(
+  fileName: string,
+  confirmLarge: (message: string) => boolean = (message) => window.confirm(message),
+): Promise<void> {
+  const player = getPlayer();
+  const segments = player.sessionRenderPlan();
+  if (segments.length === 0) throw new Error("no takes to render");
+  const startSec = Math.min(...segments.map((s) => s.baseSec));
+  const endSec = Math.max(...segments.map((s) => s.declaredEndSec));
+  const estimated = estimateSessionWavBytes(endSec - startSec);
+  if (
+    estimated > SESSION_RENDER_CONFIRM_BYTES &&
+    !confirmLarge(
+      `The session master spans ${Math.round((endSec - startSec) / 60)} minutes — about ${Math.round(estimated / 1024 / 1024)} MB of WAV. Render it?`,
+    )
+  ) {
+    return; // declined: not an error, just a no
+  }
+  const mix = await renderSessionMaster(segments, (takeId) => player.renderModelFor(takeId));
+  downloadBlob(
+    fileName,
+    new Blob([encodeWav(mix.channelData, mix.sampleRate)], { type: "audio/wav" }),
   );
 }
 

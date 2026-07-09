@@ -1,10 +1,25 @@
-// Take playback engine: decodes each stream's archived FLAC into an
-// AudioBuffer and plays them through per-track EQ → gain → pan → analyser
-// → master EQ → master gain → master pan → analyser → speakers. Alignment
-// offsets from chirp correlation — or, when no usable chirp is present,
-// from content cross-correlation against a reference stream (W4-B) — and
-// per-stream drift ratios are applied at schedule time — stored audio is
-// never touched (RFC §13).
+// Session playback engine (W6-B): the transport runs the whole SESSION
+// timeline — every take at its room offset, silence in the gaps — through
+// per-track EQ → gain → pan → analyser → master EQ → master gain → master
+// pan → analyser → speakers. Position/seek/duration are absolute session
+// (arrangement) seconds; take-scoped data (markers, comments, exports)
+// stays take-local and the desk converts at the UI boundary.
+//
+// Memory is bounded by a rolling mount window, not by decoding everything:
+// the SELECTED take is always mounted (the F5 load queue path, unchanged);
+// while playing, a look-ahead mounts the next take on the room timeline
+// before its start arrives and schedules its sources into the SAME
+// AudioContext on the running clock grid — a seamless handoff, one extra
+// schedule pass per boundary, never a re-schedule of what is already
+// rolling. Passed takes release their buffers once safely behind the
+// playhead. Gaps schedule nothing; the clock just runs.
+//
+// Alignment offsets from chirp correlation — or, when no usable chirp is
+// present, from content cross-correlation against a reference stream
+// (W4-B) — and per-stream drift ratios stay PER TAKE and are applied at
+// schedule time — stored audio is never touched (RFC §13). Look-ahead
+// mounts reapply the take's persisted verdict (F7b) before their first
+// schedule, so a boundary handoff never causes a mid-roll re-schedule.
 
 import {
   align_content,
@@ -23,7 +38,7 @@ import {
   type EqState,
   updateEqChain,
 } from "./eq";
-import type { RenderModel } from "./render";
+import type { RenderModel, RenderTrackModel } from "./render";
 import {
   type AlignLag,
   type AlignMethod,
@@ -31,7 +46,11 @@ import {
   alignShifts,
   normalizeAlignDeltas,
   planSource,
+  type SessionTakeSpan,
+  sessionEndSec,
   type TrackTiming,
+  takesToMount,
+  takesToRelease,
   trackEndSec,
   wrapLag,
 } from "./timeline-math";
@@ -64,6 +83,18 @@ export const CONTENT_MIN_CONFIDENCE = 2.75;
  * and real ADC crystals never miss by a full 1000 ppm. */
 const DRIFT_MIN_CONFIDENCE = 0.5;
 const DRIFT_MAX_PPM = 1_000;
+/** Look-ahead window: a take starting within this many seconds of the
+ * playhead gets decoded NOW. Sized for a comfortable assemble+decode of a
+ * multi-minute take (decodeAudioData runs well over 50× realtime; OPFS
+ * assembly is the slower half) with margin for a loaded machine. */
+const LOOKAHEAD_SEC = 15;
+/** A mounted take releases its buffers once its end is this far behind
+ * the playhead — close enough to bound memory, far enough that a small
+ * backwards scrub doesn't thrash decode. */
+const RELEASE_MARGIN_SEC = 5;
+/** Look-ahead poll cadence inside the meter loop (raf runs at 60 Hz; the
+ * window math needs nothing near that). */
+const LOOKAHEAD_POLL_MS = 500;
 
 export interface AlignmentResult {
   lagSamples: number;
@@ -153,8 +184,22 @@ export interface PlayerSnapshot {
   loading: boolean;
   aligning: boolean;
   playing: boolean;
+  /** Absolute SESSION (arrangement) seconds — the transport clock (W6-B). */
   positionSec: number;
+  /** Session end: the last take's aligned end. The transport's end-stop. */
   durationSec: number;
+  /** The LOADED take's own span (its aligned end minus its base) — the
+   * domain of take-scoped UI: song spans, per-take export hints, the MIDI
+   * lane. Kept separate from `durationSec` on purpose: the transport runs
+   * the session, the editing surfaces stay per-take. */
+  takeDurationSec: number;
+  /** Takes currently holding decoded buffers (diagnostics/e2e: the memory
+   * bound is selected + current + look-ahead, plus a release-margin
+   * transient). */
+  mountedTakeIds: string[];
+  /** Peak level per mixer lane across ALL mounted takes — the lane meters
+   * must follow whatever take is audible, not just the selected one. */
+  channelLevels: Record<string, number>;
   masterDb: number;
   masterPan: number;
   masterEq: EqState;
@@ -174,9 +219,41 @@ export interface PlayerSnapshot {
   seekCount: number;
 }
 
+/** One stream of the SESSION plan: where its clip sits on the arrangement
+ * and how long the archive says it is (pre-alignment — head-trims refine
+ * the end once decoded). */
+export interface SessionStreamPlan {
+  streamId: string;
+  /** Mixer lane (performer) the stream plays through. */
+  channelKey: string;
+  /** Absolute arrangement position of the clip (override or take slot). */
+  clipStartSec: number;
+  /** Declared stream length: totalSamples / sample rate. */
+  declaredDurationSec: number;
+}
+
+/** One take of the session plan — only COMPLETE streams belong here (the
+ * live take and unassembled streams are not playable material). */
+export interface SessionTakePlan {
+  takeId: string;
+  streams: SessionStreamPlan[];
+}
+
+/** What the engine needs to mount takes WITHOUT a selection: OPFS stream
+ * assembly and the persisted per-take alignment verdict (F7b). Wired once
+ * by the desk (use-desk.ts). */
+export interface SessionSources {
+  assemble(takeId: string, streamId: string): Promise<ArrayBuffer | null>;
+  storedAlignment(takeId: string): Record<string, StoredTrackAlignment> | null;
+}
+
 interface Track {
   streamId: string;
+  /** The take this stream belongs to — the mount window's unit. */
+  takeId: string;
   channelKey: string;
+  /** Absolute arrangement position of the clip (session plan). */
+  clipStartSec: number;
   buffer: AudioBuffer;
   /** Stable node sources connect to; feeds `eq` or (bypassed) `gain`. */
   input: GainNode;
@@ -216,7 +293,7 @@ export function dbToLinear(db: number): number {
   return db <= MIN_DB ? 0 : 10 ** (db / 20);
 }
 
-export class TakePlayer {
+export class SessionPlayer {
   private ctx: AudioContext | null = null;
   /** Stable node track analysers feed; routes into `masterEqChain` or
    * (bypassed) straight into `master`. */
@@ -235,10 +312,18 @@ export class TakePlayer {
     string,
     { referenceId: string; refDelta: number; trackDelta: number; result: DriftResult }
   >();
-  private sources: AudioBufferSourceNode[] = [];
-  /** Per-clip timeline delay (seconds ≥ 0 relative to the take's base):
-   * the arrangement position of each clip, set by timeline edits. */
-  private clipDelays = new Map<string, number>();
+  /** Scheduled sources, tagged by take so a released take can stop its
+   * own (already-ended) nodes and free their buffer references. */
+  private sources: Array<{ node: AudioBufferSourceNode; takeId: string }> = [];
+  /** The session plan (desk → engine): every playable take's streams with
+   * absolute clip starts and declared lengths. THE source of the session
+   * timeline — duration(), look-ahead targets, render segments. */
+  private plan: SessionTakePlan[] = [];
+  /** Assembly + persisted-verdict access for selection-less mounts. */
+  private sessionSources: SessionSources | null = null;
+  /** The one take a look-ahead decode is in flight for (serialized). */
+  private decodingTakeId: string | null = null;
+  private lastLookaheadMs = 0;
   private loadedTakeId: string | null = null;
   private loading = false;
   private aligning = false;
@@ -268,6 +353,11 @@ export class TakePlayer {
   }
 
   snapshot(): PlayerSnapshot {
+    const channelLevels: Record<string, number> = {};
+    for (const t of this.tracks.values()) {
+      const level = this.levels.get(t.streamId) ?? 0;
+      channelLevels[t.channelKey] = Math.max(channelLevels[t.channelKey] ?? 0, level);
+    }
     return {
       loadedTakeId: this.loadedTakeId,
       loading: this.loading,
@@ -275,11 +365,16 @@ export class TakePlayer {
       playing: this.playing,
       positionSec: this.position(),
       durationSec: this.duration(),
+      takeDurationSec: this.takeDuration(),
+      mountedTakeIds: this.mountedTakeIds(),
+      channelLevels,
       masterDb: this.masterDb,
       masterPan: this.masterPan,
       masterEq: { ...this.masterEq },
       masterLevel: this.masterLevel,
-      tracks: [...this.tracks.values()].map((t) => {
+      // `tracks` stays the SELECTED take's view: alignment chip, exports,
+      // waveforms, manifests all reason about the take under edit.
+      tracks: this.loadedTracks().map((t) => {
         const strip = this.channel(t.channelKey);
         return {
           streamId: t.streamId,
@@ -306,7 +401,7 @@ export class TakePlayer {
    * best confidence is the number to show), or failed (align() threw). */
   private alignmentOutcome(): AlignmentOutcome | null {
     if (this.alignError) return { kind: "failed", message: this.alignError };
-    const measured = [...this.tracks.values()].filter((t) => t.alignment !== null);
+    const measured = this.loadedTracks().filter((t) => t.alignment !== null);
     if (measured.length === 0) return null;
     const applied = measured.filter((t) => t.alignment?.applied);
     if (applied.length > 0) {
@@ -367,9 +462,161 @@ export class TakePlayer {
     return strip;
   }
 
-  /** Decode and mount every stream of a take. Previous take is discarded.
-   * `channelOf` maps each stream to its mixer lane (performer); mixer state
-   * lives on the lane, so it carries across takes untouched. */
+  // ---- mount-window accessors (W6-B) --------------------------------------------
+
+  /** Mounted tracks of one take. */
+  private takeTracks(takeId: string | null): Track[] {
+    return [...this.tracks.values()].filter((t) => t.takeId === takeId);
+  }
+
+  /** Mounted tracks of the SELECTED take — the per-take surfaces
+   * (alignment, exports, snapshot.tracks) reason over exactly these. */
+  private loadedTracks(): Track[] {
+    return this.takeTracks(this.loadedTakeId);
+  }
+
+  private mountedTakeIds(): string[] {
+    const ids: string[] = [];
+    for (const t of this.tracks.values()) {
+      if (!ids.includes(t.takeId)) ids.push(t.takeId);
+    }
+    return ids;
+  }
+
+  /** A take's base on the arrangement: its leftmost clip start — mounted
+   * tracks first (exact), else the plan, else 0 (pre-plan unit paths). */
+  private takeBaseSec(takeId: string | null): number {
+    if (takeId === null) return 0;
+    const mounted = this.takeTracks(takeId);
+    if (mounted.length > 0) return Math.min(...mounted.map((t) => t.clipStartSec));
+    const planned = this.plan.find((p) => p.takeId === takeId);
+    if (planned && planned.streams.length > 0) {
+      return Math.min(...planned.streams.map((s) => s.clipStartSec));
+    }
+    return 0;
+  }
+
+  /** A take's end on the arrangement: aligned (mounted) or declared. */
+  private takeEndSec(takeId: string): number {
+    const mounted = this.takeTracks(takeId);
+    if (mounted.length > 0) {
+      return Math.max(...mounted.map((t) => trackEndSec(this.timing(t))));
+    }
+    const planned = this.plan.find((p) => p.takeId === takeId);
+    if (planned && planned.streams.length > 0) {
+      return Math.max(...planned.streams.map((s) => s.clipStartSec + s.declaredDurationSec));
+    }
+    return 0;
+  }
+
+  /** Session spans for the look-ahead/release math — plan takes plus any
+   * mounted take the plan hasn't caught up with, aligned ends preferred. */
+  private takeSpans(): SessionTakeSpan[] {
+    const spans = new Map<string, SessionTakeSpan>();
+    for (const p of this.plan) {
+      if (p.streams.length === 0) continue;
+      spans.set(p.takeId, {
+        takeId: p.takeId,
+        startSec: this.takeBaseSec(p.takeId),
+        endSec: this.takeEndSec(p.takeId),
+      });
+    }
+    for (const takeId of this.mountedTakeIds()) {
+      if (spans.has(takeId)) continue;
+      spans.set(takeId, {
+        takeId,
+        startSec: this.takeBaseSec(takeId),
+        endSec: this.takeEndSec(takeId),
+      });
+    }
+    return [...spans.values()];
+  }
+
+  /** Wire the session sources (assembly + persisted verdicts). Set once by
+   * the desk; replaced wholesale on a session switch. */
+  setSessionSources(sources: SessionSources): void {
+    this.sessionSources = sources;
+  }
+
+  /** Publish the session plan (desk → engine). Diffed internally: identical
+   * content — status polls re-derive it every second — is a strict no-op.
+   * A clip-start change on MOUNTED tracks re-schedules live (the audible
+   * consequence must land immediately, exactly like the old per-take clip
+   * delays); anything else (added/removed takes, declared-length updates)
+   * just refreshes the timeline math and notifies. */
+  setSessionPlan(plan: SessionTakePlan[]): void {
+    const next = plan
+      .filter((p) => p.streams.length > 0)
+      .map((p) => ({
+        takeId: p.takeId,
+        streams: [...p.streams].sort((a, b) => a.streamId.localeCompare(b.streamId)),
+      }));
+    if (this.samePlan(next)) return;
+    const known = new Set(next.map((p) => p.takeId));
+    this.plan = next;
+    // Mounted takes the plan dropped (deleted / re-scoped) release now —
+    // removeTracks covers server-confirmed deletes, this covers the rest.
+    for (const takeId of this.mountedTakeIds()) {
+      if (!known.has(takeId) && takeId !== this.loadedTakeId) this.unmountTake(takeId);
+    }
+    // Re-point mounted tracks at their plan entries: clip moves re-schedule
+    // (audible), lane re-keys re-route (parameter-only, like remapChannels).
+    let moved = false;
+    for (const p of next) {
+      for (const s of p.streams) {
+        const track = this.tracks.get(s.streamId);
+        if (!track || track.takeId !== p.takeId) continue;
+        if (Math.abs(track.clipStartSec - s.clipStartSec) > 1e-4) {
+          track.clipStartSec = s.clipStartSec;
+          moved = true;
+        }
+        if (track.channelKey !== s.channelKey) {
+          track.channelKey = s.channelKey;
+          const strip = this.channel(s.channelKey);
+          if (this.ctx) updateEqChain(track.eq, strip.eq, this.ctx.currentTime);
+          this.routeTrackEq(track);
+          this.applyGains();
+        }
+      }
+    }
+    if (moved && this.playing) {
+      const pos = this.position();
+      this.stopSources();
+      this.schedule(pos);
+    } else {
+      this.notify();
+    }
+  }
+
+  private samePlan(next: SessionTakePlan[]): boolean {
+    if (next.length !== this.plan.length) return false;
+    for (let i = 0; i < next.length; i++) {
+      const a = this.plan[i] as SessionTakePlan;
+      const b = next[i] as SessionTakePlan;
+      if (a.takeId !== b.takeId || a.streams.length !== b.streams.length) return false;
+      for (let j = 0; j < a.streams.length; j++) {
+        const sa = a.streams[j] as SessionStreamPlan;
+        const sb = b.streams[j] as SessionStreamPlan;
+        if (
+          sa.streamId !== sb.streamId ||
+          sa.channelKey !== sb.channelKey ||
+          Math.abs(sa.clipStartSec - sb.clipStartSec) > 1e-4 ||
+          Math.abs(sa.declaredDurationSec - sb.declaredDurationSec) > 1e-4
+        ) {
+          return false;
+        }
+      }
+    }
+    return true;
+  }
+
+  /** Decode and mount every stream of a take, making it the SELECTED one.
+   * Other mounted takes are released (the look-ahead re-mounts what
+   * playback needs); a take the look-ahead already mounted PROMOTES
+   * without a re-decode. `channelOf` maps each stream to its mixer lane
+   * (performer); mixer state lives on the lane, so it carries across takes
+   * untouched. The transport parks at the take's arrangement base — the
+   * same spot the old take-local domain called position 0. */
   async load(
     takeId: string,
     streamIds: string[],
@@ -381,12 +628,26 @@ export class TakePlayer {
       return true;
     }
     this.pause();
+    if (streamIds.length > 0 && streamIds.every((id) => this.tracks.get(id)?.takeId === takeId)) {
+      // Look-ahead already decoded this take: promote it. Alignment came
+      // from the persisted verdict at mount time; the queue's restore/align
+      // follow-ups are idempotent against it.
+      for (const other of this.mountedTakeIds()) {
+        if (other !== takeId) this.unmountTake(other);
+      }
+      this.loadedTakeId = takeId;
+      this.startPos = this.takeBaseSec(takeId);
+      this.error = null;
+      this.alignError = null;
+      this.applyGains();
+      this.notify();
+      return true;
+    }
     this.loading = true;
     this.error = null;
     this.alignError = null;
     this.notify();
     try {
-      const ctx = this.ensureGraph();
       const next = new Map<string, Track>();
       for (const streamId of streamIds) {
         const flac = await assemble(takeId, streamId);
@@ -394,47 +655,23 @@ export class TakePlayer {
           this.error = `stream ${streamId.slice(0, 8)} not reconstructable yet`;
           continue;
         }
-        const buffer = await ctx.decodeAudioData(flac);
-        const channelKey = channelOf(streamId);
-        const input = ctx.createGain();
-        const eq = createEqChain(ctx, this.channel(channelKey).eq);
-        const gain = ctx.createGain();
-        const panner = ctx.createStereoPanner();
-        const analyser = ctx.createAnalyser();
-        analyser.fftSize = 512;
-        eq.high.connect(gain);
-        gain.connect(panner);
-        panner.connect(analyser);
-        // Meters tap AFTER the whole strip — post-EQ/gain/pan by construction.
-        analyser.connect(this.masterBus as GainNode);
+        const buffer = await this.ensureGraph().decodeAudioData(flac);
         const previous = this.tracks.get(streamId);
-        const track: Track = {
-          streamId,
-          channelKey,
-          buffer,
-          input,
-          eq,
-          gain,
-          panner,
-          analyser,
-          scratch: new Float32Array(analyser.fftSize),
-          alignment: previous?.alignment ?? null,
-          drift: previous?.drift ?? null,
-          waveform: computeWaveform(buffer),
-        };
-        this.routeTrackEq(track);
+        const track = this.mountTrack(takeId, streamId, buffer, channelOf(streamId));
+        track.alignment = previous?.alignment ?? null;
+        track.drift = previous?.drift ?? null;
         next.set(streamId, track);
       }
+      // Release everything the new selection doesn't cover — the previous
+      // take AND look-ahead mounts (playback is paused; the window rebuilds
+      // from the new position on the next play).
       for (const old of this.tracks.values()) {
-        old.input.disconnect();
-        disconnectEqChain(old.eq);
-        old.gain.disconnect();
-        old.panner.disconnect();
-        old.analyser.disconnect();
+        if (next.has(old.streamId)) continue;
+        this.disconnectTrack(old);
       }
       this.tracks = next;
       this.loadedTakeId = takeId;
-      this.startPos = 0;
+      this.startPos = this.takeBaseSec(takeId);
       this.applyGains();
       return this.tracks.size > 0;
     } catch (e) {
@@ -443,6 +680,81 @@ export class TakePlayer {
     } finally {
       this.loading = false;
       this.notify();
+    }
+  }
+
+  /** Build one track's node chain and register it (shared by the selected
+   * load and the look-ahead mount — the graph must be identical). Does NOT
+   * touch `loadedTakeId` or transport state. */
+  private mountTrack(
+    takeId: string,
+    streamId: string,
+    buffer: AudioBuffer,
+    channelKey: string,
+  ): Track {
+    const ctx = this.ensureGraph();
+    const input = ctx.createGain();
+    const eq = createEqChain(ctx, this.channel(channelKey).eq);
+    const gain = ctx.createGain();
+    const panner = ctx.createStereoPanner();
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 512;
+    eq.high.connect(gain);
+    gain.connect(panner);
+    panner.connect(analyser);
+    // Meters tap AFTER the whole strip — post-EQ/gain/pan by construction.
+    analyser.connect(this.masterBus as GainNode);
+    const track: Track = {
+      streamId,
+      takeId,
+      channelKey,
+      clipStartSec: this.planClipStart(takeId, streamId),
+      buffer,
+      input,
+      eq,
+      gain,
+      panner,
+      analyser,
+      scratch: new Float32Array(analyser.fftSize),
+      alignment: null,
+      drift: null,
+      waveform: computeWaveform(buffer),
+    };
+    this.routeTrackEq(track);
+    return track;
+  }
+
+  private planClipStart(takeId: string, streamId: string): number {
+    const planned = this.plan.find((p) => p.takeId === takeId);
+    return planned?.streams.find((s) => s.streamId === streamId)?.clipStartSec ?? 0;
+  }
+
+  private disconnectTrack(track: Track): void {
+    track.input.disconnect();
+    disconnectEqChain(track.eq);
+    track.gain.disconnect();
+    track.panner.disconnect();
+    track.analyser.disconnect();
+  }
+
+  /** Release one mounted take: stop its (ended) sources, tear down its
+   * node chains, drop its buffers. The selected take never comes through
+   * here — callers guard it. */
+  private unmountTake(takeId: string): void {
+    for (const entry of this.sources) {
+      if (entry.takeId !== takeId) continue;
+      try {
+        entry.node.stop();
+        entry.node.disconnect();
+      } catch {
+        // already stopped
+      }
+    }
+    this.sources = this.sources.filter((entry) => entry.takeId !== takeId);
+    for (const track of this.takeTracks(takeId)) {
+      this.disconnectTrack(track);
+      this.tracks.delete(track.streamId);
+      this.levels.delete(track.streamId);
     }
   }
 
@@ -485,8 +797,8 @@ export class TakePlayer {
    * auto-align triggers ride on status polls, and both the correlation
    * cost and the final re-schedule must not repeat. */
   async align(force = false): Promise<void> {
-    if (this.tracks.size === 0 || this.aligning) return;
-    if (!force && [...this.tracks.values()].every((t) => t.alignment !== null)) return;
+    if (this.loadedTracks().length === 0 || this.aligning) return;
+    if (!force && this.loadedTracks().every((t) => t.alignment !== null)) return;
     const takeId = this.loadedTakeId;
     this.aligning = true;
     this.alignError = null;
@@ -497,12 +809,12 @@ export class TakePlayer {
     // W4-A's gapless invariant pins scheduleCount == 1 — a declined run
     // landing during playback must be inaudible and schedule-free).
     const fingerprint = () =>
-      JSON.stringify([...this.tracks.values()].map((t) => [t.streamId, this.timing(t)]));
+      JSON.stringify(this.loadedTracks().map((t) => [t.streamId, this.timing(t)]));
     const before = fingerprint();
     try {
       await initWasm();
       const spec = DEFAULT_CHIRP_SPEC;
-      for (const track of this.tracks.values()) {
+      for (const track of this.loadedTracks()) {
         const rate = track.buffer.sampleRate;
         const window = Math.min(track.buffer.length, Math.round(rate * ALIGN_WINDOW_SECONDS));
         const head = track.buffer.getChannelData(0).slice(0, window);
@@ -554,7 +866,7 @@ export class TakePlayer {
       !this.alignError &&
       takeId !== null &&
       takeId === this.loadedTakeId &&
-      [...this.tracks.values()].some((t) => t.alignment !== null)
+      this.loadedTracks().some((t) => t.alignment !== null)
     ) {
       for (const listener of this.alignmentSettledListeners) listener(takeId);
     }
@@ -574,8 +886,8 @@ export class TakePlayer {
    * A failed content measurement KEEPS the honest chirp decline — the
    * verdict never fabricates. */
   private async alignContentFallback(): Promise<void> {
-    if (this.tracks.size < 2) return; // nothing to align against
-    const tracks = [...this.tracks.values()];
+    const tracks = this.loadedTracks();
+    if (tracks.length < 2) return; // nothing to align against
     const chirpApplied = tracks.filter((t) => t.alignment?.applied);
     if (chirpApplied.length === tracks.length) return; // chirp placed everything
     const anchors = chirpApplied.length > 0 ? chirpApplied : tracks;
@@ -594,7 +906,7 @@ export class TakePlayer {
     const refWindow = Math.min(reference.buffer.length, Math.round(rate * CONTENT_WINDOW_SECONDS));
     const refHead = reference.buffer.getChannelData(0).slice(0, refWindow);
     let bestConfidence = 0;
-    for (const track of this.tracks.values()) {
+    for (const track of tracks) {
       if (track === reference || track.alignment?.applied) continue;
       const trackRate = track.buffer.sampleRate;
       const window = Math.min(track.buffer.length, Math.round(trackRate * CONTENT_WINDOW_SECONDS));
@@ -643,7 +955,7 @@ export class TakePlayer {
   restoreAlignment(takeId: string, entries: Record<string, StoredTrackAlignment>): boolean {
     if (this.loadedTakeId !== takeId || this.aligning || this.loading) return false;
     let changed = false;
-    for (const track of this.tracks.values()) {
+    for (const track of this.loadedTracks()) {
       const entry = entries[track.streamId];
       if (!entry) continue;
       // Normalize before comparing/applying: legacy verdicts (and untyped
@@ -685,7 +997,7 @@ export class TakePlayer {
   private async estimateDrift(): Promise<void> {
     const deltas = this.alignDeltas();
     if (deltas.size < 2) return; // no anchor to drift against
-    const aligned = [...this.tracks.values()].filter((t) => deltas.has(t.streamId));
+    const aligned = this.loadedTracks().filter((t) => deltas.has(t.streamId));
     const reference = aligned.reduce((a, b) =>
       (deltas.get(b.streamId) as number) < (deltas.get(a.streamId) as number) ? b : a,
     );
@@ -792,11 +1104,13 @@ export class TakePlayer {
     return (this.alignDelta(track) + driftSamples) / track.buffer.sampleRate;
   }
 
-  /** The applied alignment lags exactly as the schedule math consumes
-   * them — the single source for both the head-trim deltas below and the
-   * visual shift composition (W6-C). */
-  private appliedAlignLags(): AlignLag[] {
-    return [...this.tracks.values()]
+  /** ONE take's applied alignment lags exactly as the schedule math
+   * consumes them — the single source for both the head-trim deltas below
+   * and the visual shift composition (W6-C). PER TAKE by construction
+   * (W6-B): with multiple takes mounted, mixing their lag domains would
+   * tear both the trims and the drawn shifts. */
+  private appliedAlignLagsFor(takeId: string | null): AlignLag[] {
+    return this.takeTracks(takeId)
       .filter((t) => t.alignment?.applied)
       .map((t) => ({
         streamId: t.streamId,
@@ -808,51 +1122,64 @@ export class TakePlayer {
 
   /** Samples to trim from each track's head so all aligned tracks share
    * the room clock — the modulo-repeat normalization lives in
-   * timeline-math (shared with the offline render). Public as a pure
-   * diagnostics readout (F7 e2e asserts restored deltas through it). */
+   * timeline-math (shared with the offline render). PER TAKE: alignment
+   * is a property of one take's recording, never of the session. Public
+   * form reads the SELECTED take (a pure diagnostics readout — F7 e2e
+   * asserts restored deltas through it). */
   alignDeltas(): Map<string, number> {
-    const spec = DEFAULT_CHIRP_SPEC;
-    return normalizeAlignDeltas(this.appliedAlignLags(), (spec.durationMs + spec.gapMs) / 1_000);
+    return this.alignDeltasFor(this.loadedTakeId);
   }
 
-  /** Visual composition of the loaded take's alignment (W6-C): per-clip
+  private alignDeltasFor(takeId: string | null): Map<string, number> {
+    const spec = DEFAULT_CHIRP_SPEC;
+    return normalizeAlignDeltas(
+      this.appliedAlignLagsFor(takeId),
+      (spec.durationMs + spec.gapMs) / 1_000,
+    );
+  }
+
+  /** Visual composition of the LOADED take's alignment (W6-C): per-clip
    * box shifts + the room-zero anchor, derived from the SAME lag set the
    * schedule trims with (timeline-math.alignShifts) — the timeline draws
-   * exactly what plays. Empty/zero until a verdict applies. */
+   * exactly what plays. Empty/zero until a verdict applies. Scope note
+   * (W6-B × W6-C): the anchor is a DRAWING transform of the selected
+   * take only — the session clock itself is anchor-free (every take's
+   * aligned audio starts at its clip's arrangement position; see the
+   * timing() contract), and mounted-but-unselected takes draw at capture
+   * placement, W6-C's documented scope. */
   alignShifts(): AlignShifts {
     const spec = DEFAULT_CHIRP_SPEC;
-    return alignShifts(this.appliedAlignLags(), (spec.durationMs + spec.gapMs) / 1_000);
+    return alignShifts(
+      this.appliedAlignLagsFor(this.loadedTakeId),
+      (spec.durationMs + spec.gapMs) / 1_000,
+    );
   }
 
   private alignDelta(track: Track): number {
-    return this.alignDeltas().get(track.streamId) ?? 0;
+    return this.alignDeltasFor(track.takeId).get(track.streamId) ?? 0;
   }
 
-  /** Drop tracks whose streams were deleted. Playback continues with the
-   * survivors (re-scheduled from the same position); an emptied player
-   * unloads entirely. */
+  /** Drop tracks whose streams were deleted (any mounted take). Playback
+   * continues with the survivors (re-scheduled from the same position);
+   * an emptied player unloads entirely. */
   removeTracks(streamIds: string[]): void {
     let removed = false;
     for (const streamId of streamIds) {
       const track = this.tracks.get(streamId);
       if (!track) continue;
-      track.input.disconnect();
-      disconnectEqChain(track.eq);
-      track.gain.disconnect();
-      track.panner.disconnect();
-      track.analyser.disconnect();
+      this.disconnectTrack(track);
       this.tracks.delete(streamId);
       this.levels.delete(streamId);
-      this.clipDelays.delete(streamId);
       this.driftCache.delete(streamId);
       removed = true;
     }
     if (!removed) return;
-    if (this.tracks.size === 0) {
+    if (this.loadedTracks().length === 0) {
       this.pause();
       this.loadedTakeId = null;
       this.startPos = 0;
-    } else if (this.playing) {
+    }
+    if (this.playing) {
       const pos = this.position();
       this.stopSources();
       this.schedule(pos);
@@ -860,83 +1187,144 @@ export class TakePlayer {
     this.notify();
   }
 
-  /** Update arrangement positions (from timeline clip drags). Re-schedules
-   * live so the change is audible immediately — but ONLY when a delay
-   * actually changed: callers fire on status polls, and a spurious
-   * re-schedule mid-playback is an audible cut. */
-  setClipDelays(delays: Record<string, number>): void {
-    const next = new Map(Object.entries(delays).map(([id, d]) => [id, Math.max(0, d)]));
-    let changed = next.size !== this.clipDelays.size;
-    if (!changed) {
-      for (const [id, d] of next) {
-        const prev = this.clipDelays.get(id);
-        if (prev === undefined || Math.abs(prev - d) > 1e-4) {
-          changed = true;
-          break;
-        }
-      }
-    }
-    if (!changed) return;
-    this.clipDelays = next;
-    if (this.playing) {
-      const pos = this.position();
-      this.stopSources();
-      this.schedule(pos);
-    } else {
-      this.notify();
-    }
-  }
-
-  private clipDelay(streamId: string): number {
-    return this.clipDelays.get(streamId) ?? 0;
-  }
-
   /** The SAME schedule parameters live playback and the offline render
-   * plan sources with (timeline-math.planSource) — the parity contract. */
+   * plan sources with (timeline-math.planSource) — the parity contract.
+   * `clipDelaySec` is the ABSOLUTE arrangement position now: one session
+   * clock for every mounted take. */
   private timing(track: Track): TrackTiming {
     return {
       headSec: this.headSec(track),
       ratio: this.driftRatio(track),
-      clipDelaySec: this.clipDelay(track.streamId),
+      clipDelaySec: track.clipStartSec,
       bufferDurationSec: track.buffer.duration,
     };
   }
 
+  /** Transport duration = SESSION end: the last take's end on the room
+   * timeline, planned takes included (they need no decode to have an
+   * extent). Mounted takes report their aligned ends. */
   duration(): number {
-    let max = 0;
-    for (const t of this.tracks.values()) {
-      max = Math.max(max, trackEndSec(this.timing(t)));
-    }
-    return max;
+    return sessionEndSec(this.takeSpans());
+  }
+
+  /** The loaded take's own span (aligned end − base): the take-scoped
+   * domain for song ranges, export hints, the MIDI lane. */
+  takeDuration(): number {
+    if (!this.loadedTakeId || this.loadedTracks().length === 0) return 0;
+    return this.takeEndSec(this.loadedTakeId) - this.takeBaseSec(this.loadedTakeId);
   }
 
   /** Immutable inputs for the offline export path (render.ts): the decoded
    * buffers (shared by reference, read-only — stored audio is never
    * mutated), the SAME per-track timing playback schedules with, and the
    * mixer state resolved exactly as applyGains() resolves it (mute/solo →
-   * gain 0). Null while nothing is loaded. */
+   * gain 0). Null while nothing is loaded. TAKE-LOCAL by contract: clip
+   * delays are rebased onto the take's own head, so per-take/per-song
+   * exports and manifests keep their W2-A/W2-B domain untouched. */
   renderModel(): RenderModel | null {
-    if (!this.loadedTakeId || this.tracks.size === 0) return null;
+    if (!this.loadedTakeId || this.loadedTracks().length === 0) return null;
+    return this.renderModelOfMounted(this.loadedTakeId);
+  }
+
+  private renderModelOfMounted(takeId: string): RenderModel {
     const anySolo = [...this.channels.values()].some((c) => c.soloed);
+    const base = this.takeBaseSec(takeId);
     return {
-      takeId: this.loadedTakeId,
-      durationSec: this.duration(),
+      takeId,
+      durationSec: this.takeEndSec(takeId) - base,
       masterGain: dbToLinear(this.masterDb),
       masterPan: this.masterPan,
       masterEq: { ...this.masterEq },
-      tracks: [...this.tracks.values()].map((track) => {
+      tracks: this.takeTracks(takeId).map((track) => {
         const strip = this.channel(track.channelKey);
         const audible = !strip.muted && (!anySolo || strip.soloed);
         return {
           streamId: track.streamId,
           channelKey: track.channelKey,
           buffer: track.buffer,
-          timing: this.timing(track),
+          timing: { ...this.timing(track), clipDelaySec: track.clipStartSec - base },
           gain: audible ? dbToLinear(strip.gainDb) : 0,
           pan: strip.pan,
           eq: { ...strip.eq },
         };
       }),
+    };
+  }
+
+  /** The session master render's segment list (W6-B): every planned take
+   * with its arrangement base and declared end, base order. The render
+   * walks these sequentially through `renderModelFor` — one take decoded
+   * at a time, memory bounded exactly like playback. */
+  sessionRenderPlan(): Array<{ takeId: string; baseSec: number; declaredEndSec: number }> {
+    return this.plan
+      .filter((p) => p.streams.length > 0)
+      .map((p) => ({
+        takeId: p.takeId,
+        baseSec: this.takeBaseSec(p.takeId),
+        declaredEndSec: this.takeEndSec(p.takeId),
+      }))
+      .sort((a, b) => a.baseSec - b.baseSec);
+  }
+
+  /** A take-local RenderModel for ANY planned take. Mounted takes reuse
+   * their live buffers; others assemble+decode on a scratch context at the
+   * live graph's rate (so persisted lag samples mean what they mean on
+   * this desk) and apply the persisted verdict (F7b) — the same
+   * timing/planSource math as playback, then the buffers go out of scope
+   * with the returned model. Null when the take can't be built. */
+  async renderModelFor(takeId: string): Promise<RenderModel | null> {
+    if (this.takeTracks(takeId).length > 0) return this.renderModelOfMounted(takeId);
+    const planned = this.plan.find((p) => p.takeId === takeId);
+    if (!planned || planned.streams.length === 0 || !this.sessionSources) return null;
+    const decoded: Array<{ plan: SessionStreamPlan; buffer: AudioBuffer }> = [];
+    for (const stream of planned.streams) {
+      const flac = await this.sessionSources.assemble(takeId, stream.streamId);
+      if (!flac) return null; // not reconstructable: an honest miss, not silence
+      const scratch = new OfflineAudioContext(1, 1, this.ctx?.sampleRate ?? 48_000);
+      decoded.push({ plan: stream, buffer: await scratch.decodeAudioData(flac) });
+    }
+    const entries = this.sessionSources.storedAlignment(takeId) ?? {};
+    const spec = DEFAULT_CHIRP_SPEC;
+    const deltas = normalizeAlignDeltas(
+      decoded
+        .filter(({ plan }) => entries[plan.streamId]?.alignment.applied)
+        .map(({ plan, buffer }) => ({
+          streamId: plan.streamId,
+          lagSamples: entries[plan.streamId]?.alignment.lagSamples ?? 0,
+          sampleRate: buffer.sampleRate,
+          method: entries[plan.streamId]?.alignment.method ?? "chirp",
+        })),
+      (spec.durationMs + spec.gapMs) / 1_000,
+    );
+    const base = Math.min(...decoded.map(({ plan }) => plan.clipStartSec));
+    const anySolo = [...this.channels.values()].some((c) => c.soloed);
+    const tracks: RenderTrackModel[] = decoded.map(({ plan, buffer }) => {
+      const drift = entries[plan.streamId]?.drift;
+      const driftSamples = drift?.applied ? drift.initialOffsetSamples : 0;
+      const strip = this.channel(plan.channelKey);
+      const audible = !strip.muted && (!anySolo || strip.soloed);
+      return {
+        streamId: plan.streamId,
+        channelKey: plan.channelKey,
+        buffer,
+        timing: {
+          headSec: ((deltas.get(plan.streamId) ?? 0) + driftSamples) / buffer.sampleRate,
+          ratio: drift?.applied ? drift.ratio : 1,
+          clipDelaySec: plan.clipStartSec - base,
+          bufferDurationSec: buffer.duration,
+        },
+        gain: audible ? dbToLinear(strip.gainDb) : 0,
+        pan: strip.pan,
+        eq: { ...strip.eq },
+      };
+    });
+    return {
+      takeId,
+      durationSec: Math.max(...tracks.map((t) => trackEndSec(t.timing))),
+      masterGain: dbToLinear(this.masterDb),
+      masterPan: this.masterPan,
+      masterEq: { ...this.masterEq },
+      tracks,
     };
   }
 
@@ -958,7 +1346,12 @@ export class TakePlayer {
     this.stopSources();
     this.scheduleCount = 0;
     const pos = fromSec ?? this.startPos;
+    // End rule (F12, now end-of-SESSION): Play from the parked end returns
+    // to the top of the room timeline.
     this.schedule(pos >= this.duration() - 0.05 ? 0 : pos);
+    // Kick the mount window immediately: a play landing just before a
+    // boundary must not wait for the meter loop's first poll.
+    this.ensureLookahead();
   }
 
   private schedule(fromSec: number): void {
@@ -967,6 +1360,9 @@ export class TakePlayer {
     for (const track of this.tracks.values()) {
       // Timeline→buffer mapping (head trim, drift ratio, clip delay) is the
       // shared planSource — identical for playback and export by design.
+      // Every MOUNTED take schedules here: future takes get future starts
+      // (planSource's whenSec), passed ones plan null — one pass covers
+      // whatever the mount window holds.
       const timing = this.timing(track);
       const plan = planSource(timing, fromSec);
       if (!plan) continue;
@@ -975,7 +1371,7 @@ export class TakePlayer {
       source.playbackRate.value = timing.ratio;
       source.connect(track.input);
       source.start(when + plan.whenSec, plan.offsetSec);
-      this.sources.push(source);
+      this.sources.push({ node: source, takeId: track.takeId });
     }
     this.startCtxTime = when;
     this.startPos = fromSec;
@@ -983,6 +1379,117 @@ export class TakePlayer {
     this.scheduleCount += 1;
     this.startMeterLoop();
     this.notify();
+  }
+
+  /** Boundary handoff (W6-B): schedule ONE freshly mounted take's sources
+   * onto the RUNNING clock grid — startCtxTime anchors the same
+   * origin the rolling sources were planned against, so the new take's
+   * room offset is sample-exact relative to them. Never touches what is
+   * already playing; counts as one schedule pass (the honest evolution of
+   * W4-A's storm guard: schedules == 1 + boundary handoffs). */
+  private scheduleTake(takeId: string): void {
+    const ctx = this.ensureGraph();
+    let scheduled = false;
+    for (const track of this.takeTracks(takeId)) {
+      const timing = this.timing(track);
+      let plan = planSource(timing, this.startPos);
+      if (!plan) continue;
+      let when = this.startCtxTime + plan.whenSec;
+      if (when < ctx.currentTime + 0.02) {
+        // The decode landed after the take's start passed (late mount —
+        // machine load, a seek straight into the take): start NOW at the
+        // current session position instead of replaying from its head.
+        const now = ctx.currentTime + 0.02;
+        const posNow = this.startPos + (now - this.startCtxTime);
+        const late = planSource(timing, posNow);
+        if (!late) continue;
+        plan = late;
+        when = now + late.whenSec;
+      }
+      const source = ctx.createBufferSource();
+      source.buffer = track.buffer;
+      source.playbackRate.value = timing.ratio;
+      source.connect(track.input);
+      source.start(when, plan.offsetSec);
+      this.sources.push({ node: source, takeId });
+      scheduled = true;
+    }
+    if (!scheduled) return;
+    this.scheduleCount += 1;
+    this.notify();
+  }
+
+  /** The rolling mount window: release takes safely behind the playhead,
+   * then decode the next take the room timeline needs (one at a time,
+   * nearest first). Runs on play(), on a throttled meter-loop poll, and on
+   * every seek (QA M-3) — paused included, so a parked transport already
+   * holds the takes its position would play. mountAhead handles the
+   * paused case (mount + notify, no schedule). */
+  private ensureLookahead(): void {
+    if (!this.sessionSources) return;
+    const pos = this.position();
+    const spans = this.takeSpans();
+    for (const takeId of takesToRelease(
+      spans,
+      this.mountedTakeIds(),
+      pos,
+      this.loadedTakeId,
+      RELEASE_MARGIN_SEC,
+    )) {
+      this.unmountTake(takeId);
+    }
+    if (this.decodingTakeId !== null) return; // serialized decode
+    const [nextTakeId] = takesToMount(
+      spans,
+      (takeId) => this.takeTracks(takeId).length > 0,
+      pos,
+      LOOKAHEAD_SEC,
+    );
+    if (nextTakeId) void this.mountAhead(nextTakeId);
+  }
+
+  /** Decode + mount one take for the look-ahead window: assemble, decode
+   * into the LIVE context, apply the persisted alignment verdict (F7b) so
+   * the first schedule is already aligned, then hand off onto the running
+   * clock. A failure surfaces on the error strip but never stops the
+   * transport — the session plays on with an honest hole. */
+  private async mountAhead(takeId: string): Promise<void> {
+    const sources = this.sessionSources;
+    if (!sources) return;
+    this.decodingTakeId = takeId;
+    try {
+      const planned = this.plan.find((p) => p.takeId === takeId);
+      if (!planned) return;
+      const mounted: Track[] = [];
+      for (const stream of planned.streams) {
+        const flac = await sources.assemble(takeId, stream.streamId);
+        if (!flac) throw new Error(`stream ${stream.streamId.slice(0, 8)} not reconstructable`);
+        const buffer = await this.ensureGraph().decodeAudioData(flac);
+        mounted.push(this.mountTrack(takeId, stream.streamId, buffer, stream.channelKey));
+      }
+      // The plan may have moved on while we decoded (session switch, take
+      // delete): a mount nobody asked for is discarded, not registered.
+      if (!this.plan.some((p) => p.takeId === takeId)) {
+        for (const track of mounted) this.disconnectTrack(track);
+        return;
+      }
+      const entries = sources.storedAlignment(takeId);
+      for (const track of mounted) {
+        const entry = entries?.[track.streamId];
+        if (!entry) continue; // no verdict: honest unaligned playback
+        track.alignment = { ...entry.alignment, method: entry.alignment.method ?? "chirp" };
+        track.drift = entry.drift ? { ...entry.drift } : null;
+      }
+      for (const track of mounted) this.tracks.set(track.streamId, track);
+      this.applyGains();
+      if (this.playing) this.scheduleTake(takeId);
+      else this.notify();
+    } catch (e) {
+      this.error = `take ${takeId.slice(0, 8)} decode failed: ${e instanceof Error ? e.message : String(e)}`;
+      this.notify();
+    } finally {
+      this.decodingTakeId = null;
+    }
   }
 
   pause(): void {
@@ -1009,6 +1516,15 @@ export class TakePlayer {
       this.startPos = clamped;
       this.notify();
     }
+    // QA M-3: a seek can land anywhere on the session — re-point the mount
+    // window NOW instead of waiting for the meter loop's 500 ms poll (a
+    // rolling seek into an unmounted take lost ~0.5 s of its head to that
+    // wait). A PAUSED seek pre-mounts too: by the time a human presses
+    // Play the decode has landed and resume starts complete at the target.
+    // Deliberately fire-and-forget (no await/queue machinery): if Play
+    // beats the decode, the completion hands off from the live position
+    // exactly like any mid-roll mount.
+    this.ensureLookahead();
   }
 
   // Channel-strip controls: keyed by lane, valid at ANY time — before the
@@ -1136,16 +1652,26 @@ export class TakePlayer {
         for (const v of this.masterScratch) peak = Math.max(peak, Math.abs(v));
         this.masterLevel = peak;
       }
+      // Rolling mount window (W6-B): the raf runs at 60 Hz, the window
+      // math needs ~2 Hz — decode kicks are throttled, decodes themselves
+      // run async off this loop.
+      const nowMs = performance.now();
+      if (nowMs - this.lastLookaheadMs > LOOKAHEAD_POLL_MS) {
+        this.lastLookaheadMs = nowMs;
+        this.ensureLookahead();
+      }
       if (this.position() >= this.duration() - 0.02) {
-        // End of take: EXACTLY a user pause on the last frame. startPos
-        // parks at the end (position() clamps to duration) and pause()'s
-        // notify hands the UI the same parked position the engine reports —
-        // Play from here returns to the start through play()'s own
-        // >= duration guard, the transport's one rule for "play from the
-        // end". (A silent startPos = 0 here desynced timecode vs engine —
-        // QA F12.) Return WITHOUT re-arming: pause() stopped the meter
-        // loop, and re-arming would strand a stale raf id that gates the
-        // next startMeterLoop, freezing playhead/meters on the next play.
+        // End of SESSION (the F12 end-of-take rule, promoted with the
+        // transport scope in W6-B): EXACTLY a user pause on the last
+        // frame. startPos parks at the end (position() clamps to duration)
+        // and pause()'s notify hands the UI the same parked position the
+        // engine reports — Play from here returns to the session top
+        // through play()'s own >= duration guard, the transport's one rule
+        // for "play from the end". (A silent startPos = 0 here desynced
+        // timecode vs engine — QA F12.) Return WITHOUT re-arming: pause()
+        // stopped the meter loop, and re-arming would strand a stale raf
+        // id that gates the next startMeterLoop, freezing playhead/meters
+        // on the next play.
         this.pause();
         return;
       }
@@ -1169,10 +1695,10 @@ export class TakePlayer {
   }
 
   private stopSources(): void {
-    for (const source of this.sources) {
+    for (const { node } of this.sources) {
       try {
-        source.stop();
-        source.disconnect();
+        node.stop();
+        node.disconnect();
       } catch {
         // already stopped
       }

@@ -122,7 +122,10 @@ test.describe("ruler hit targets (F11)", () => {
     await desk
       .locator("[data-ruler]")
       .click({ position: { x: (TAKE_BASE_SEC + 2) * PX_PER_SEC, y: 15 } });
-    await expect.poll(async () => Math.abs((await playerPosition(desk)) - 2)).toBeLessThan(0.1);
+    // W6-B: positions are session-absolute (the ruler click's own x).
+    await expect
+      .poll(async () => Math.abs((await playerPosition(desk)) - (TAKE_BASE_SEC + 2)))
+      .toBeLessThan(0.1);
     await desk.keyboard.press("c");
     const composer = desk.getByLabel("Comment text");
     await expect(composer).toBeFocused();
@@ -144,9 +147,7 @@ test.describe("ruler hit targets (F11)", () => {
     const midX = (TAKE_BASE_SEC + 2.33) * PX_PER_SEC; // ≈ 80 px, take-time 2.33 s
     await desk.locator("[data-ruler]").click({ position: { x: midX, y: 22 } });
     await expect
-      .poll(async () =>
-        Math.abs((await playerPosition(desk)) - (midX / PX_PER_SEC - TAKE_BASE_SEC)),
-      )
+      .poll(async () => Math.abs((await playerPosition(desk)) - midX / PX_PER_SEC))
       .toBeLessThan(0.1);
 
     // --- (b) the tick's own pixels are topmost where it sits ----------------
@@ -155,21 +156,22 @@ test.describe("ruler hit targets (F11)", () => {
     // --- (c) clicking the tick seeks to the comment --------------------------
     await desk.locator("[data-comment-tick]").click({ timeout: 5_000 });
     await expect
-      .poll(async () => Math.abs((await playerPosition(desk)) - commentAtSec))
+      .poll(async () => Math.abs((await playerPosition(desk)) - (TAKE_BASE_SEC + commentAtSec)))
       .toBeLessThan(0.05);
 
     // --- (d) head-band ruler background past the chip still seeks -----------
     const headX = (TAKE_BASE_SEC + 3) * PX_PER_SEC + 4; // ≈ 100 px, take-time ≈ 3.17 s
     await desk.locator("[data-ruler]").click({ position: { x: headX, y: 8 } });
     await expect
-      .poll(async () =>
-        Math.abs((await playerPosition(desk)) - (headX / PX_PER_SEC - TAKE_BASE_SEC)),
-      )
+      .poll(async () => Math.abs((await playerPosition(desk)) - headX / PX_PER_SEC))
       .toBeLessThan(0.1);
 
-    // The flag itself still seeks to the marker (visuals + behavior intact).
+    // The flag itself still seeks to the marker (visuals + behavior intact;
+    // the marker sits at take-time 1 = session TAKE_BASE_SEC + 1).
     await desk.getByRole("button", { name: "Marker Song 1", exact: true }).click();
-    await expect.poll(async () => Math.abs((await playerPosition(desk)) - 1)).toBeLessThan(0.05);
+    await expect
+      .poll(async () => Math.abs((await playerPosition(desk)) - (TAKE_BASE_SEC + 1)))
+      .toBeLessThan(0.05);
 
     await phone.close();
     await desk.close();

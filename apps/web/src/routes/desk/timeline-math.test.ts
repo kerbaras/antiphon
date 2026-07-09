@@ -4,7 +4,12 @@ import {
   normalizeAlignDeltas,
   planSource,
   resolveRange,
+  type SessionTakeSpan,
+  sessionEndSec,
+  sessionStartSec,
   type TrackTiming,
+  takesToMount,
+  takesToRelease,
   trackEndSec,
 } from "./timeline-math";
 
@@ -185,6 +190,56 @@ describe("alignShifts (W6-C visual composition)", () => {
     }
     // Every shift is a rightward (≥ 0) move — never off the left edge.
     for (const shift of shiftSec.values()) expect(shift).toBeGreaterThanOrEqual(0);
+  });
+});
+
+// ---- W6-B — session spans / look-ahead scheduler math ---------------------------
+
+const SPANS: SessionTakeSpan[] = [
+  { takeId: "t1", startSec: 1, endSec: 5 },
+  { takeId: "t2", startSec: 7, endSec: 12 },
+  { takeId: "t3", startSec: 20, endSec: 26 },
+];
+
+describe("session spans (W6-B)", () => {
+  it("session start/end come from the outermost clip edges", () => {
+    expect(sessionStartSec(SPANS)).toBe(1);
+    expect(sessionEndSec(SPANS)).toBe(26);
+    expect(sessionStartSec([])).toBe(0);
+    expect(sessionEndSec([])).toBe(0);
+  });
+
+  it("mounts the takes intersecting the look-ahead window, nearest first", () => {
+    // Playhead mid-take-1 with a 15 s window: t1 is already mounted, t2
+    // starts inside the window, t3 (start 20 > 3+15) stays out.
+    expect(takesToMount(SPANS, (id) => id === "t1", 3, 15)).toEqual(["t2"]);
+    // Wider window reaches t3 too — start order, not span order.
+    expect(
+      takesToMount([SPANS[2] as SessionTakeSpan, SPANS[1] as SessionTakeSpan], () => false, 3, 30),
+    ).toEqual(["t2", "t3"]);
+  });
+
+  it("a take already behind the playhead never mounts", () => {
+    // Playhead in the t2..t3 gap: t1 ended, t2 ended at 12 < 13.
+    expect(takesToMount(SPANS, () => false, 13, 15)).toEqual(["t3"]);
+  });
+
+  it("a seek into a gap mounts only the NEXT take, not the passed ones", () => {
+    expect(takesToMount(SPANS, () => false, 5.5, 15)).toEqual(["t2", "t3"]);
+    expect(takesToMount(SPANS, () => false, 5.5, 3)).toEqual(["t2"]);
+  });
+
+  it("releases mounted takes that ended beyond the margin, keeping the selected one", () => {
+    // Playhead at 11 (inside t2): t1 ended at 5, margin 5 → 5 < 11−5.
+    expect(takesToRelease(SPANS, ["t1", "t2"], 11, null, 5)).toEqual(["t1"]);
+    // Not yet past the margin at 9.9.
+    expect(takesToRelease(SPANS, ["t1", "t2"], 9.9, null, 5)).toEqual([]);
+    // The selected take is never released, however far behind.
+    expect(takesToRelease(SPANS, ["t1", "t2"], 25, "t1", 5)).toEqual(["t2"]);
+  });
+
+  it("releases mounted takes the plan no longer knows (deleted)", () => {
+    expect(takesToRelease(SPANS, ["gone", "t2"], 8, null, 5)).toEqual(["gone"]);
   });
 });
 

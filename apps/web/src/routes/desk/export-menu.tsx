@@ -21,7 +21,12 @@ export interface ExportMenuProps {
    * take and per song alike. The menu shows it; the page owns it. */
   stemFormat: StemFormat;
   onStemFormat: (format: StemFormat) => void;
+  /** THE master (W6-B): the whole session — every take at its room
+   * offset, silence between. */
   onMaster: () => void;
+  /** The selected take's mix alone — the pre-W6-B master, kept as its own
+   * row (capability never silently removed). */
+  onTakeMaster: () => void;
   onStems: () => void;
   onSong: (song: Song) => void;
   onSongStems: (song: Song) => void;
@@ -62,6 +67,7 @@ export function ExportMenu({
   stemFormat,
   onStemFormat,
   onMaster,
+  onTakeMaster,
   onStems,
   onSong,
   onSongStems,
@@ -108,11 +114,21 @@ export function ExportMenu({
             role="menu"
             className="absolute top-[calc(100%+6px)] right-0 z-[20] w-[272px] rounded-lg border border-edge-card bg-card p-1 shadow-[0_10px_28px_rgba(0,0,0,.55)]"
           >
+            {/* W6-B: "Master mix" IS the session now — every take at its
+                room offset, silence between (the operator's ask). The
+                selected take's own mix keeps a row: capability is never
+                silently removed. */}
             <ExportItem
               title="Master mix"
-              hint="WAV · 24-bit · 48 kHz"
+              hint="WAV · whole session"
               disabled={!canRender}
               onClick={pick(onMaster)}
+            />
+            <ExportItem
+              title="Loaded take mix"
+              hint="WAV · 24-bit · 48 kHz"
+              disabled={!canRender}
+              onClick={pick(onTakeMaster)}
             />
             {/* Stems row: the title exports, the trailing toggle picks the
                 archive format (W5-C) — same mono 24-bit audio either way,

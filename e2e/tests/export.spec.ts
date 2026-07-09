@@ -53,13 +53,17 @@ test.describe("export (W2-A)", () => {
     // --- master mix WAV ----------------------------------------------------
     // The menu button unlocks on convergence; the render item additionally
     // waits for playback readiness (take decoded + aligned).
+    // W6-B: "Master mix" renders the SESSION now (session-tagged filename);
+    // with this spec's single take that is the same audio as the old
+    // per-take master, so every structural assertion below stands. The
+    // per-take row ("Loaded take mix") is covered by session-playback.spec.
     const exportButton = desk.getByRole("button", { name: "Export ▾" });
     await expect(exportButton).toBeEnabled({ timeout: 30_000 });
     await exportButton.click();
     const masterItem = desk.getByRole("menuitem", { name: /master mix/i });
     await expect(masterItem).toBeEnabled({ timeout: 30_000 });
     const [masterDownload] = await Promise.all([desk.waitForEvent("download"), masterItem.click()]);
-    expect(masterDownload.suggestedFilename()).toMatch(/^take-\d{2}-master\.wav$/);
+    expect(masterDownload.suggestedFilename()).toMatch(/^session-[0-9a-f]{8}-master\.wav$/);
     const master = parseWav(await readFile(await masterDownload.path()));
     expect(master.channels).toBe(2);
     expect(master.sampleRate).toBe(48_000);

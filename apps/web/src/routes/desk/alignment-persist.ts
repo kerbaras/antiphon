@@ -48,7 +48,7 @@ export interface CollabDocHandle {
   origin: unknown;
 }
 
-/** The slice of TakePlayer this module needs. */
+/** The slice of SessionPlayer this module needs. */
 export interface AlignmentPlayerPort {
   snapshot(): PlayerSnapshot;
   restoreAlignment(takeId: string, entries: Record<string, StoredTrackAlignment>): boolean;
@@ -339,6 +339,18 @@ function reconcile(
   if (winner !== fromDoc) writeDocAlignmentIfChanged(collab.doc, takeId, winner, collab.origin);
   if (winner !== local) saveLocalAlignment(sessionId, takeId, winner);
   return winner;
+}
+
+/** Read a take's persisted verdict without a player in the loop (W6-B:
+ * the engine's look-ahead mounts and the session render apply verdicts to
+ * takes that were never selected). Runs the same newest-wins reconcile as
+ * a restore, so both layers converge as a side effect. */
+export function readTakeAlignment(
+  collab: CollabDocHandle,
+  sessionId: string,
+  takeId: string,
+): TakeAlignment | null {
+  return reconcile(collab, sessionId, takeId)?.entries ?? null;
 }
 
 /** Reapply a persisted verdict to a freshly loaded take. Returns true when

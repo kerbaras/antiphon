@@ -192,7 +192,10 @@ test.describe("timeline polish (F17 + zoom anchor + min-width badges)", () => {
     await expect.poll(async () => await loadedTakeId(desk), { timeout: 30_000 }).toBe(take1);
     const seekX = (TAKE_BASE_SEC + 1.75) * PX_PER_SEC;
     await desk.locator("[data-ruler]").click({ position: { x: seekX, y: 22 } });
-    await expect.poll(async () => Math.abs((await playerPosition(desk)) - 1.75)).toBeLessThan(0.1);
+    // W6-B: session-absolute position — the clicked arrangement second.
+    await expect
+      .poll(async () => Math.abs((await playerPosition(desk)) - (TAKE_BASE_SEC + 1.75)))
+      .toBeLessThan(0.1);
 
     const playhead = desk.locator("[data-playhead]");
     await expect(playhead).toBeVisible();

@@ -148,7 +148,9 @@ test.describe("content alignment (W4-B)", () => {
     // lanes' envelopes: near-identical content aligned by the schedule must
     // correlate at ≈ zero lag (a broken application would read the raw
     // ~1.5-2.5 s capture stagger instead). One schedule pass, gapless-style.
-    const residual = await measureLaneOffset(desk, 6);
+    // W6-B domain note: play() takes SESSION seconds — the take head sits
+    // at +1 s on the arrangement (the helper's content-full rule).
+    const residual = await measureLaneOffset(desk, 6, 1);
     expect(Math.abs(residual.lagSec)).toBeLessThanOrEqual(0.05);
     expect(residual.r).toBeGreaterThan(0.9);
     expect(residual.scheduleCount).toBe(1);

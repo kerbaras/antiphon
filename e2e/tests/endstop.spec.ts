@@ -1,9 +1,13 @@
 // F12 regression — end-of-take auto-stop must not desync UI vs engine.
+// W6-B promoted the rule to end-of-SESSION with the transport scope: with
+// this spec's single take, the session end IS the take's end (plus its
+// +1 s arrangement base), and "restart from the top" means session zero —
+// the assertions below hold under both readings, by construction.
 //
 // One phone records a short take; once it converges and auto-loads, Play
 // runs it to the end. The meter loop's auto-stop must leave the desk UI
 // (last notified snapshot — what the timecode renders) and the engine
-// (`position()`) agreeing: both parked AT the take end, exactly like a
+// (`position()`) agreeing: both parked AT the session end, exactly like a
 // user pause on the last frame. Pressing Play from that parked end then
 // restarts from the top (play()'s own return-to-start guard) with a live
 // meter loop — the playhead visibly advances again.

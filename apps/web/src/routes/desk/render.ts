@@ -37,7 +37,7 @@ export interface RenderTrackModel {
 }
 
 /** Everything an export needs, snapshotted from the player at render time
- * (TakePlayer.renderModel). */
+ * (SessionPlayer.renderModel). */
 export interface RenderModel {
   takeId: string;
   /** Whole-take room-timeline length (player.duration()). */
@@ -123,6 +123,92 @@ export async function renderStems(model: RenderModel, range?: RenderRange): Prom
     });
   }
   return stems;
+}
+
+// ---- session master render (W6-B) ------------------------------------------------
+// The operator's ask: "master render should render the entire session, not
+// the take you are in." Sequential per-take renderMaster passes — the SAME
+// planSource math as playback and every per-take export — mixed into one
+// session-length stereo buffer at each take's room offset. Gaps are zeros.
+// Memory bounds like playback: one take's decoded audio lives at a time
+// (modelOf decodes on demand; renderMaster's output is the only long-lived
+// PCM, and it IS the deliverable).
+
+/** One take's slot in the session render, from player.sessionRenderPlan(). */
+export interface SessionRenderSegment {
+  takeId: string;
+  /** Arrangement position of the take's base (leftmost clip). */
+  baseSec: number;
+  /** Declared end (pre-alignment) — sizes the allocation; the actual
+   * rendered ends trim the result. */
+  declaredEndSec: number;
+}
+
+export interface SessionMix {
+  /** Stereo PCM, session length: first clip start → last take's end. */
+  channelData: [Float32Array, Float32Array];
+  sampleRate: number;
+  durationSec: number;
+}
+
+/** Estimated on-disk size of the session master WAV (24-bit stereo) — the
+ * pre-render length guard's number. */
+export function estimateSessionWavBytes(spanSec: number): number {
+  return 44 + Math.ceil(spanSec * RENDER_SAMPLE_RATE) * 2 * 3;
+}
+
+/** Render the whole session: every take mixed at its room offset, silence
+ * between. The output timeline starts at the FIRST clip's start (the
+ * arrangement's leading second is desk furniture, not recorded silence) —
+ * so a single-take session renders exactly what the per-take master
+ * renders. Takes render sequentially through `modelOf`; a take that can't
+ * build a model throws — a master with a silent hole would be a lie. */
+export async function renderSessionMaster(
+  segments: readonly SessionRenderSegment[],
+  modelOf: (takeId: string) => Promise<RenderModel | null>,
+): Promise<SessionMix> {
+  if (segments.length === 0) throw new Error("no takes to render");
+  const startSec = Math.min(...segments.map((s) => s.baseSec));
+  // Allocate against the declared ends plus drift slack (a slow source
+  // clock stretches on the room timeline — 1 s covers 1000 ppm over hours),
+  // then trim to the actual rendered end.
+  const declaredEnd = Math.max(...segments.map((s) => s.declaredEndSec));
+  const capacity = Math.ceil((declaredEnd - startSec + 1) * RENDER_SAMPLE_RATE);
+  const out: [Float32Array, Float32Array] = [
+    new Float32Array(capacity),
+    new Float32Array(capacity),
+  ];
+  let endSample = 0;
+  for (const segment of [...segments].sort((a, b) => a.baseSec - b.baseSec)) {
+    const model = await modelOf(segment.takeId);
+    if (!model) throw new Error(`take ${segment.takeId.slice(0, 8)} is not renderable`);
+    const rendered = await renderMaster(model);
+    const offset = Math.round((segment.baseSec - startSec) * RENDER_SAMPLE_RATE);
+    for (let ch = 0; ch < 2; ch++) {
+      const src = rendered.getChannelData(Math.min(ch, rendered.numberOfChannels - 1));
+      const dst = out[ch] as Float32Array;
+      const n = Math.min(src.length, capacity - offset);
+      // MIX (+=), not overwrite: takes never overlap in a stock session,
+      // but a dragged arrangement that overlaps them still sums honestly.
+      for (let i = 0; i < n; i++) {
+        dst[offset + i] = (dst[offset + i] ?? 0) + (src[i] as number);
+      }
+      endSample = Math.max(endSample, offset + n);
+    }
+  }
+  // subarray, not slice (QA M-4): slice would transiently DOUBLE the
+  // session-length float pair just to drop the ≤1 s drift slack. Aliasing
+  // is safe here — encodeWav only READS the channels into its own fresh
+  // ArrayBuffer, and the SessionMix (with its slack-sized backing) is
+  // transient export state either way.
+  return {
+    channelData: [
+      (out[0] as Float32Array).subarray(0, endSample),
+      (out[1] as Float32Array).subarray(0, endSample),
+    ],
+    sampleRate: RENDER_SAMPLE_RATE,
+    durationSec: endSample / RENDER_SAMPLE_RATE,
+  };
 }
 
 /** Schedule one track into an offline graph — the same plan live playback

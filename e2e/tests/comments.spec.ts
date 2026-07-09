@@ -126,7 +126,11 @@ test.describe("comments with mark-as-done (W2-F)", () => {
     await desk
       .locator("[data-ruler]")
       .click({ position: { x: (TAKE_BASE_SEC + 2) * PX_PER_SEC, y: 15 } });
-    await expect.poll(async () => Math.abs((await playerPosition(desk)) - 2)).toBeLessThan(0.1);
+    // W6-B: the transport clock is session-absolute — a ruler click parks
+    // the engine at the clicked ARRANGEMENT second (comments stay take-local).
+    await expect
+      .poll(async () => Math.abs((await playerPosition(desk)) - (TAKE_BASE_SEC + 2)))
+      .toBeLessThan(0.1);
     await desk.keyboard.press("c");
     await expect(composer).toBeFocused();
     await desk.getByLabel("Pin comment to lane").selectOption({ index: 1 });
@@ -154,7 +158,7 @@ test.describe("comments with mark-as-done (W2-F)", () => {
     // --- row timecode click seeks the playhead --------------------------------
     await desk.locator(`[data-comment="${first.id}"]`).getByTitle("Seek to comment").click();
     await expect
-      .poll(async () => Math.abs((await playerPosition(desk)) - first.atSec))
+      .poll(async () => Math.abs((await playerPosition(desk)) - (TAKE_BASE_SEC + first.atSec)))
       .toBeLessThan(0.05);
 
     // --- resolve: badge drops, tick dims, Open filter hides the row -----------
