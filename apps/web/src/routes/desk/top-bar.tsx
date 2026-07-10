@@ -1,6 +1,5 @@
 // Top bar (48px): wordmark + session identity, the centered transport
-// cluster, avatar stack (its "+" opens the invite popover), export menu —
-// as in the prototype.
+// cluster, avatar stack (its "+" opens the invite popover), export menu.
 
 import type { PeerInfo } from "@antiphon/protocol";
 import { lazy, Suspense, useRef, useState } from "react";
@@ -15,15 +14,13 @@ import type { PlayerSnapshot } from "./player";
 import { deviceName, initialsOf, TRACK_COLORS } from "./track-model";
 import { getDeskSession, getPlayer } from "./use-desk";
 
-/** W8-A: Share (desk access by email) + UserButton — auth mode only, lazy
- * so keyless desks never load Clerk chrome. */
+/** Account button — auth mode only, lazy so keyless desks never load
+ * Clerk chrome. */
 const AccountCluster = lazy(() => import("./account-cluster"));
 
 /** THE transport button's ▶-face gate, shared with the global Space
- * shortcut (W5-B): Space must be a no-op exactly when ▶ is disabled.
- * QA hit the gap twice — while a take decodes (playerSnap.loading) the
- * button honestly refuses, but Space could still reach toggle() and play
- * the previous take. One predicate, both callers: parity by construction. */
+ * shortcut: Space must be a no-op exactly when ▶ is disabled (e.g. while a
+ * take decodes). One predicate, both callers: parity by construction. */
 export function playActionReady(playerLoaded: boolean, playerSnap: PlayerSnapshot): boolean {
   return playerLoaded && !playerSnap.loading;
 }
@@ -48,7 +45,7 @@ export function DeskTopBar({
   sessionId: string;
   joinUrl: string;
   phones: PeerInfo[];
-  /** Other desks in the room (W3-A presence) — real people, real avatars. */
+  /** Other desks in the room — real people, real avatars. */
   remoteDesks: Array<{ clientId: number; name: string; color: string; avatarUrl: string | null }>;
   deskInputLive: boolean;
   serverSync: DeskSessionState["serverSync"];
@@ -62,38 +59,17 @@ export function DeskTopBar({
   streamCount: number;
   exportMenu: ExportMenuProps;
 }) {
-  // The "+" on the avatar stack is THE invite affordance (W4-D) — and its
-  // popover holds the desk's ONLY join QR (W6-A retired the performers
-  // tab's wall-poster copy, and with it the W5-B yield plumbing that had
-  // this state living with the orchestrator). Nobody else cares: local.
+  // The "+" on the avatar stack is THE invite affordance; its popover
+  // holds the desk's only join QR. Nobody else cares: local state.
   const [inviteOpen, setInviteOpen] = useState(false);
   const inviteAnchor = useRef<HTMLButtonElement>(null);
-  // W8-A: the "+" stays the MIC invite (public link); desk-access sharing
-  // and the operator's account render as their own cluster beside it,
-  // auth mode only — keyless top bars are unchanged.
   const authMode = useAuthMode();
-  // The operator's own face (A16): signed-in pfp over the DK disc.
   const me = useAuthUser();
 
   return (
-    // Left and right groups are equal flex shares (flex-1 basis-0), so at
-    // full width the transport cluster sits dead-center exactly like the
-    // prototype's absolute centering — but when the viewport narrows the
-    // cluster claims its space first (shrink-0) and the session-title block
-    // truncates into its own share instead of running underneath (F15).
-    //
-    // Below that, the bar sheds tiers instead of self-overlapping (W5-B —
-    // QA clamped to 430px and watched the right group run over the
-    // transport): stat chips go first (<1200, F15), then the wordmark
-    // lettering (<840 — the mark stays; the session title is the working
-    // identity), then the timecode and the presence avatars (<640 — the
-    // "+" invite affordance survives; the boundary sits where the title
-    // still keeps a legible width WITH those pieces on screen — at the
-    // old 560 the title crushed to ~2 chars right at the tier edge, QA
-    // F5). The right group refuses to shrink below its content
-    // (min-w-fit): overflow claims the flexible title, never the
-    // neighbouring cluster. index.tsx floors the whole desk at 520px —
-    // beyond every tier, the page scrolls rather than explodes.
+    // Equal flex shares center the transport at full width; narrower, the
+    // sweep-pinned tiers shed (stat chips <1200, wordmark lettering <840,
+    // timecode + presence avatars <640) and the flexible title truncates.
     <header className="flex items-center gap-4 border-b border-divider bg-panel px-3.5">
       <div className="flex min-w-0 flex-1 items-center gap-3.5">
         <Wordmark textClassName="hidden min-[840px]:block" />
@@ -111,7 +87,7 @@ export function DeskTopBar({
         </div>
       </div>
 
-      {/* Centered transport cluster, as in the prototype */}
+      {/* Centered transport cluster */}
       <div className="flex shrink-0 items-center gap-2.5">
         {/* Screen readers hear take/transport changes; visually the
             record button + timecode already carry this. */}
@@ -126,16 +102,9 @@ export function DeskTopBar({
           >
             ⏮
           </TransportButton>
-          {/* THE transport button (W4-D): one context-aware control whose
-              face IS the transport state — ■ Stop while a take rolls
-              (stopping is the only sane transport action then; record and
-              playback stay mutually exclusive), ⏸ Pause while playing,
-              ▶ Play when idle. Recording wins the precedence, exactly like
-              the Space shortcut in index.tsx always has. Stop never gates
-              on the player or on signaling: a rolling take must stay
-              stoppable even mid-server-restart (the recovery e2e relies on
-              it); Play alone waits for a loaded, decoded take
-              (playActionReady — the Space shortcut shares the gate). */}
+          {/* Face IS the transport state: ■ Stop while a take rolls
+              (recording wins), ⏸ while playing, ▶ idle. Stop never gates on
+              player/signaling; Play alone waits for playActionReady. */}
           <TransportButton
             label={recording ? "Stop take" : playerSnap.playing ? "Pause" : "Play"}
             tone="accent"
@@ -147,8 +116,7 @@ export function DeskTopBar({
                 return;
               }
               // Re-validated at event time on the live snapshot, exactly
-              // like the Space guard (QA F4): disabled= should make this
-              // unreachable, but both paths run the one predicate.
+              // like the Space guard: both paths run the one predicate.
               if (playActionReady(playerLoaded, getPlayer().snapshot())) getPlayer().toggle();
             }}
           >
@@ -196,7 +164,6 @@ export function DeskTopBar({
                 title: "You (Desk)",
                 avatarUrl: me?.imageUrl ?? null,
               },
-              // Other desks co-editing this session (W3-A presence).
               ...remoteDesks.slice(0, 3).map((d) => ({
                 id: `desk-${d.clientId}`,
                 initials: initialsOf(d.name) ?? "D",

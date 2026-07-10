@@ -1,8 +1,6 @@
-// Boot-time capability gate for the audio-bearing routes. The desk and the
-// phone recorder need cross-origin isolation (COOP/COEP → SharedArrayBuffer
-// for the capture ring) and AudioWorklet; opened from a plain static host
-// the app used to crash cryptically at the first `new SharedArrayBuffer`.
-// State exactly what is missing and why instead. No polyfills.
+// Boot-time capability gate for the audio-bearing routes: they need
+// cross-origin isolation (COOP/COEP → SharedArrayBuffer for the capture
+// ring) and AudioWorklet. State exactly what is missing; no polyfills.
 
 import type { ReactNode } from "react";
 import { MonoReadout, Panel, SectionLabel, Wordmark } from "./components";

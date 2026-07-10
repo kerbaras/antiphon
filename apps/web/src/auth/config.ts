@@ -1,10 +1,6 @@
-// W8-A auth-mode boot probe. The SERVER is the source of truth for whether
-// auth is enforced (GET /api/auth/config, public in both modes): a single
-// web build then behaves correctly against keyless AND authed servers —
-// which is also what makes the keyless e2e suite deterministic while a real
-// key sits baked in a local dist. The publishable key prefers the build-time
-// VITE_CLERK_PUBLISHABLE_KEY (PM-provisioned .env.local) and falls back to
-// the server-provided one (publishable keys are public by definition).
+// Auth-mode boot probe. The SERVER is the source of truth for whether auth
+// is enforced (GET /api/auth/config, public in both modes), so one web build
+// behaves correctly against keyless AND authed servers.
 
 export type AuthMode = { mode: "keyless" } | { mode: "clerk"; publishableKey: string };
 

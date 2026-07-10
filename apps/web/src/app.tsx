@@ -7,9 +7,9 @@ import { JoinRoute } from "./routes/join";
 
 // Audio-bearing routes sit behind the capability gate (COOP/COEP →
 // SharedArrayBuffer, AudioWorklet); the landing page renders anywhere.
-// The desk additionally sits behind the W8-A access gate (owner/sharee in
-// auth mode; pass-through keyless) — the join route NEVER does: mic join
-// is a public bearer capability (RFC §12).
+// The desk additionally sits behind the access gate (owner/sharee in auth
+// mode; pass-through keyless) — the join route NEVER does: mic join is a
+// public bearer capability (RFC §12).
 const desk = (
   <CapabilityGate>
     <DeskAccessGate>

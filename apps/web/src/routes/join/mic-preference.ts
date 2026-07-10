@@ -1,11 +1,6 @@
-// Phone mic preference (W4-F): which input the performer picked, persisted
-// so the next visit records on the same mic. Stored as {deviceId, label}
-// because deviceIds are NOT durable — iOS Safari re-mints them when site
-// data clears (and historically per browsing session) — so the label is the
-// recovery key: a rotated id with a familiar label is the same physical mic.
-// Storage guards follow device-identity.ts: never throw, degrade to
-// "no preference" (the default mic), because a stale preference must never
-// cost a take.
+// Persisted mic choice, stored as {deviceId, label}: deviceIds are NOT
+// durable (iOS Safari re-mints them), so the label is the recovery key.
+// Storage never throws — degrade to "no preference" (the default mic).
 
 export const MIC_PREF_KEY = "antiphon:mic-input";
 

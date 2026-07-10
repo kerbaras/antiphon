@@ -1,14 +1,6 @@
-// project.json (W3-B): the schema-versioned manifest inside every project
-// export. The WAVs carry the audio; this file carries everything else the
-// desk knows — identity, lane names, the full mixer state (EQ included),
-// song markers, comments, and the alignment/drift measurements that were
-// baked into the stems. It is the honest interchange format: any DAW (or
-// script) can reconstruct the session from `stems/*.wav` + this file, and
-// the .als / Logic packages are conveniences layered on top of it.
-//
-// Pure data in, JSON-safe object out — the builder never touches audio
-// buffers or the DOM, so the schema round-trips under plain JSON and is
-// unit-testable byte-for-byte.
+// project.json: the schema-versioned manifest inside every project export.
+// The WAVs carry the audio; this carries everything else the desk knows.
+// Pure data in, JSON-safe object out — the builder never touches audio.
 
 import type { TakeComment } from "./comments";
 import type { EqState } from "./eq";
@@ -44,12 +36,10 @@ export interface ManifestStem {
    * (nickname when set). */
   lane: { key: string; name: string; peerId: string | null };
   mixer: ManifestMixer;
-  /** Raw alignment measurement. `method` "chirp" (or absent): `lagSamples`
-   * = the RFC §10 sweep's position in this stream's own samples. `method`
-   * "content" (W4-B fallback): the same lag domain, derived from content
-   * cross-correlation against the reference stream. `applied` = the fit
-   * was confident enough to schedule with. null = the take was never
-   * aligned. (Field keeps its v1 name for schema stability.) */
+  /** Raw alignment measurement. `method` "chirp" (or absent): the RFC §10
+   * sweep's position in this stream's own samples; "content": same lag
+   * domain via cross-correlation. `applied` = confident enough to schedule
+   * with; null = never aligned. (Keeps its v1 name for schema stability.) */
   chirp: AlignmentResult | null;
   /** Clock-drift fit vs the reference stream: `ratio` is
    * target_clock/reference_clock (played back as playbackRate), `ppm` the
@@ -78,9 +68,8 @@ export interface ProjectManifest {
   /** WAV bit depth (integer PCM). */
   bitDepth: number;
   /** The slice of the take's room timeline this package renders, seconds
-   * (0 = take head after alignment) — where the exported WAVs sit in the
-   * source take. Whole-take exports declare {0, takeDuration}; per-song
-   * exports (W5-C) declare the song's span. */
+   * (0 = take head after alignment). Whole-take exports declare
+   * {0, takeDuration}; per-song exports declare the song's span. */
   range: { startSec: number; endSec: number };
   /** The desk's reference mixdown — all mixer/master state applied. */
   master: { file: string; gainDb: number; pan: number; eq: EqState };
@@ -120,7 +109,7 @@ export interface ManifestInput {
   range: { startSec: number; endSec: number };
   /** The take's full room-timeline length — lets the slicer recognize a
    * range that runs to the true take end (whose end is inclusive: no next
-   * song exists past it — QA M-1). */
+   * song exists past it). */
   takeDurationSec: number;
   masterFile: string;
   masterDb: number;
@@ -140,12 +129,8 @@ export interface ManifestInput {
 export function buildProjectManifest(input: ManifestInput): ProjectManifest {
   const stripOf = new Map(input.channels.map((c) => [c.key, c]));
   const laneOf = new Map(input.lanes.map((l) => [l.key, l]));
-  // Honest range slicing (W5-C): only events inside the exported span, on
-  // the exported timeline (0 = range head, matching the WAVs). Half-open —
-  // an event AT endSec belongs to the next song, not to a zero-length tail
-  // (the same rule als.ts uses for locators) — EXCEPT at the take's true
-  // end, where no next song exists (QA M-1): whole-take exports and a
-  // final-song range keep an event parked exactly on the end.
+  // Honest range slicing: only events inside the exported span, rebased
+  // onto the exported timeline (0 = range head, matching the WAVs).
   const markers = rebased(input.markers, input.range, input.takeDurationSec);
   const comments = rebased(input.comments, input.range, input.takeDurationSec);
   return {
@@ -197,8 +182,7 @@ export function buildProjectManifest(input: ManifestInput): ProjectManifest {
 /** Filter timeline events to [startSec, endSec) and rebase onto the
  * exported timeline. The end bound turns inclusive when the range runs to
  * the take's true end — a boundary event belongs to the NEXT song, and
- * past the take end there is no next song (QA M-1). Order-preserving;
- * copies, never mutates. */
+ * past the take end there is no next song. Copies, never mutates. */
 function rebased<T extends { atSec: number }>(
   events: readonly T[],
   range: { startSec: number; endSec: number },

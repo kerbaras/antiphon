@@ -1,33 +1,27 @@
-// Ingest: the server's sink. node-datachannel (libdatachannel underneath)
-// terminates DTLS/SCTP; the WASM SinkEngine (the same one the desk runs)
-// makes every protocol decision; the Archive persists.
-//
-// KEEP ISOLATED. This module is the designated extraction candidate for
-// Axum + webrtc-rs if hosted-product scale ever demands it. It speaks only
-// the idempotent chunk protocol and the Archive interface — no reaching
-// into signaling or HTTP. (docs/ARCHITECTURE.md §2.3, §7)
-//
-// Durability contract: an ACK is a claim that a chunk is persisted. All
-// ingest work is serialized on a per-session promise chain, and ACKs join
-// the same chain — an ACK can never overtake the persistence of a chunk it
-// covers. A persistence failure poisons the session: channels drop, the
-// engine rebuilds from the database (RFC §8 crash recovery), reconnection
-// resumes normally. Fail-stop, never fail-silent.
+// Ingest: the server's sink. node-datachannel terminates DTLS/SCTP, the
+// WASM SinkEngine makes every protocol decision, the Archive persists.
+// Kept isolated: speaks only the chunk protocol + Archive (ARCHITECTURE §7).
 
-import {
-  init as initWasm,
-  SinkEngine,
-  stream_header_json,
-  TimeSyncSession,
-} from "@antiphon/core-wasm";
+import type { SinkEngine } from "@antiphon/core-wasm";
 import nodeDataChannel from "node-datachannel";
 import type { Archive } from "../archive/index.ts";
 import { createLogger, type Logger } from "../logger.ts";
-import { CHANNEL_LABELS, uuidBytes } from "./util.ts";
+import { ensureStreamPersisted, type FrameHost, processFrame } from "./frames.ts";
+import {
+  type ChannelHost,
+  type IngestCallbacks,
+  nowUs,
+  openPeerLink,
+  type PeerLink,
+  safeSend,
+  sendAcksTo,
+} from "./link.ts";
+import { rebuildEngine } from "./rebuild.ts";
+import { uuidBytes } from "./util.ts";
 
-const { PeerConnection } = nodeDataChannel;
+export type { IngestCallbacks } from "./link.ts";
+
 type DataChannel = nodeDataChannel.DataChannel;
-type NdcPeerConnection = nodeDataChannel.PeerConnection;
 
 const moduleLog = createLogger({ module: "ingest" });
 
@@ -40,48 +34,6 @@ if (process.env.ANTIPHON_RTC_LOG) {
 
 const ACK_INTERVAL_MS = 2_000;
 const TIME_SYNC_INTERVAL_MS = 5_000;
-/** Stop pushing into a channel above this buffered amount (bytes). */
-const HIGH_WATERMARK = 1 << 20;
-const LOW_WATERMARK = 256 * 1024;
-
-export interface IngestCallbacks {
-  /** Relay a local ICE candidate to the peer via the control plane. */
-  onLocalCandidate(peerId: string, candidate: string, mid: string): void;
-  /** Surface a fatal protocol condition on the control plane (§11). */
-  onFatal(peerId: string, code: string, message: string): void;
-}
-
-interface PeerLink {
-  pc: NdcPeerConnection;
-  /** Recorder data channel (antiphon/1) once open. */
-  dataChannel: DataChannel | null;
-  /** Desk sync channel (antiphon-sync/1) once open. */
-  syncChannel: DataChannel | null;
-  timeSync: TimeSyncSession;
-  /** Chunk keys queued for sink→sink push, oldest first. */
-  pushQueue: Array<{ takeId: string; streamId: string; seq: number }>;
-  pushing: boolean;
-  closed: boolean;
-}
-
-interface ChunkMetaJson {
-  takeId: string;
-  streamId: string;
-  seq: number;
-  firstSampleIndex: number;
-  sampleCount: number;
-  captureTsUs: number;
-  crc32c: number;
-  payloadLen: number;
-  chwm: number;
-  detail?: Record<string, number>;
-}
-
-interface RangeListJson {
-  takeId: string;
-  streamId: string;
-  ranges: Array<[number, number]>;
-}
 
 export class SessionIngest {
   private engine: SinkEngine | null = null;
@@ -90,7 +42,6 @@ export class SessionIngest {
   private ackTimer: NodeJS.Timeout | null = null;
   private timeSyncTimer: NodeJS.Timeout | null = null;
   private closed = false;
-  /** Streams whose seq-0 header has been applied to the streams table. */
   private readonly headerApplied = new Set<string>();
   private readonly knownTakes = new Set<string>();
   private readonly knownStreams = new Set<string>();
@@ -99,53 +50,36 @@ export class SessionIngest {
   private readonly archive: Archive;
   private readonly callbacks: IngestCallbacks;
   private readonly log: Logger;
+  private readonly host: ChannelHost & FrameHost;
 
   constructor(sessionId: string, archive: Archive, callbacks: IngestCallbacks) {
     this.sessionId = sessionId;
     this.archive = archive;
     this.callbacks = callbacks;
     this.log = moduleLog.child({ sessionId });
+    this.host = {
+      sessionId,
+      peers: this.peers,
+      log: this.log,
+      archive: this.archive,
+      callbacks: this.callbacks,
+      knownTakes: this.knownTakes,
+      knownStreams: this.knownStreams,
+      headerApplied: this.headerApplied,
+      engine: () => this.engine,
+      getFrame: (takeId, streamId, seq) => this.archive.getFrameBytes(takeId, streamId, seq),
+      enqueue: (task) => this.enqueue(task),
+      processFrame: (peerId, link, dc, bytes) => this.processFrame(peerId, link, dc, bytes),
+      closePeer: (peerId) => this.closePeer(peerId),
+    };
   }
 
-  /** Rebuild receiver state from durable storage (RFC §8): the server
-   * rejoins its own archive as if it had merely been disconnected. */
   async init(): Promise<void> {
-    await initWasm();
-    const engine = new SinkEngine();
-    const state = await this.archive.loadSessionState(this.sessionId);
-    for (const chunk of state.chunks) {
-      engine.rebuild_chunk(
-        uuidBytes(chunk.takeId),
-        uuidBytes(chunk.streamId),
-        chunk.seq,
-        chunk.crc32c,
-        chunk.firstSampleIndex,
-        chunk.sampleCount,
-        chunk.payloadLen,
-      );
-      this.knownTakes.add(chunk.takeId);
-      this.knownStreams.add(chunk.streamId);
-    }
-    for (const stream of state.streams) {
-      this.knownStreams.add(stream.id);
-      this.knownTakes.add(stream.takeId);
-      if (stream.finalSeq !== null) {
-        engine.set_final_seq(uuidBytes(stream.takeId), uuidBytes(stream.id), stream.finalSeq);
-      }
-      if (stream.sampleRate !== null) this.headerApplied.add(stream.id);
-    }
-    for (const gap of state.gaps) {
-      const stream = state.streams.find((s) => s.id === gap.streamId);
-      if (stream) {
-        engine.rebuild_gap(
-          uuidBytes(stream.takeId),
-          uuidBytes(gap.streamId),
-          gap.startSeq,
-          gap.endSeq,
-        );
-      }
-    }
-    this.engine = engine;
+    this.engine = await rebuildEngine(this.archive, this.sessionId, {
+      takes: this.knownTakes,
+      streams: this.knownStreams,
+      headerApplied: this.headerApplied,
+    });
     this.ackTimer = setInterval(() => this.enqueue(() => this.sendAcks()), ACK_INTERVAL_MS);
     this.timeSyncTimer = setInterval(() => this.sendTimePings(), TIME_SYNC_INTERVAL_MS);
   }
@@ -164,47 +98,7 @@ export class SessionIngest {
    * answer SDP once available. */
   async handleOffer(peerId: string, sdp: string): Promise<{ sdp: string; type: string }> {
     this.closePeer(peerId);
-    // The empty config is deliberate, not an oversight: the server's host
-    // candidates (the addresses on its NICs) are the whole ICE story. The
-    // WEBRTC_PUBLIC_IP knob CANNOT be wired here — node-datachannel 0.32.x
-    // reads exactly the RtcConfig fields in its type defs (verified against
-    // src/cpp/peer-connection-wrapper.cpp), libdatachannel v0.24's
-    // rtc::Configuration has no externalAddress/1:1-NAT mapping, and
-    // libjuice's agent config (juice_config_t) doesn't either — only its
-    // standalone TURN server does. Until upstream grows that API, a public
-    // IP bound to the NIC is a hard deployment requirement (docs/deploy.md
-    // §5); createServer warns at boot if WEBRTC_PUBLIC_IP is set.
-    const pc = new PeerConnection(`antiphon-${peerId.slice(0, 8)}`, { iceServers: [] });
-    const link: PeerLink = {
-      pc,
-      dataChannel: null,
-      syncChannel: null,
-      timeSync: new TimeSyncSession(),
-      pushQueue: [],
-      pushing: false,
-      closed: false,
-    };
-    this.peers.set(peerId, link);
-
-    pc.onLocalCandidate((candidate, mid) => {
-      if (!link.closed) this.callbacks.onLocalCandidate(peerId, candidate, mid);
-    });
-    pc.onDataChannel((dc) => this.attachChannel(peerId, link, dc));
-    pc.onStateChange((state) => {
-      if ((state === "closed" || state === "failed") && !link.closed) {
-        this.closePeer(peerId);
-      }
-    });
-
-    const answer = new Promise<{ sdp: string; type: string }>((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error("answer timeout")), 10_000);
-      pc.onLocalDescription((sdp, type) => {
-        clearTimeout(timeout);
-        resolve({ sdp, type });
-      });
-    });
-    pc.setRemoteDescription(sdp, "offer");
-    return await answer;
+    return await openPeerLink(this.host, peerId, sdp);
   }
 
   addRemoteCandidate(peerId: string, candidate: string, mid: string): void {
@@ -260,13 +154,13 @@ export class SessionIngest {
 
   noteStream(takeId: string, streamId: string, peerId?: string): void {
     this.enqueue(async () => {
-      await this.ensureStreamPersisted(takeId, streamId, peerId);
+      await ensureStreamPersisted(this.host, takeId, streamId, peerId);
     });
   }
 
   setFinalSeq(takeId: string, streamId: string, finalSeq: number): void {
     this.enqueue(async () => {
-      await this.ensureStreamPersisted(takeId, streamId);
+      await ensureStreamPersisted(this.host, takeId, streamId);
       this.engine?.set_final_seq(uuidBytes(takeId), uuidBytes(streamId), finalSeq);
       await this.archive.setFinalSeq(streamId, finalSeq);
       await this.sendAcks();
@@ -275,10 +169,8 @@ export class SessionIngest {
 
   /** Desk-initiated stream deletion. Engine state goes first — the streams
    * vanish from ACK/HAVE traffic, so no peer can re-push them — then the
-   * archive rows/blobs. Serialized on the ingest chain like all mutations;
-   * on archive failure the chain poisons and rebuilds from the database,
-   * which still holds the rows (delete failed = nothing lost). Resolves
-   * with the take ids that were removed entirely. */
+   * archive rows/blobs. On archive failure the chain poisons and rebuilds
+   * from the database, which still holds the rows (nothing lost). */
   deleteStreams(refs: Array<{ takeId: string; streamId: string }>): Promise<string[]> {
     return new Promise((resolve, reject) => {
       this.enqueue(async () => {
@@ -305,160 +197,14 @@ export class SessionIngest {
 
   // ---- data plane ---------------------------------------------------------
 
-  private attachChannel(peerId: string, link: PeerLink, dc: DataChannel): void {
-    const label = dc.getLabel();
-    if (label === CHANNEL_LABELS.data) link.dataChannel = dc;
-    else if (label === CHANNEL_LABELS.sync) link.syncChannel = dc;
-    else {
-      dc.close();
-      return;
-    }
-    dc.setBufferedAmountLowThreshold(LOW_WATERMARK);
-    dc.onBufferedAmountLow(() => this.drainPushQueue(link));
-    dc.onMessage((msg) => {
-      const bytes = toBytes(msg);
-      if (bytes) this.enqueue(() => this.processFrame(peerId, link, dc, bytes));
-    });
-    dc.onOpen(() => {
-      // §6.4: ACK immediately on (re)connect; sinks also announce HAVEs on
-      // the sync channel so diff push starts without waiting.
-      this.enqueue(async () => {
-        await this.sendAcksTo(dc);
-        if (label === CHANNEL_LABELS.sync) this.sendHaves(dc);
-      });
-    });
-    // node-datachannel may deliver onDataChannel after the channel is
-    // already open; fire the open path once explicitly if so.
-    if (dc.isOpen()) {
-      this.enqueue(async () => {
-        await this.sendAcksTo(dc);
-        if (label === CHANNEL_LABELS.sync) this.sendHaves(dc);
-      });
-    }
-  }
-
   private async processFrame(
     peerId: string,
     link: PeerLink,
     dc: DataChannel,
     bytes: Uint8Array,
   ): Promise<void> {
-    const engine = this.engine;
-    if (!engine || this.closed) return;
-    const result = engine.ingest(bytes, nowUs());
-    const kind = result.kind;
-    try {
-      switch (kind) {
-        case "stored":
-        case "continuity": {
-          const meta = JSON.parse(result.json) as ChunkMetaJson;
-          await this.ensureStreamPersisted(meta.takeId, meta.streamId);
-          if (meta.seq === 0) await this.applyHeader(meta.streamId, bytes);
-          await this.archive.persistChunk(meta, bytes);
-          if (kind === "continuity") {
-            await this.archive.flagStream(meta.streamId);
-            this.callbacks.onFatal(
-              peerId,
-              "stream-discontinuity",
-              `stream ${meta.streamId} seq ${meta.seq}: first_sample_index mismatch`,
-            );
-          }
-          // Live tee toward the other sink(s): the desk gets recorder chunks
-          // as they land; recorders never receive tees.
-          this.teeToSyncPeers(peerId, meta, bytes);
-          break;
-        }
-        case "duplicate":
-          break;
-        case "gap-report": {
-          const list = JSON.parse(result.json) as RangeListJson;
-          await this.ensureStreamPersisted(list.takeId, list.streamId);
-          await this.archive.persistGaps(list.streamId, list.ranges);
-          break;
-        }
-        case "time-ping": {
-          const reply = result.reply;
-          if (reply) safeSend(dc, reply);
-          break;
-        }
-        case "time-pong": {
-          link.timeSync.handle_pong(bytes, nowUs());
-          break;
-        }
-        case "have": {
-          // Sink↔sink: push whatever we hold that they lack (§6.8).
-          const plan = JSON.parse(engine.plan_push(bytes)) as RangeListJson;
-          this.queuePush(link, plan);
-          break;
-        }
-        case "backfill": {
-          const list = JSON.parse(result.json) as RangeListJson;
-          this.queuePush(link, list);
-          break;
-        }
-        case "fatal-crc": {
-          const meta = JSON.parse(result.json) as ChunkMetaJson;
-          await this.archive.flagStream(meta.streamId);
-          this.callbacks.onFatal(
-            peerId,
-            "chunk-key-conflict",
-            `stream ${meta.streamId} seq ${meta.seq}: duplicate key with different payload`,
-          );
-          break;
-        }
-        case "ignored": {
-          // Experimental frames (0x80–0xFF, e.g. live METER telemetry) are
-          // not protocol state, but the desk wants them even when its P2P
-          // leg to the recorder failed: tee recorder→sync, fire-and-forget.
-          if (link.dataChannel === dc) this.teeRawToSyncPeers(peerId, bytes);
-          break;
-        }
-        case "corrupt":
-        case "ack":
-        case "discard":
-          break;
-        default:
-          break;
-      }
-    } finally {
-      result.free();
-    }
-  }
-
-  private async applyHeader(streamId: string, frameBytes: Uint8Array): Promise<void> {
-    if (this.headerApplied.has(streamId)) return;
-    try {
-      const { extract_chunk_payload } = await import("@antiphon/core-wasm");
-      const header = JSON.parse(stream_header_json(extract_chunk_payload(frameBytes))) as {
-        sampleRate: number;
-        bitsPerSample: number;
-        channels: number;
-        deviceDesc: string;
-        clockEpochUs: number;
-        wallClockHintMs: number;
-      };
-      await this.archive.applyStreamHeader(streamId, header);
-      this.headerApplied.add(streamId);
-    } catch (error) {
-      // A malformed header payload is a recorder bug; the chunk itself is
-      // still archived verbatim.
-      this.log.warn("malformed seq-0 stream header; chunk archived verbatim", { streamId, error });
-    }
-  }
-
-  private async ensureStreamPersisted(
-    takeId: string,
-    streamId: string,
-    peerId?: string,
-  ): Promise<void> {
-    if (!this.knownTakes.has(takeId)) {
-      await this.archive.ensureTake(this.sessionId, takeId);
-      this.knownTakes.add(takeId);
-    }
-    if (!this.knownStreams.has(streamId) || peerId) {
-      await this.archive.ensureStream(takeId, streamId, peerId);
-      this.knownStreams.add(streamId);
-    }
+    if (!this.engine || this.closed) return;
+    await processFrame(this.host, this.engine, peerId, link, dc, bytes);
   }
 
   // ---- outbound -----------------------------------------------------------
@@ -467,79 +213,8 @@ export class SessionIngest {
     if (!this.engine || this.closed) return;
     for (const link of this.peers.values()) {
       const dc = link.dataChannel ?? link.syncChannel;
-      if (dc?.isOpen()) await this.sendAcksTo(dc);
+      if (dc?.isOpen()) await sendAcksTo(this.engine, dc);
     }
-  }
-
-  private async sendAcksTo(dc: DataChannel): Promise<void> {
-    if (!this.engine) return;
-    for (const ack of this.engine.ack_frames()) {
-      safeSend(dc, ack as Uint8Array);
-    }
-  }
-
-  private sendHaves(dc: DataChannel): void {
-    if (!this.engine) return;
-    for (const have of this.engine.have_frames()) {
-      safeSend(dc, have as Uint8Array);
-    }
-  }
-
-  /** Best-effort raw tee (telemetry): dropped without retry under pressure. */
-  private teeRawToSyncPeers(sourcePeerId: string, bytes: Uint8Array): void {
-    for (const [peerId, link] of this.peers) {
-      if (peerId === sourcePeerId) continue;
-      const dc = link.syncChannel;
-      if (dc?.isOpen() && dc.bufferedAmount() < LOW_WATERMARK) safeSend(dc, bytes);
-    }
-  }
-
-  private teeToSyncPeers(sourcePeerId: string, meta: ChunkMetaJson, bytes: Uint8Array): void {
-    for (const [peerId, link] of this.peers) {
-      if (peerId === sourcePeerId) continue;
-      const dc = link.syncChannel;
-      if (!dc?.isOpen()) continue;
-      if (dc.bufferedAmount() > HIGH_WATERMARK) {
-        // Skip the live tee under pressure; HAVE reconciliation fills in.
-        link.pushQueue.push({ takeId: meta.takeId, streamId: meta.streamId, seq: meta.seq });
-        this.drainPushQueue(link);
-        continue;
-      }
-      safeSend(dc, bytes);
-    }
-  }
-
-  private queuePush(link: PeerLink, plan: RangeListJson): void {
-    for (const [start, end] of plan.ranges) {
-      for (let seq = start; seq <= end; seq++) {
-        link.pushQueue.push({ takeId: plan.takeId, streamId: plan.streamId, seq });
-      }
-    }
-    this.drainPushQueue(link);
-  }
-
-  private drainPushQueue(link: PeerLink): void {
-    if (link.pushing || link.closed) return;
-    link.pushing = true;
-    void (async () => {
-      try {
-        const dc = link.syncChannel ?? link.dataChannel;
-        while (dc?.isOpen() && link.pushQueue.length > 0) {
-          if (dc.bufferedAmount() > HIGH_WATERMARK) return; // resume on low
-          const next = link.pushQueue.shift();
-          if (!next) return;
-          try {
-            const frame = await this.archive.getFrameBytes(next.takeId, next.streamId, next.seq);
-            safeSend(dc, frame);
-          } catch (error) {
-            // Blob missing (e.g. gap seq requested): nothing to push.
-            this.log.debug("push skipped; frame blob unavailable", { ...next, error });
-          }
-        }
-      } finally {
-        link.pushing = false;
-      }
-    })();
   }
 
   private sendTimePings(): void {
@@ -549,7 +224,9 @@ export class SessionIngest {
     }
   }
 
-  /** Serialize ingest work; poison-and-rebuild on persistence failure. */
+  /** Serialize ingest work on one promise chain; ACKs join the same chain,
+   * so an ACK can never overtake persistence of a chunk it covers. On
+   * failure: poison — drop channels, rebuild from the archive (fail-stop). */
   private enqueue(task: () => Promise<void>): void {
     this.chain = this.chain.then(task).catch(async (error) => {
       this.log.error("persistence failure; rebuilding engine from archive", { error });
@@ -563,23 +240,4 @@ export class SessionIngest {
       });
     });
   }
-}
-
-function toBytes(msg: string | Buffer | ArrayBuffer): Uint8Array | null {
-  if (typeof msg === "string") return null; // data plane is binary-only
-  if (msg instanceof ArrayBuffer) return new Uint8Array(msg);
-  return new Uint8Array(msg.buffer, msg.byteOffset, msg.byteLength);
-}
-
-function safeSend(dc: DataChannel, bytes: Uint8Array): void {
-  try {
-    if (dc.isOpen()) dc.sendMessageBinary(bytes);
-  } catch (error) {
-    // Channel died mid-send; reconnection reconciles.
-    moduleLog.debug("datachannel send failed", { bytes: bytes.byteLength, error });
-  }
-}
-
-function nowUs(): number {
-  return performance.now() * 1_000;
 }

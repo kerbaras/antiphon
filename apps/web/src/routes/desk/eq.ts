@@ -1,15 +1,6 @@
-// 3-band channel EQ (W2-C): one pure parameter model plus one biquad-chain
-// builder, shared by live playback (player.ts) and the offline render
-// (render.ts). Like timeline-math, export parity is by construction — both
-// paths build their filter chains HERE, so the master render can only ever
-// hear what monitoring hears.
-//
-// Chain: low shelf (120 Hz) → mid peak (sweepable 200 Hz–8 kHz, Q 1) →
-// high shelf (8 kHz), all ±12 dB. At 0 dB gain the RBJ coefficients of all
-// three types collapse to b0=a0, b1=a1, b2=a2 — an exact IEEE identity
-// (verified coefficient-for-coefficient in eq.test.ts, and byte-for-byte
-// against real renders in e2e/tests/eq.spec.ts) — so an engaged EQ at
-// defaults is bit-transparent, not merely inaudible.
+// 3-band EQ: pure parameter model + biquad-chain builder, shared by live
+// playback and the offline render so exports hear what monitoring hears.
+// At 0 dB gain the RBJ coefficients are an exact identity (bit-transparent).
 
 export const EQ_LOW_HZ = 120;
 export const EQ_HIGH_HZ = 8_000;

@@ -1,9 +1,6 @@
-// Slim MIDI lane (W3-C): piano-roll-lite under the audio rows when the
-// selected take captured MIDI. Density over fidelity — one 28px row, note
-// rectangles banded by pitch, no editing. Clicks fall through to the
-// timeline's seek surface (the rects are inert), so seeking works exactly
-// like everywhere else. Deliberately silent on playback: the room mics
-// carried the instrument; this lane is the data, the .mid export the payoff.
+// Slim MIDI lane: piano-roll-lite under the audio rows when the selected
+// take captured MIDI. One 28px row, note rects banded by pitch, no editing;
+// the rects are inert so clicks fall through to the timeline's seek surface.
 
 import { Badge } from "../../components";
 import { hexA, laneGridStyle, TRACK_HEADER_W } from "./daw";
@@ -45,16 +42,13 @@ export function MidiLaneRow({
   const yOf = (note: number) => pad + (1 - (note - bandLo) / span) * usable;
 
   return (
-    // Row seam on the CHILDREN, not the wrapper — the audio rows' W7-C
-    // border-on-children rule (timeline.tsx TimelineRow): the header's
-    // seam must paint inside its z-[5] layer or the full-height overlays
-    // bleed 1px through it in the header band.
+    // Row seam on the CHILDREN, not the wrapper (timeline.tsx TimelineRow's
+    // rule): the header's seam must paint inside its z-[5] layer or the
+    // full-height overlays bleed 1px through it in the header band.
     <div className="flex" style={{ height: MIDI_LANE_H }}>
-      {/* data-lane-header: the tracks-band contract (W6-A, pinned by
-          timeline-header-band.spec.ts elementFromPoint sweeps) recognizes
-          band chrome by this attribute — the MIDI header is band chrome
-          like every audio lane header. "midi" can't collide with the
-          audio rows' keys (peer/stream ids). */}
+      {/* data-lane-header: the tracks-band contract (pinned by
+          timeline-header-band.spec.ts) recognizes band chrome by this
+          attribute. "midi" can't collide with the audio rows' peer/stream keys. */}
       <div
         data-lane-header="midi"
         className="sticky left-0 z-[5] flex flex-none items-stretch border-r border-b border-divider border-b-[#0e0f10] bg-card"

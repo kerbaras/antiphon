@@ -1,11 +1,20 @@
 // Main-thread capture orchestration: getUserMedia (all processing OFF) →
 // AudioWorklet → SAB ring → encoder worker. Owns no protocol logic; it moves
-// bytes between the worker and whatever transports are attached, and
-// republishes worker stats for the UI.
+// bytes between the worker and attached transports and republishes stats.
 
+import {
+  acquireStream,
+  type CaptureFlags,
+  defaultDeviceDesc,
+  flagsOf,
+  randomId,
+  uuidToBytes,
+} from "./capture-media";
 import type { RingDiagnostics } from "./sab-ring";
 import { createCaptureRing } from "./sab-ring";
 import type { FromEncoderWorker, RecorderStats, ToEncoderWorker } from "./worker-protocol";
+
+export { type CaptureFlags, randomId, uuidToBytes };
 
 /** Ring capacity: ~8s of float samples — an encoder stall this long is a
  * fault we surface, not absorb silently. */
@@ -13,18 +22,6 @@ const RING_SECONDS = 8;
 /** Encoded ring buffer budget: 60s (RFC §9 RECOMMENDED) at a generous
  * ~100 KB/s estimate. A few MB of RAM buys the entire resilience story. */
 const ENCODED_RING_BUDGET_BYTES = 6 * 1024 * 1024;
-
-export interface CaptureFlags {
-  // Newer specs allow string modes (e.g. echoCancellation: "browser").
-  echoCancellation: boolean | string | undefined;
-  noiseSuppression: boolean | string | undefined;
-  autoGainControl: boolean | string | undefined;
-  sampleRate: number | undefined;
-  channelCount: number | undefined;
-  deviceLabel: string;
-  /** Live track's deviceId — what a device picker should show as selected. */
-  deviceId: string | undefined;
-}
 
 export interface CaptureSnapshot {
   contextSampleRate: number | null;
@@ -38,8 +35,8 @@ export interface CaptureSnapshot {
   error: string | null;
   /** A take is open (arm requested → streaming → draining, until the
    * worker reports "stopped"). Latched SYNCHRONOUSLY in arm() — worker
-   * stats lag by their reporting interval (~250ms) and must never gate
-   * safety decisions like device switching (W4-F QA F1). */
+   * stats lag ~250ms and must never gate safety decisions like device
+   * switching. */
   takeOpen: boolean;
 }
 
@@ -93,15 +90,14 @@ export class CaptureController {
   private pendingArm: ArmOptions | null = null;
   /** Bumped by teardown(): async paths (switchDevice's in-flight
    * getUserMedia) re-check it after every await — a stale fulfillment
-   * against a torn-down pipeline must never repopulate a hot mic (QA F2). */
+   * against a torn-down pipeline must never repopulate a hot mic. */
   private pipelineEpoch = 0;
   /** One device switch at a time; concurrent calls fail fast. */
   private switchInFlight = false;
   /** Take identity for the takeOpen latch: bumped synchronously per arm().
    * The worker's "stopped" report releases the latch ONLY when no arm
    * happened after the stop it answers (stopTake records the generation it
-   * closes) — a stop(N)+arm(N+1) pair inside the worker's stop round-trip
-   * must not let take N's stopped wipe take N+1's latch (QA re-verify). */
+   * closes). */
   private armGeneration = 0;
   /** Generation the pending worker "stop" closes; -1 = no stop in flight. */
   private stopForGeneration = -1;
@@ -175,23 +171,17 @@ export class CaptureController {
     }
   }
 
-  /** Swap the live input (W4-F) without touching the rest of the pipeline:
-   * the AudioContext, SAB ring, encoder worker, attached sinks and take
-   * state machine all survive — only the MediaStream source node is
-   * replaced, so the level meter reflects the new mic immediately and the
-   * next arm() stamps the new device into its seq-0 stream header (the
-   * deviceDesc is read from the published flags at arm time).
+  /** Swap the live input without touching the rest of the pipeline: only
+   * the MediaStream source node is replaced; the next arm() stamps the new
+   * device into its stream header.
    *
    * Refused while a take is open: a mid-take source swap would put a
-   * foreign device inside one contiguous sample domain — first_sample_index
-   * would stay numerically contiguous while real time silently vanished,
-   * with no gap declared (the one-shot-recording law's worst failure mode).
-   * The gate is the SYNCHRONOUS takeOpen latch (never lagged worker stats),
-   * checked twice: before acquiring, and AGAIN after the awaited
-   * getUserMedia — an arm() or teardown() landing mid-acquisition wins,
-   * and the freshly-acquired tracks are stopped, never swapped in.
-   * On failure the old stream keeps running untouched (never trade a
-   * working mic for a broken one). */
+   * foreign device inside one contiguous sample domain with no gap
+   * declared. The gate is the SYNCHRONOUS takeOpen latch (never lagged
+   * worker stats), checked before acquiring and AGAIN after the awaited
+   * getUserMedia — an arm() or teardown() landing mid-acquisition wins and
+   * the fresh tracks are stopped, never swapped in. On failure the old
+   * stream keeps running untouched. */
   async switchDevice(deviceId: string): Promise<void> {
     if (!this.context || !this.node) throw new Error("capture pipeline is not running");
     if (this.snapshot.takeOpen) throw new Error("cannot switch input while a take is open");
@@ -206,9 +196,9 @@ export class CaptureController {
         this.publish({ error: `input switch failed: ${String(e)}` });
         throw e;
       }
-      // Post-await re-checks (QA F1/F2): the world may have moved while
-      // getUserMedia was in flight. Either way the new stream is retired
-      // on the spot — a rejected switch must never leave a hot mic behind.
+      // Post-await re-checks: the world may have moved while getUserMedia
+      // was in flight. Either way the new stream is retired on the spot —
+      // a rejected switch must never leave a hot mic behind.
       const context = this.context;
       const node = this.node;
       if (this.pipelineEpoch !== epoch || !context || !node) {
@@ -220,9 +210,9 @@ export class CaptureController {
         throw new Error("a take opened during the switch — input unchanged");
       }
       // New stream first, then retire the old: if the OS kills the old
-      // track on re-acquisition (iOS allows one live capture), the swap
-      // below is already in flight. The worklet counts the (at most) one
-      // silent quantum between disconnect and connect; nothing is armed.
+      // track on re-acquisition (iOS allows one live capture), the swap is
+      // already in flight. The worklet counts the (at most) one silent
+      // quantum between disconnect and connect; nothing is armed.
       this.source?.disconnect();
       for (const track of this.stream?.getTracks() ?? []) track.stop();
       const source = context.createMediaStreamSource(stream);
@@ -242,8 +232,8 @@ export class CaptureController {
   arm(options: ArmOptions): void {
     // Latch take intent SYNCHRONOUSLY, before any queueing or posting:
     // switchDevice() and the picker UI gate on this bit, and worker stats
-    // arrive ~250ms too late to close the race (QA F1). The generation
-    // bump makes any already-in-flight "stopped" (previous take) stale.
+    // arrive ~250ms too late to close the race. The generation bump makes
+    // any already-in-flight "stopped" (previous take) stale.
     this.armGeneration += 1;
     this.publish({ takeOpen: true });
     if (!this.workerReady) {
@@ -270,9 +260,9 @@ export class CaptureController {
       return;
     }
     // takeOpen stays latched through DRAINING; the worker's "stopped"
-    // report (final seq known, engine closed) releases it — but only for
-    // THIS take: record the generation this stop closes, so a stopped
-    // arriving after a newer arm() is recognized as stale and ignored.
+    // report releases it — but only for THIS take: record the generation
+    // this stop closes, so a stopped arriving after a newer arm() is
+    // recognized as stale and ignored.
     this.stopForGeneration = this.armGeneration;
     this.post({ type: "stop" });
   }
@@ -323,7 +313,7 @@ export class CaptureController {
    * stale "capturing" state over a released mic. */
   async teardown(): Promise<void> {
     // Invalidate in-flight async work (switchDevice) FIRST: anything that
-    // fulfills after this line sees a new epoch and retires itself (QA F2).
+    // fulfills after this line sees a new epoch and retires itself.
     this.pipelineEpoch += 1;
     this.node?.disconnect();
     this.node = null;
@@ -396,12 +386,10 @@ export class CaptureController {
       }
       case "stopped":
         // Release the takeOpen latch only when this report answers the
-        // CURRENT generation's stop — a stop(N)+arm(N+1) pair processed
-        // back-to-back (batched take-stop/take-start after a reconnect
-        // flush, desk quick re-record) otherwise lets take N's stopped
-        // wipe the latch while take N+1 rolls, reopening the F1 hole.
-        // finalSeq publishes regardless: the session dedupes it per
-        // (takeId, streamId, finalSeq) and A2 says err on re-sending.
+        // CURRENT generation's stop — a stop(N)+arm(N+1) pair inside the
+        // worker's stop round-trip must not let take N's stopped wipe take
+        // N+1's latch. finalSeq publishes regardless: the session dedupes
+        // it per (takeId, streamId, finalSeq).
         this.publish({
           finalSeq: msg.finalSeq,
           ...(this.stopForGeneration === this.armGeneration ? { takeOpen: false } : {}),
@@ -436,61 +424,4 @@ export class CaptureController {
       // Wake lock is best-effort; the runbook covers screen-on guidance.
     }
   }
-}
-
-/** The ONE getUserMedia call sites share: every processing flag OFF (the
- * sacred capture constraints, ARCHITECTURE §2.1 — a phone call is not a
- * recorder), mono, optionally pinned to a device with `exact` so a stale
- * id fails loudly (OverconstrainedError) instead of silently recording
- * the wrong mic; callers own the fallback. */
-function acquireStream(deviceId?: string): Promise<MediaStream> {
-  return navigator.mediaDevices.getUserMedia({
-    audio: {
-      echoCancellation: false,
-      noiseSuppression: false,
-      autoGainControl: false,
-      channelCount: 1,
-      ...(deviceId !== undefined ? { deviceId: { exact: deviceId } } : {}),
-    },
-  });
-}
-
-/** Honest flags readout from the live track (iOS may still misreport). */
-function flagsOf(stream: MediaStream): CaptureFlags {
-  const track = stream.getAudioTracks()[0];
-  const settings = track?.getSettings() ?? {};
-  return {
-    echoCancellation: settings.echoCancellation,
-    noiseSuppression: settings.noiseSuppression,
-    autoGainControl: settings.autoGainControl,
-    sampleRate: settings.sampleRate,
-    channelCount: settings.channelCount,
-    deviceLabel: track?.label ?? "unknown input",
-    deviceId: settings.deviceId,
-  };
-}
-
-function defaultDeviceDesc(flags: CaptureFlags | null): string {
-  const ua = navigator.userAgent;
-  const device = /iPhone|iPad|Android/.exec(ua)?.[0] ?? "browser";
-  return `${device} · ${flags?.deviceLabel ?? "mic"}`;
-}
-
-export function randomId(): Uint8Array {
-  const id = new Uint8Array(16);
-  crypto.getRandomValues(id);
-  // UUIDv4 bits so the ids read as valid UUIDs everywhere.
-  id[6] = ((id[6] as number) & 0x0f) | 0x40;
-  id[8] = ((id[8] as number) & 0x3f) | 0x80;
-  return id;
-}
-
-export function uuidToBytes(uuid: string): Uint8Array {
-  const hex = uuid.replaceAll("-", "");
-  if (hex.length !== 32) throw new Error(`bad uuid: ${uuid}`);
-  const out = new Uint8Array(16);
-  for (let i = 0; i < 16; i++) {
-    out[i] = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
-  }
-  return out;
 }

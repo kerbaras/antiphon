@@ -1,38 +1,16 @@
-// W8-A Clerk mount (lazy chunk — see auth-root.tsx).
-//
-// COEP RESOLUTION (trap A, decided after testing both options): clerk-js
-// loads from the Clerk CDN (the SDK default). The npm-bundled variant
-// (`Clerk` prop) was tried first and REJECTED: since clerk-js v6 the
-// prebuilt components (SignIn modal, UserButton) live in a separately
-// hot-loaded `@clerk/ui` package that simply is not in the npm module —
-// the bundled path throws "Clerk was not loaded with Ui components".
-// Self-hosting would mean vendoring two dist trees behind two @internal
-// props; instead we rely on the fact that Clerk serves EVERY browser
-// asset (clerk.browser.js + chunks, ui.browser.js, img.clerk.com
-// avatars) with `Cross-Origin-Resource-Policy: cross-origin` — verified
-// 2026-07 and deliberately COEP-compatible on their side. COOP/COEP
-// (require-corp) stay untouched on every route; the FAPI itself is CORS
-// (exempt from CORP). The live-clerk e2e pins the whole story: sign-in
-// modal renders, crossOriginIsolated === true, zero BLOCKED_BY_RESPONSE.
-// If Clerk ever drops those headers, that spec — not a choir's session —
-// finds out.
-//
-// Appearance maps Clerk components onto the house tokens (styles.css) so
-// the prebuilt modals don't look alien in the instrument panel.
-// TokenBridge hands Clerk's getToken to the non-React net layer; on
-// unmount the registry clears back to keyless behavior.
+// Clerk mount (lazy chunk — see auth-root.tsx). clerk-js loads from the
+// Clerk CDN on purpose: the npm-bundled variant lacks the hot-loaded
+// @clerk/ui components, and every Clerk browser asset is served with
+// CORP: cross-origin, so our COOP/COEP (require-corp) stays untouched.
 
 import { ClerkProvider, useAuth, useUser } from "@clerk/react";
 import { type ReactNode, useEffect } from "react";
 import { registerAuthTokenGetter } from "../net/auth-token";
 import { setAuthUser } from "../net/auth-user";
 
-/** House tokens → Clerk appearance variables (the CURRENT @clerk/ui
- * names: colorForeground/colorInput/… — the legacy colorText/
- * colorInputBackground aliases silently no-op on the new renderer, which
- * is how the first pass shipped a white input on a dark card). Values
- * mirror styles.css (@theme) — keep in sync by hand; Clerk renders in its
- * own subtree where our Tailwind theme doesn't reach. */
+/** House tokens → Clerk appearance variables. Use the CURRENT @clerk/ui
+ * names (colorForeground/colorInput/…) — legacy aliases silently no-op.
+ * Values mirror styles.css (@theme); keep in sync by hand. */
 const APPEARANCE = {
   variables: {
     colorPrimary: "#2e8bff", // --color-accent
@@ -58,17 +36,15 @@ function TokenBridge() {
   const { getToken } = useAuth();
   useEffect(() => {
     // Clerk's getToken caches + auto-refreshes the session JWT; per-call
-    // use is the intended pattern (clerk-react-patterns skill).
+    // use is the intended pattern.
     registerAuthTokenGetter(() => getToken());
     return () => registerAuthTokenGetter(null);
   }, [getToken]);
   return null;
 }
 
-/** Mirrors the signed-in user's DISPLAY identity (email + pfp) into the
- * net-layer registry: join-page email defaults, hello avatarUrl (A16), and
- * the desk's own top-bar face all read from there — no Clerk outside this
- * chunk. */
+/** Mirrors the signed-in user's display identity (email + pfp) into the
+ * net-layer registry — no Clerk outside this chunk. */
 function IdentityBridge() {
   const { user } = useUser();
   const email = user?.primaryEmailAddress?.emailAddress ?? null;

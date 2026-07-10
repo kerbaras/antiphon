@@ -1,12 +1,6 @@
-// F2 — destructive-action confirm for DURABLE deletion (Shift+Delete, the
-// lane menu): recordings fan out of every sink (rows AND blobs gone), so
-// these paths must never fire straight from keydown. This kit-styled
-// alertdialog spells out exactly what is about to be destroyed (clip count
-// per take, mono readouts), traps focus, and maps Enter=confirm /
-// Escape=cancel. It only ADDS a confirmation ahead of the existing
-// server-authoritative delete protocol — the never-lose-audio path itself
-// is untouched. Plain Delete needs none of this since W9-F: it removes
-// clips from the ARRANGEMENT only (doc write, Ctrl+Z restores).
+// Confirm dialog for DURABLE deletion (Shift+Delete, the lane menu):
+// recordings fan out of every sink (rows AND blobs gone), so these paths
+// never fire straight from keydown. Plain Delete is arrangement-only (undoable).
 
 import { useEffect, useRef } from "react";
 import { Button, MonoReadout, Panel, SectionLabel } from "../../components";
@@ -103,8 +97,8 @@ export function DeleteConfirm({
                 value={`${take.clipCount} clip${take.clipCount === 1 ? "" : "s"}`}
               />
             ))}
-            {/* Honesty over a split selection: durable deletion is
-                recording-level — every piece of a staged stream goes. */}
+            {/* Durable deletion is recording-level — every piece of a
+                staged stream goes, not just the selected ones. */}
             {splitWhole && (
               <p
                 data-split-whole

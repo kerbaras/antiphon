@@ -1,14 +1,12 @@
-// Toolbar row (40px): editing tools, snap/grid, auto-align, marker/comment
-// pills, status readouts, view tabs, zoom. Also home of the desk's fatal
-// terminal panel (F3) — rendered by index.tsx over everything when the
-// control plane halts for good.
+// Toolbar row (40px): tools, snap/grid, auto-align, marker/comment pills,
+// status readouts, view tabs, zoom.
 
-import { Button, MonoReadout, Panel, SectionLabel, StatusPill } from "../../components";
-import type { FatalSignalingError } from "../../net/signaling-client";
 import { type DeskTool, SnapGrid, ToolGroup, ViewTabs, ZoomControl } from "./daw";
 import type { PlayerSnapshot } from "./player";
 
-/** Auto-align control state (F7a) — also the e2e observation surface. */
+export { DeskFatalPanel } from "./fatal-panel";
+
+/** Auto-align control state — also the e2e observation surface. */
 type AlignState = "aligning" | "aligned" | "declined" | "failed" | "idle";
 
 const ALIGN_BUTTON_STYLES: Record<AlignState, string> = {
@@ -52,23 +50,23 @@ export function DeskToolbar({
   playerLoaded: boolean;
   playerSnap: PlayerSnapshot;
   markersUsable: boolean;
-  /** Active editing tool (W7-B): Select ↔ Split, owned by the desk. */
+  /** Active editing tool: Select ↔ Split, owned by the desk. */
   tool: DeskTool;
   lastChirpAt: number | null;
   errors: string[];
   exportError: string | null;
   zoom: number;
-  /** Selected clips (W7-A): scopes the align button + its copy. */
+  /** Selected clips: scopes the align button + its copy. */
   selectionCount: number;
-  /** Multi-take align flow progress (W7-A) — non-null while running. */
+  /** Multi-take align flow progress — non-null while running. */
   alignFlow: { done: number; total: number } | null;
-  /** Transient align note (W7-A): "manual offsets reset · N clips". */
+  /** Transient align note: "manual offsets reset · N clips". */
   alignNote: string | null;
   /** Mixer-lane display name (nickname when set) for the align readout. */
   laneNameOf: (channelKey: string) => string;
   onTool: (tool: DeskTool) => void;
   onZoom: (zoom: number) => void;
-  /** Selection-aware auto-align (W7-A) — index.tsx owns the flow. */
+  /** Selection-aware auto-align — index.tsx owns the flow. */
   onAutoAlign: () => void;
   onAddMarker: () => void;
   onOpenComments: () => void;
@@ -85,9 +83,8 @@ export function DeskToolbar({
             outcome.referenceStreamId,
         )
       : null;
-  // Honest method readout (W4-B): chirp-aligned ≠ waveform-aligned.
-  // Operator copy says "waveform" (PM decision); the persisted method
-  // value stays "content" for schema stability.
+  // Display copy says "waveform"; the persisted method value stays
+  // "content" for schema stability.
   const methodLabel =
     outcome?.kind === "aligned"
       ? outcome.method === "mixed"
@@ -109,15 +106,13 @@ export function DeskToolbar({
     <div className="flex items-center justify-between border-b border-divider bg-raised px-3.5">
       <div className="flex min-w-0 items-center gap-3.5">
         <ToolGroup tool={tool} onTool={onTool} splitDisabled={recording} />
-        {/* Divider belongs to SnapGrid — it sheds on the same tier (W5-B). */}
+        {/* Divider belongs to SnapGrid — it sheds on the same tier. */}
         <div className="hidden h-[18px] w-px bg-edge min-[1200px]:block" />
         <SnapGrid />
         <button
           type="button"
           aria-label="Auto-align"
-          // "resets moved clips (split clips keep their cuts)": honest for
-          // every selection shape — the W7-B PM decision preserves split
-          // streams' region layout, so only never-split clips' moves reset.
+          // Split streams keep their region layout — only never-split clips' moves reset.
           title={
             selectionCount > 0
               ? `Re-align the ${selectionCount} selected clip${selectionCount === 1 ? "" : "s"} by waveform (chirp first when present) — resets moved clips (split clips keep their cuts)`
@@ -128,9 +123,8 @@ export function DeskToolbar({
           data-align-state={alignState}
           disabled={!playerLoaded || playerSnap.aligning || recording || alignFlow !== null}
           onClick={onAutoAlign}
-          // whitespace-nowrap (W5-B seam): under flex squeeze the pill used
-          // to two-line ("align / declined") and break the 40px row — the
-          // verdict CHIP is the row's designated flexible child, not this.
+          // whitespace-nowrap: under flex squeeze the pill two-lined and
+          // broke the 40px row — the verdict chip is the flexible child.
           className={`flex items-center gap-1.5 whitespace-nowrap rounded-full border px-2.5 py-1 text-[10.5px] font-semibold transition-colors disabled:cursor-not-allowed ${
             alignState === "idle" && lastChirpAt
               ? "border-accent/50 text-accent/80 hover:text-accent"
@@ -140,10 +134,8 @@ export function DeskToolbar({
           <span className="text-[8px]">●</span>
           {ALIGN_BUTTON_LABELS[alignState]}
         </button>
-        {/* Multi-take flow progress (W7-A) rides the outcome chip's slot:
-            "aligning take 2/3…" while the flow walks the selection's
-            takes through the load queue. Single-take runs keep the plain
-            "aligning…" button state — a 1/1 counter is noise. */}
+        {/* Multi-take progress rides the outcome chip's slot; single-take
+            runs keep "aligning…" — a 1/1 counter is noise. */}
         {alignFlow && alignFlow.total > 1 && (
           <span
             data-testid="align-outcome"
@@ -152,8 +144,7 @@ export function DeskToolbar({
             aligning take {Math.min(alignFlow.done + 1, alignFlow.total)}/{alignFlow.total}…
           </span>
         )}
-        {/* Compact outcome readout (F7a): aligned / declined / failed are
-            visibly distinct from "never ran" — no more silent decline. */}
+        {/* aligned/declined/failed stay visibly distinct from "never ran". */}
         {!playerSnap.aligning && !alignFlow && outcome && (
           <span
             data-testid="align-outcome"
@@ -181,8 +172,7 @@ export function DeskToolbar({
                 : `failed: ${outcome.message}`}
           </span>
         )}
-        {/* Transient align note (W7-A): a forced re-align that cleared
-            manual clip moves says so — quietly, next to the verdict. */}
+        {/* A re-align that cleared manual clip moves says so, quietly. */}
         {alignNote && (
           <span
             data-testid="align-note"
@@ -201,13 +191,10 @@ export function DeskToolbar({
           className="flex items-center gap-1.5 whitespace-nowrap rounded-full border border-edge-strong px-2.5 py-1 text-[10.5px] font-semibold text-text-mute transition-colors hover:text-text-hi disabled:cursor-not-allowed disabled:opacity-50"
         >
           <span className="text-[8px] text-accent/80">◆</span>
-          {/* Label text sheds below 1024 (W9-F: the third live tool costs
-              the chip budget ~40px, and at 900 — labels + key hints both
-              returning — the sweep measured the chip 28px short; icon +
-              title + aria carry the meaning below the boundary). */}
+          {/* Label sheds below 1024 (width-sweep-pinned tier); icon +
+              title + aria carry the meaning below the boundary. */}
           <span className="hidden min-[1024px]:inline">marker</span>
         </button>
-        {/* N (was C — the Split tool owns C now, W7-B). */}
         <button
           type="button"
           aria-label="Add comment at playhead"
@@ -217,7 +204,7 @@ export function DeskToolbar({
           className="flex items-center gap-1.5 whitespace-nowrap rounded-full border border-edge-strong px-2.5 py-1 text-[10.5px] font-semibold text-text-mute transition-colors hover:text-text-hi disabled:cursor-not-allowed disabled:opacity-50"
         >
           <span className="text-[8px] text-pin/80">●</span>
-          {/* Sheds with the marker label (W9-F) — same tier, same reason. */}
+          {/* Sheds with the marker label — same tier, same reason. */}
           <span className="hidden min-[1024px]:inline">comment</span>
         </button>
         {lastChirpAt && (
@@ -231,8 +218,8 @@ export function DeskToolbar({
         {exportError && (
           <span className="font-mono text-[9px] text-warn">export: {exportError}</span>
         )}
-        {/* Error strip (F3 fold): EVERY live error renders — capped and
-            self-expiring in desk-session — each with its own dismiss. */}
+        {/* Error strip: EVERY live error renders — capped and self-expiring
+            in desk-session — each with its own dismiss. */}
         {errors.map((message, index) => (
           <span
             // biome-ignore lint/suspicious/noArrayIndexKey: entries are positional (dismissError is index-based) and may repeat verbatim
@@ -257,60 +244,6 @@ export function DeskToolbar({
       <div className="flex items-center gap-3.5">
         <ViewTabs />
         <ZoomControl zoom={zoom} onZoom={onZoom} />
-      </div>
-    </div>
-  );
-}
-
-/** Terminal control-plane halt (F3, desk flavor): signaling stopped for
- * good (no reconnect loop is running — SignalingClient halted itself), so
- * this renders the FACT as a blocking panel, exactly like the phone's.
- * The only exit is the deliberate take-over (reopen + supersede back);
- * local data is safe either way — takes live in OPFS and on the server. */
-export function DeskFatalPanel({
-  fatal,
-  onTakeOver,
-}: {
-  fatal: FatalSignalingError;
-  onTakeOver: () => void;
-}) {
-  const superseded = fatal.code === "superseded";
-  return (
-    <div className="fixed inset-0 z-[50] grid place-items-center bg-void/70">
-      <div
-        role="alertdialog"
-        aria-modal="true"
-        aria-labelledby="desk-fatal-title"
-        className="relative"
-      >
-        <Panel className="w-[420px] p-4 shadow-[0_14px_36px_rgba(0,0,0,.6)]">
-          <div className="flex items-center justify-between">
-            <SectionLabel>Session</SectionLabel>
-            <StatusPill tone="warn">disconnected</StatusPill>
-          </div>
-          <p
-            id="desk-fatal-title"
-            role="alert"
-            className="mt-3 text-[13px] leading-relaxed text-text-body"
-          >
-            {superseded
-              ? "This desk reconnected in another tab — this tab has been disconnected."
-              : fatal.message}
-          </p>
-          <MonoReadout className="mt-3" label="reason" value={fatal.code} />
-          <MonoReadout label="reconnect" value="stopped" />
-          <MonoReadout label="recorded takes" value="safe (stored on desk + server)" />
-          {superseded && (
-            <>
-              <Button variant="accent" className="mt-4 w-full" onClick={onTakeOver}>
-                Take over in this tab
-              </Button>
-              <p className="mt-2 text-[10px] leading-relaxed text-text-faint">
-                Taking over re-joins the session from this tab — and disconnects the other one.
-              </p>
-            </>
-          )}
-        </Panel>
       </div>
     </div>
   );

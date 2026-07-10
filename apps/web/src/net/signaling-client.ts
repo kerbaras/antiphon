@@ -15,8 +15,9 @@ import { getDeviceId } from "./device-identity";
 type MessageListener = (msg: SignalingMessage) => void;
 type StateListener = (state: SignalingClientState) => void;
 
-/** A terminal control-plane error (§11 `fatal:true`), e.g. an A12 device
- * supersede. The client halts — no reconnect — until an explicit reopen(). */
+/** A terminal control-plane error (§11 `fatal:true`), e.g. this device
+ * identity reconnected elsewhere and superseded us. The client halts — no
+ * reconnect — until an explicit reopen(). */
 export interface FatalSignalingError {
   code: string;
   message: string;
@@ -26,7 +27,7 @@ export interface SignalingClientState {
   connected: boolean;
   peerId: string | null;
   session: SessionState | null;
-  /** Non-null = this client is terminally halted (F3). */
+  /** Non-null = this client is terminally halted. */
   fatal: FatalSignalingError | null;
 }
 
@@ -41,16 +42,15 @@ const HANDSHAKE_TIMEOUT_MS = 10_000;
 export class SignalingClient {
   readonly role: PeerRole;
   readonly sessionId: string;
-  /** Nickname sent as `deviceInfo.label` on (re)hello (A13). Mutable so a
-   * rename survives the next reconnect handshake. */
+  /** Nickname sent as `deviceInfo.label` on (re)hello. Mutable so a rename
+   * survives the next reconnect handshake. */
   label: string | null;
-  /** A12 identity override (the desk's embedded recorder derives its own);
+  /** Identity override (the desk's embedded recorder derives its own);
    * null = this browser's persisted deviceId. */
   private readonly deviceId: string | null;
-  /** This endpoint speaks for the signed-in ACCOUNT (A16): hellos carry the
-   * profile picture, and an unnamed recorder defaults its label to the
-   * account email. False for the desk's embedded room-mic recorder — that
-   * lane is hardware, not a person. No-op keyless (authUser() is null). */
+  /** This endpoint speaks for the signed-in account: hellos carry the
+   * profile picture, and an unnamed recorder defaults to the account email.
+   * False for the desk's room-mic recorder — hardware, not a person. */
   private readonly accountIdentity: boolean;
   private ws: WebSocket | null = null;
   private closed = false;
@@ -88,20 +88,16 @@ export class SignalingClient {
     ws.addEventListener("open", () => {
       clearTimeout(deadline);
       this.attempts = 0;
-      // Account display identity (A16), read at hello time so a sign-in
-      // that landed after construction still counts: signed-in endpoints
-      // carry their pfp, and an unnamed RECORDER introduces itself by its
-      // account email (a default, never persisted — an explicit nickname
-      // always wins). Keyless/signed-out: account is null, wire unchanged.
+      // Account identity is read at hello time so a sign-in that landed
+      // after construction still counts. An unnamed recorder defaults its
+      // label to the account email (never persisted; a nickname wins).
       const account = this.accountIdentity ? authUser() : null;
       const label =
         this.label?.trim() ||
         (this.role === "recorder" ? (account?.email ?? undefined) : undefined);
-      // Desk hellos carry the Clerk session token (A15) — the browser
-      // cannot set WS headers, so auth rides the handshake message. The
-      // await is a no-op keyless (null, nothing attached) and recorders
-      // never send one: mic join stays accountless (RFC §12). Fetched per
-      // (re)connect so a long-lived desk always presents a fresh JWT.
+      // Desk hellos carry the session token (the browser can't set WS
+      // headers), fetched per (re)connect for a fresh JWT. Recorders never
+      // send one: mic join stays accountless (RFC §12).
       const tokenPromise = this.role === "desk" ? authToken() : Promise.resolve(null);
       void tokenPromise.then((token) => {
         if (this.ws !== ws || ws.readyState !== WebSocket.OPEN) return;
@@ -111,7 +107,7 @@ export class SignalingClient {
           role: this.role,
           deviceInfo: {
             userAgent: navigator.userAgent.slice(0, 500),
-            // Stable per-browser id (A12): the server resumes our peerId.
+            // Stable per-browser id so the server resumes our peerId.
             deviceId: this.deviceId ?? getDeviceId(),
             ...(label ? { label } : {}),
             ...(account?.imageUrl ? { avatarUrl: account.imageUrl } : {}),
@@ -133,10 +129,9 @@ export class SignalingClient {
       }
       if (!msg) return;
       if (msg.type === "error" && msg.fatal) {
-        // Terminal by contract (F3): the server is closing this socket and
-        // means it — superseded devices, deleted sessions, caps. Halt the
-        // reconnect loop and surface a distinct terminal state; recovery is
-        // a deliberate reopen(), never an automatic retry.
+        // Terminal by contract: superseded devices, deleted sessions, caps.
+        // Halt the reconnect loop; recovery is a deliberate reopen(), never
+        // an automatic retry.
         this.setState({
           ...this.state,
           connected: false,
@@ -148,8 +143,8 @@ export class SignalingClient {
       } else if (msg.type === "peer-status") {
         this.setState({ ...this.state, session: msg.session });
       } else if (msg.type === "peer-update" && this.state.session) {
-        // Live rename (A13): patch the snapshot so every consumer sees the
-        // new label without waiting for the next peer-status.
+        // Live rename: patch the snapshot so every consumer sees the new
+        // label without waiting for the next peer-status.
         const update = msg;
         const peers = this.state.session.peers.map((p) => {
           if (p.peerId !== update.peerId) return p;

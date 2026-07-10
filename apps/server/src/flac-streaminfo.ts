@@ -1,19 +1,8 @@
-// STREAMINFO finalization for server-assembled FLACs (QA #27, server side).
-//
-// The streaming encoder's codec bootstrap (packages/codec codec_header())
-// necessarily writes total-samples = 0 ("unknown" per the FLAC spec) — no
-// frame exists yet when it is emitted. Without a real count, players show
-// no duration and ffprobe estimates a wrong one from bitrate.
-//
-// RFC 0001 §13 rules that sinks MUST NOT transcode or resample stored
-// chunks — and this does neither: chunk blobs are immutable protocol bytes
-// and stay byte-identical in the store. Only the ASSEMBLED download copy
-// (reconstructFlac output) has its header field set to the length the
-// served file truly has. A metadata field describing the audio is not an
-// audio transform: no sample is decoded, re-encoded, or touched.
-//
-// Byte-for-byte mirror of the web's local-export finalization
-// (apps/web/src/audio/flac-streaminfo.ts, read-only reference).
+// STREAMINFO finalization for server-assembled FLACs. The streaming codec
+// bootstrap writes total-samples = 0 ("unknown"); only the ASSEMBLED
+// download copy gets the real count — stored chunk blobs stay byte-identical
+// (RFC §13 no-transcode: a metadata field is not an audio transform).
+// Byte-for-byte mirror of apps/web/src/audio/flac-streaminfo.ts.
 
 /** `fLaC` magic (4) + metadata block header (4) + STREAMINFO body (34). */
 const STREAMINFO_HEADER_BYTES = 42;

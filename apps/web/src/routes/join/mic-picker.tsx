@@ -1,15 +1,6 @@
-// Phone mic picker (W4-F). A styled NATIVE select — on a phone the OS
-// wheel/sheet beats any custom dropdown — that lives where the static
-// device label sat: it shows the current input and switches the live
-// pipeline on change (source-node swap; the pipeline and its take state
-// survive). Enumeration runs only once capture is up, because labels are
-// blank until a getUserMedia grant; devicechange re-enumerates (AirPods
-// arriving mid-soundcheck). Collapses when the phone has a single input.
-// Locked (with the reason spelled out) while a take is open — a mid-take
-// device swap would corrupt the stream's sample continuity. The lock
-// mirrors the controller's synchronous takeOpen latch; the controller
-// itself re-checks it after the async acquisition, so even a race the UI
-// misses cannot swap a rolling take's device (QA F1).
+// Phone mic picker: a styled NATIVE select (on a phone the OS wheel/sheet
+// beats any custom dropdown) that switches the live pipeline on change.
+// Locked while a take is open — a mid-take swap would corrupt continuity.
 
 import { useCallback, useEffect, useId, useRef, useState } from "react";
 import type { CaptureFlags } from "../../audio/capture-controller";
@@ -21,7 +12,8 @@ import {
 } from "./mic-preference";
 import { getCaptureController } from "./use-capture";
 
-/** Audio inputs, refreshed on devicechange. Only meaningful post-grant. */
+/** Audio inputs, refreshed on devicechange. Only meaningful post-grant
+ * (labels are blank until getUserMedia is granted). */
 function useAudioInputs(active: boolean): MicDeviceOption[] {
   const [devices, setDevices] = useState<MicDeviceOption[]>([]);
   useEffect(() => {
@@ -81,8 +73,7 @@ export function MicPicker({
     } catch {
       // The previous stream keeps running (the controller never trades a
       // working mic for a broken one), so the select — whose value derives
-      // from the LIVE flags — snaps back on its own. Say so inline (F4);
-      // the full error also lands on the transient strip via snapshot.error.
+      // from the LIVE flags — snaps back on its own.
       setFailed(true);
     } finally {
       setSwitching(false);
@@ -110,10 +101,7 @@ export function MicPicker({
     if (!match) {
       // Dead preference (device gone, label matches nothing): re-persist
       // the live input so future starts stop paying a doomed exact-id
-      // getUserMedia on every visit (F3). Deliberate trade-off (PM call):
-      // this forgets a merely-absent device (AirPods left home) — re-
-      // picking a mic is trivial; a failing constraint every session
-      // start is worse.
+      // getUserMedia on every visit.
       saveMicPreference({ deviceId: flags.deviceId, label: flags.deviceLabel });
       return;
     }

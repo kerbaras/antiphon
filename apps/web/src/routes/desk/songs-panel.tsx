@@ -1,4 +1,4 @@
-// Right-rail Songs panel (W2-B): the selected take's marker-started songs.
+// Right-rail Songs panel: the selected take's marker-started songs.
 
 import { useRef, useState } from "react";
 import { formatAt, formatSpan } from "./format";

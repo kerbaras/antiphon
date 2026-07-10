@@ -1,5 +1,5 @@
-// The desk's MIDI input card (W3-C), hosted by the performers panel next to
-// the desk audio input — same enable/resume UX, no audio path behind it.
+// The desk's MIDI input card, hosted by the performers panel next to the
+// desk audio input — same enable/resume UX, no audio path behind it.
 
 import { useState } from "react";
 import { Avatar, SectionLabel, StatusPill } from "../../components";
@@ -7,11 +7,10 @@ import { MIDI_EVENT_CAP } from "./midi";
 import { initialsOf } from "./track-model";
 import { type DeskMidiState, getDeskMidi } from "./use-desk-midi";
 
-/** Desk MIDI input (W3-C): permission probe → input picker → armed lane.
- * While a take rolls the lane timestamps channel messages into the take;
- * it is a DATA lane — playback stays silent (the room mics carried the
- * piano), the payoff is the .mid export. Enable/disable sit out rolling
- * takes, like the desk audio input: lanes never appear mid-take. */
+/** Permission probe → input picker → armed lane. While a take rolls the
+ * lane timestamps channel messages into the take; it is a DATA lane —
+ * playback stays silent, the payoff is the .mid export. Enable/disable
+ * sit out rolling takes: lanes never appear mid-take. */
 export function MidiInputBlock({
   sessionId,
   midi,

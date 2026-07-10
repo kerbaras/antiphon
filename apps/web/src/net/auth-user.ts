@@ -1,9 +1,6 @@
-// W8-A follow-up: the signed-in user's DISPLAY identity (email + profile
-// picture), bridged from React (where Clerk lives) to the non-React net
-// layer — auth-token.ts's exact pattern, for identity instead of tokens.
-// KEYLESS INVARIANT: nothing registered → every reader sees null and every
-// flow behaves exactly as before (no email defaults, no avatarUrl on the
-// wire). Nothing in /net imports Clerk.
+// The signed-in user's display identity (email + profile picture), bridged
+// from React (where Clerk lives) to the non-React net layer — auth-token.ts's
+// pattern. Keyless: nothing registered → readers see null. No Clerk in /net.
 
 export interface AuthUserIdentity {
   /** Primary email address, or null while Clerk hasn't resolved one. */

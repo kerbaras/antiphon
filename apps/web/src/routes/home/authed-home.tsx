@@ -1,11 +1,6 @@
-// W8-A auth-mode landing (lazy chunk: this file is the home route's only
-// @clerk/react importer, so keyless visitors never download Clerk bytes).
-//
-// Signed out: wordmark, pitch, sign-in/up, join-by-code — NO create button
-// (creating a session needs an owner). Signed in: "Your sessions" and
-// "Shared with me" (GET /api/me/sessions), create-session, join-by-code,
-// UserButton. Join-by-code stays accountless in both states: singers with
-// a link are mics, not accounts.
+// Auth-mode landing (lazy chunk: the home route's only @clerk/react
+// importer). Signed out: sign-in/up + join-by-code — no create button, a
+// session needs an owner. Signed in: session lists, create, UserButton.
 
 import { UserButton, useAuth, useClerk } from "@clerk/react";
 import { useEffect, useState } from "react";
@@ -20,8 +15,8 @@ export default function AuthedHome() {
   const { isLoaded, isSignedIn } = useAuth();
   const navigate = useNavigate();
 
-  // isLoaded gate first, always (clerk-react-patterns): render the shared
-  // skeleton rather than flashing the signed-out affordances.
+  // isLoaded gate first, always: render the shared skeleton rather than
+  // flashing the signed-out affordances.
   if (!isLoaded) {
     return (
       <main className="grid min-h-dvh place-items-center bg-void p-6">
@@ -146,8 +141,7 @@ function SignedInHome() {
   );
 }
 
-/** One landing bucket: name (short id), created, take count — the desk is
- * one click away. Owner attribution only makes sense on the shared bucket. */
+/** One landing bucket. Owner attribution only makes sense on the shared one. */
 function SessionList({
   label,
   sessions,

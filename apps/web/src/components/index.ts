@@ -1,6 +1,7 @@
 export { Avatar, AvatarImg } from "./avatar";
 export { Button } from "./button";
 export { cx } from "./cx";
+export { sliderStep, trackPointerDrag } from "./interactions";
 export { PopoverBackdrop, PopoverCard, useEscapeToClose } from "./popover";
 export { StyledQr } from "./qr";
 export { type PillTone, RecDot, StatusPill, VUMeter } from "./status";

@@ -7,8 +7,8 @@ import "./styles.css";
 // biome-ignore lint/style/noNonNullAssertion: root element is in index.html
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
-    {/* W8-A: ClerkProvider mounts at the root iff the server enforces
-        auth; keyless renders the app bare (today's tree byte-for-byte). */}
+    {/* ClerkProvider mounts at the root iff the server enforces auth;
+        keyless renders the app bare. */}
     <AuthRoot>
       <App />
     </AuthRoot>

@@ -7,8 +7,8 @@ import { downloadStreamFlac } from "../../net/stream-download";
 import type { DriftResult } from "./player";
 import type { ServerStreamStatus } from "./use-desk";
 
-/** Plain-words decode of the drift readout, as a hover tooltip (QA low:
- * "c 0.00 · off" was cryptic). Exported for unit tests. */
+/** Plain-words decode of the drift readout, shown as its hover tooltip.
+ * Exported for unit tests. */
 export function driftTitle(drift: DriftResult): string {
   if (drift.isReference) {
     return "this stream is the drift reference — every other lane's clock is measured against it";
@@ -47,7 +47,7 @@ export function SinksPanel({
   deskStatus: DeskStreamStatus[];
   serverStatus: Map<string, ServerStreamStatus>;
   driftByStream: Map<string, DriftResult>;
-  /** A6-truncated streams (F9): terminally incomplete, never converging. */
+  /** Truncated streams: terminally incomplete, never converging. */
   orphanedStreams: Set<string>;
   /** Stream → lane name (nickname when set) for the card label. */
   laneNameOf: (streamId: string) => string | undefined;
@@ -71,8 +71,8 @@ export function SinksPanel({
             className="flex flex-col gap-1.5 rounded-lg border border-edge-card bg-card-hi px-2.5 py-[9px]"
           >
             <div className="flex items-center justify-between gap-2">
-              {/* Lane name first (QA low: cards were raw-UUID-labeled);
-                  the short stream id keeps the diagnostic identity. */}
+              {/* Lane name first; the short stream id keeps the
+                  diagnostic identity. */}
               <span className="flex min-w-0 items-baseline gap-1.5" title={desk.streamId}>
                 {lane && (
                   <span className="truncate text-[11px] font-semibold text-text-strong">
@@ -86,9 +86,9 @@ export function SinksPanel({
               {desk.flagged || server?.flagged ? (
                 <StatusPill tone="rec">flagged</StatusPill>
               ) : incomplete ? (
-                // Terminal by design (A6): the phone reloaded mid-take and
-                // this stream's final length is undecidable — it will
-                // never reconcile to "converged".
+                // Terminal by design: the phone reloaded mid-take and this
+                // stream's final length is undecidable — it will never
+                // reconcile to "converged".
                 <StatusPill tone="warn" className="flex-none">
                   ⚠ incomplete
                 </StatusPill>
@@ -115,10 +115,9 @@ export function SinksPanel({
               }
             />
             {desk.finalSeq !== null && <MonoReadout label="final seq" value={desk.finalSeq} />}
-            {/* The mic behind this stream (W5-B): the seq-0 header's
-                device description, as archived — with W4-F it carries the
-                picked input's label. Absent = the archive holds none
-                (pre-mic-metadata stream), so no line rather than a guess. */}
+            {/* The mic behind this stream: the seq-0 header's device
+                description, as archived. Absent = the archive holds none,
+                so no line rather than a guess. */}
             {server?.deviceDesc && (
               <MonoReadout
                 label="mic"
@@ -141,9 +140,9 @@ export function SinksPanel({
                 href={`/api/streams/${desk.streamId}/flac`}
                 download
                 onClick={(e) => {
-                  // Auth mode: the export route is desk-gated (W8-A) and
-                  // anchors can't carry the token — intercept and fetch.
-                  // Keyless: authActive() is false, plain anchor as always.
+                  // Auth mode: the export route is desk-gated and anchors
+                  // can't carry the token — intercept and fetch. Keyless:
+                  // authActive() is false, plain anchor as always.
                   if (authActive()) {
                     e.preventDefault();
                     void downloadStreamFlac(desk.streamId);

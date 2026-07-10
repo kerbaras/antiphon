@@ -27,24 +27,20 @@ export const sessions = pgTable("sessions", {
   /** Touched on join and take start/stop (signaling-level, never per-chunk);
    * the expiry sweep hard-deletes sessions idle past SESSION_TTL_HOURS. */
   lastActivityAt: timestamp("last_activity_at", { withTimezone: true }).notNull().defaultNow(),
-  /** Clerk user id of the session owner (W8-A). NULL in keyless mode and
-   * for legacy sessions; with auth ON, the first authenticated desk opener
-   * claims an ownerless session (atomic claim in auth/access.ts) — after
-   * that the desk surface is owner+sharee only. Never a foreign key: users
-   * live in Clerk, not in this database. */
+  /** Clerk user id of the owner. NULL in keyless mode and for ownerless
+   * sessions (claimed by the first authenticated desk opener — see
+   * auth/access.ts). Never a foreign key: users live in Clerk, not here. */
   ownerUserId: text("owner_user_id"),
   /** Owner's primary email at claim/create time, normalized lowercase.
-   * Deliberate denormalization: the landing's "Shared with me" list shows
-   * who owns a session without a Clerk API call per row. Display-only —
-   * authorization always compares ownerUserId / session_shares. */
+   * Display-only denormalization ("Shared with me" list) — authorization
+   * always compares ownerUserId / session_shares. */
   ownerEmail: text("owner_email"),
 });
 
-/** W8-A desk-access shares: (session, normalized-lowercase email). Grants
- * the USE capability (desk surface) to any Clerk user holding a VERIFIED
- * matching email — distinct from the mic-join capability, which stays a
- * public bearer link (RFC §12). Rows are meaningful only when auth is ON;
- * keyless mode never reads this table. */
+/** Desk-access shares: (session, normalized-lowercase email). Grants the
+ * desk surface to any Clerk user holding a VERIFIED matching email — the
+ * mic-join capability stays a public bearer link (RFC §12). Only read when
+ * auth is ON. */
 export const sessionShares = pgTable(
   "session_shares",
   {
@@ -143,10 +139,9 @@ export const gaps = pgTable(
   (t) => [primaryKey({ columns: [t.streamId, t.startSeq] })],
 );
 
-/** W3-A shared project doc (Yjs): the session's mix/markers/comments/arrange
- * state as one merged CRDT update (`Y.encodeStateAsUpdate`). Audio bytes are
- * NEVER in here — blobs stay content-addressed in the blob store
- * (ARCHITECTURE §6); this row is small metadata like everything else. */
+/** Shared project doc (Yjs): mix/markers/comments/arrangement state as one
+ * merged CRDT update (`Y.encodeStateAsUpdate`). Audio bytes are NEVER in
+ * here — blobs stay content-addressed in the blob store (ARCHITECTURE §6). */
 export const collabDocs = pgTable("collab_docs", {
   sessionId: uuid("session_id")
     .primaryKey()

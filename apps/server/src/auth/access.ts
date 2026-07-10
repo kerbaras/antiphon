@@ -1,20 +1,7 @@
-// Desk-surface authorization (W8-A). The access model has exactly two
-// capability classes — keep them distinct everywhere:
-//
-// - USE a session (desk surface: /session/:uuid WS + collab + desk REST):
-//   requires a valid Clerk user who is the session OWNER or a SHAREE.
-//   Sharees get FULL desk powers in v1, including transport and session
-//   delete (matches the A14 multi-desk stance: any authorized desk is the
-//   desk); only share MANAGEMENT stays owner-only. Per-role permissions
-//   are documented future work.
-// - JOIN as mic (/join/:uuid + recorder WS + chunk ingest): stays a public
-//   bearer capability (RFC §12) — zero account friction for singers. This
-//   module is never consulted on that surface.
-//
-// Legacy/ownerless sessions: when auth is ON, the FIRST authenticated desk
-// opener claims ownership — an atomic `SET owner WHERE owner IS NULL`, so
-// two racing desks resolve to one owner and the loser re-reads. The claim
-// is persisted and logged; after that, normal rules.
+// Desk-surface authorization. Two capability classes, distinct everywhere:
+// USE a session (desk WS + collab + desk REST — owner or sharee; sharees
+// get full desk powers, only share MANAGEMENT is owner-only) vs JOIN as
+// mic (public bearer link, RFC §12 — this module is never consulted there).
 
 import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import type { Db } from "../db/index.ts";

@@ -1,13 +1,8 @@
-// Desk hardware input (W2-D): the desk embeds a recorder built from the
-// SAME CaptureController + RecorderSession machinery the phone uses — on the
-// wire it is just another recorder peer (zero protocol changes). Its chunks
-// reach the desk's own sink over the ordinary P2P leg (ICE trivially finds
-// the same-machine loopback path) and the server leg simultaneously, exactly
-// like a phone on the desk's LAN; no sink special-casing anywhere. The W1-E
-// pendingArm queue covers the welcome→arm vs encoder-boot race for free.
-//
-// One manager per desk page, bridged into React via useSyncExternalStore
-// (house style of use-capture.ts), with the __antiphonDeskInput e2e hook.
+// Desk hardware input: the desk embeds a recorder built from the SAME
+// CaptureController + RecorderSession machinery the phone uses — on the
+// wire it is just another recorder peer; no sink special-casing anywhere.
+// One manager per page, bridged into React via useSyncExternalStore, with
+// the __antiphonDeskInput e2e hook.
 
 import { useCallback, useSyncExternalStore } from "react";
 import {
@@ -36,7 +31,7 @@ export interface DeskInputState {
   devices: DeskInputDeviceOption[];
   /** The live input, when phase = live. */
   input: DeskInputDeviceOption | null;
-  /** Lane nickname (desk renames land here via peer-update, A13). */
+  /** Lane nickname (desk renames land here via peer-update). */
   laneLabel: string | null;
   peerId: string | null;
   streamId: string | null;
@@ -50,7 +45,7 @@ export interface DeskInputState {
   /** The selected device vanished; the lane records silence until swapped
    * or disabled between takes (sample-domain continuity over dead air). */
   unplugged: boolean;
-  /** Persisted input from a previous visit — one-click resume (A12). */
+  /** Persisted input from a previous visit — one-click resume. */
   resumeLabel: string | null;
   error: string | null;
 }
@@ -80,7 +75,7 @@ export class DeskInput {
   private prefs: DeskInputPrefs | null = loadDeskInputPrefs();
   private state: DeskInputState = { ...OFF_STATE, resumeLabel: this.prefs?.inputLabel ?? null };
   private readonly listeners = new Set<Listener>();
-  /** Final-seq dedupe, per (takeId, streamId, finalSeq) — see use-capture.ts. */
+  /** Final-seq dedupe, per (takeId, streamId, finalSeq). */
   private lastReportedFinal: string | null = null;
 
   constructor(readonly sessionId: string) {
@@ -107,18 +102,24 @@ export class DeskInput {
     for (const l of this.listeners) l(this.state);
   }
 
-  /** Open the device picker. Labels are blank until getUserMedia grants,
-   * so a throwaway probe stream runs first (stopped immediately). */
-  async openPicker(): Promise<void> {
-    if (this.state.phase === "live") return;
+  /** Labels are blank until getUserMedia grants, so a throwaway probe
+   * stream runs first (stopped immediately). False = permission denied. */
+  private async probeMicPermission(): Promise<boolean> {
     this.patch({ phase: "picking", error: null });
     try {
       const probe = await navigator.mediaDevices.getUserMedia({ audio: true });
       for (const track of probe.getTracks()) track.stop();
+      return true;
     } catch (e) {
       this.patch({ phase: "off", error: `microphone permission: ${String(e)}` });
-      return;
+      return false;
     }
+  }
+
+  /** Open the device picker. */
+  async openPicker(): Promise<void> {
+    if (this.state.phase === "live") return;
+    if (!(await this.probeMicPermission())) return;
     await this.refreshDevices();
   }
 
@@ -139,8 +140,7 @@ export class DeskInput {
     } catch (e) {
       this.controller = null;
       void controller.teardown();
-      // The card shows the friendly line; keep the raw cause for devtools
-      // (NotAllowedError vs NotFoundError vs OverconstrainedError…).
+      // The card shows the friendly line; keep the raw cause for devtools.
       console.warn("[desk-input] capture failed to start", e);
       this.patch({ phase: "picking", error: "input failed to start — is it still connected?" });
       return;
@@ -148,7 +148,7 @@ export class DeskInput {
     controller.audioTrack?.addEventListener("ended", () => this.patch({ unplugged: true }));
     const laneLabel = this.prefs?.label ?? defaultDeskInputLabel(device.label);
     const session = new RecorderSession(this.sessionId, controller, {
-      // Derived from the desk's browser id (A12): reloads resume this lane.
+      // Stable derived deviceId so a reload resumes the lane.
       deviceId: deriveDeskInputDeviceId(getDeviceId()),
       label: laneLabel,
       persistLabel: (label) => this.persistLabel(label),
@@ -169,21 +169,14 @@ export class DeskInput {
 
   /** One click after a reload: re-enable the persisted input. Permission is
    * already granted and the derived deviceId is stable, so the server hands
-   * back the same peerId — the lane resumes instead of forking (A12). */
+   * back the same peerId — the lane resumes instead of forking. */
   async resume(): Promise<void> {
     const prefs = this.prefs;
     if (!prefs) {
       await this.openPicker();
       return;
     }
-    this.patch({ phase: "picking", error: null });
-    try {
-      const probe = await navigator.mediaDevices.getUserMedia({ audio: true });
-      for (const track of probe.getTracks()) track.stop();
-    } catch (e) {
-      this.patch({ phase: "off", error: `microphone permission: ${String(e)}` });
-      return;
-    }
+    if (!(await this.probeMicPermission())) return;
     const devices = await this.refreshDevices();
     // Device ids persist per origin; fall back to the label if the browser
     // re-minted them (cleared site data).

@@ -1,14 +1,6 @@
-// Standard MIDI File writer (W3-C) — format 0, one track, dependency-free.
-//
-// seconds → ticks, exactly: the file declares 480 TPQN and a fixed tempo of
-// 120 BPM (set-tempo meta = 500 000 µs/quarter), so one quarter = 0.5 s and
-// tick = round(atSec × 480 / 0.5) = round(atSec × 960). The ~1.04 ms tick
-// grid matches the capture-side precision (see midi.ts). Antiphon has no
-// musical tempo — the session clock is the grid — so 120 BPM is purely the
-// time base; DAWs import wall-clock-correct events either way.
-//
-// Running status is deliberately NOT used: every event carries its status
-// byte. Correctness (and trivial parseability) over the ~2 byte/event win.
+// Standard MIDI File writer — format 0, one track. 480 TPQN at a fixed
+// 500 000 µs/quarter (120 BPM, purely a time base) ⇒ tick = round(atSec × 960).
+// Running status deliberately NOT used: every event carries its status byte.
 
 import { type MidiEvent, midiDataBytes, sortMidiEvents } from "./midi";
 

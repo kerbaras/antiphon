@@ -1,26 +1,15 @@
-// W4-E — lane context menu. Right-click on a lane (sidebar row header or
-// mixer strip) opens this cursor-anchored menu: Move up · Move down · Solo
-// · Mute · Delete. Moves write the shared-doc lane order — the one
-// sanctioned exception to F8's frozen ranks (see track-model.ts
-// applyLaneMoves); Solo/Mute toggle the lane's channel strip exactly like
-// its S/M buttons; Delete only STAGES the lane's recorded clips behind the
-// existing F2 confirm dialog — never a direct destroy. Export-menu
-// styling: card panel, hard shadow, mono hints. Dismiss on click-away or
-// Escape; arrows/Home/End/Tab walk the enabled items; inapplicable items
-// are honestly disabled with the reason on hover.
+// Lane context menu (right-click on a sidebar row header or mixer strip):
+// Move up/down write the shared-doc lane order, Solo/Mute mirror the strip's
+// S/M buttons, Delete only STAGES recorded clips behind the confirm dialog.
 
 import { useLayoutEffect, useRef, useState } from "react";
-import { SectionLabel } from "../../components";
+import { cx, SectionLabel } from "../../components";
 
 /** Where and for which lane the menu is open (index.tsx owns the state). */
 export interface LaneMenuState {
   laneKey: string;
   x: number;
   y: number;
-}
-
-function cx(...parts: Array<string | false | null | undefined>): string {
-  return parts.filter(Boolean).join(" ");
 }
 
 export function LaneContextMenu({
@@ -59,8 +48,7 @@ export function LaneContextMenu({
   const menuRef = useRef<HTMLDivElement | null>(null);
   const [pos, setPos] = useState({ x, y });
 
-  // Clamp into the viewport (a right-click near the mixer footer must not
-  // push items off-screen) and land focus on the first enabled item so
+  // Clamp into the viewport and land focus on the first enabled item so
   // arrows/Enter work immediately.
   useLayoutEffect(() => {
     const el = menuRef.current;
@@ -105,12 +93,10 @@ export function LaneContextMenu({
   };
 
   /** Right-click while open re-anchors in ONE gesture (native-menu
-   * behavior): close, then hand the same cursor position to whatever sits
-   * underneath — a lane surface reopens its own menu there, anywhere else
-   * just dismisses. Wired on the backdrop AND the panel itself (the panel
-   * often covers the neighboring strip the operator is aiming at); both
-   * carry data-lane-menu so the hit-test skips the whole overlay. The
-   * forwarded event is synthetic, so no browser menu can appear. */
+   * behavior): close, then forward the cursor position to whatever sits
+   * underneath — backdrop and panel both carry data-lane-menu so the
+   * hit-test skips the whole overlay. The forwarded event is synthetic,
+   * so no browser menu can appear. */
   function reanchorContextMenu(e: React.MouseEvent) {
     e.preventDefault();
     onClose();
@@ -128,7 +114,8 @@ export function LaneContextMenu({
 
   return (
     <>
-      {/* Click-away backdrop. */}
+      {/* Not the shared PopoverBackdrop: this one must carry data-lane-menu
+          and the re-anchor contextmenu handler. */}
       <button
         type="button"
         aria-label="Close lane menu"
@@ -148,9 +135,8 @@ export function LaneContextMenu({
         className="fixed z-[31] w-[172px] rounded-lg border border-edge-card bg-card p-1 shadow-[0_10px_28px_rgba(0,0,0,.55)]"
         style={{ left: pos.x, top: pos.y }}
       >
-        {/* Strict menu ARIA: the label header is presentational chrome,
-            the dividers are real <hr> separators (implicit role) — only
-            menuitems are items. */}
+        {/* Strict menu ARIA: the label header is presentational chrome, the
+            dividers are real <hr> separators — only menuitems are items. */}
         <div role="presentation" className="truncate px-2.5 pt-1 pb-0.5">
           <SectionLabel>{laneName}</SectionLabel>
         </div>

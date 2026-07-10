@@ -1,9 +1,6 @@
-// F5 — serialized, latest-wins job queue for take loads. The player can
-// only decode one take at a time; a load requested while another is in
-// flight used to be dropped on the floor (player.load's `loading` guard),
-// stranding the transport on the stale take. The queue keeps exactly one
-// pending request — the LATEST — and runs it when the in-flight load
-// settles, so the player always converges to the most recent selection.
+// Serialized, latest-wins job queue for take loads: the player decodes one
+// take at a time, so exactly one pending request (the latest) is kept and
+// runs when the in-flight load settles.
 
 export class LoadQueue<T> {
   private inFlight = false;
@@ -15,9 +12,8 @@ export class LoadQueue<T> {
   constructor(
     run: (req: T, superseded: () => boolean) => Promise<void>,
     onError: (error: unknown, req: T) => void = () => {},
-    // A replaced PENDING request never runs (latest wins) — callers that
-    // await a settle signal (the W7-A align flow) must hear about the
-    // drop or they would wait forever.
+    // A replaced PENDING request never runs — callers awaiting a settle
+    // signal must hear about the drop or they would wait forever.
     onDropped: (req: T) => void = () => {},
   ) {
     this.run = run;
@@ -54,8 +50,7 @@ export class LoadQueue<T> {
           // when a newer request is already waiting to replace its result.
           await this.run(req, () => this.pending !== null);
         } catch (error) {
-          // A failed load must never wedge the queue: report and move on
-          // to whatever is pending (or stop).
+          // A failed load must never wedge the queue: report and move on.
           this.onError(error, req);
         }
         current = this.pending;

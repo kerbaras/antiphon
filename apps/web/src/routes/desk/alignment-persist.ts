@@ -1,42 +1,6 @@
-// F7b — per-take alignment persistence. Chirp/drift verdicts are
-// TAKE-DERIVED state (a pure measurement of the recorded audio), so the
-// source of truth is the shared project doc: every desk plays the same
-// take and needs the same schedule offsets, and reapplying a stored
-// verdict beats re-measuring (re-running needs the decoded audio plus
-// ~100 ms of correlation per track). localStorage keeps a SHADOW copy per
-// the markers/comments pattern (use-desk.ts W3-A boundary): it seeds the
-// doc after offline/server-restart gaps and gives a lone desk reload
-// parity with zero round-trips. Restored values land on player track
-// state only — the SAME fields align() writes, consumed through the same
-// timing()/planSource math as the offline render — so playback parity is
-// by construction and stored audio is never touched (RFC §13).
-//
-// Doc shape: getMap('alignment')  takeId → { at, entries: Record<streamId, …> }
-// Whole-take verdicts write at most once per align() run; the Y.Map key is
-// last-write-wins per takeId. Two desks measuring the same take
-// concurrently converge to one desk's verdict — both are honest
-// measurements of the same audio, the accepted bound (mirrors
-// collab-doc.ts's documented Y.Map semantics). Equal-content writes are
-// skipped, so doc echoes can never ping-pong.
-//
-// WIRE COMPAT (W4-B): stored entries are encoded (encodeEntry) before they
-// touch the doc or the shadow. Chirp verdicts keep the v1 shape; CONTENT
-// verdicts carry their lag as `contentLagSamples` and OMIT `lagSamples` —
-// pre-W4-B desks validate `lagSamples` as a finite number and rebuild only
-// known keys, so a content entry parsed by an old desk fails validation
-// and drops WHOLE (honest "no verdict" → that stream plays unaligned)
-// instead of being mistaken for a chirp lag and wrapped modulo the sweep
-// repeat interval — a real 1.9 s content offset would otherwise tear ~2 s
-// between desk versions on one session. New desks read both shapes;
-// decode normalizes back to the in-memory AlignmentResult.
-//
-// FRESHNESS (`at`, measurement wall-clock): the collab client coalesces
-// outgoing updates (~33 ms), so a verdict measured moments before a reload
-// may never reach the server — after the reload the doc then syncs an
-// OLDER verdict than the localStorage shadow holds. Restore and the sync
-// observer therefore both run newest-wins between the two layers, and the
-// fresher side is written back to the other — the newest measurement
-// always survives, on every desk.
+// Per-take alignment persistence: verdicts live in the shared doc
+// (getMap('alignment'), LWW per takeId) with a localStorage shadow;
+// restore/sync run newest-wins by `at` and write the winner back.
 
 import type * as Y from "yjs";
 import type { PlayerSnapshot, StoredTrackAlignment } from "./player";
@@ -64,10 +28,10 @@ export interface TakeAlignmentRecord {
   entries: TakeAlignment;
 }
 
-/** One stream's verdict as it travels the doc / localStorage (see the
- * WIRE COMPAT header note): chirp lags under `lagSamples` (v1 shape),
- * content lags under `contentLagSamples` — structurally invisible to
- * legacy validators, which is the point. */
+/** Wire shape. WIRE COMPAT: chirp lags travel as `lagSamples` (v1 shape),
+ * content lags as `contentLagSamples` and OMIT `lagSamples`, so legacy
+ * desks drop the whole entry (honest "no verdict") instead of wrapping a
+ * content lag modulo the chirp sweep interval and tearing the timeline. */
 interface WireTrackAlignment {
   alignment: {
     lagSamples?: number;
@@ -133,12 +97,9 @@ function isFiniteNumber(v: unknown): v is number {
   return typeof v === "number" && Number.isFinite(v);
 }
 
-/** Validate one wire alignment and decode it to the in-memory shape (null
- * = malformed, drop the entry). Method rules: absent = legacy chirp;
- * chirp entries carry `lagSamples`, content entries carry
- * `contentLagSamples` (the WIRE COMPAT rule — a content entry with only a
- * plain `lagSamples` does not exist in any released writer and is treated
- * as junk); anything else is junk. */
+/** Validate one wire alignment and decode it to the in-memory shape (null =
+ * malformed, drop the entry). Absent method = legacy chirp; chirp needs
+ * `lagSamples`, content needs `contentLagSamples`; anything else is junk. */
 function decodeAlignment(v: unknown): StoredTrackAlignment["alignment"] | null {
   if (typeof v !== "object" || v === null) return null;
   const a = v as Record<string, unknown>;
@@ -188,10 +149,8 @@ export function parseTakeAlignment(raw: unknown): TakeAlignment | null {
   for (const [streamId, value] of Object.entries(raw)) {
     if (typeof value !== "object" || value === null) continue;
     const entry = value as Record<string, unknown>;
-    // Rebuild exact shapes — never let unknown extra keys ride along.
-    // decodeAlignment applies the WIRE COMPAT rule (content lags travel
-    // as `contentLagSamples`) and normalizes legacy entries to chirp so
-    // every consumer downstream sees one canonical in-memory shape.
+    // Rebuild exact shapes — never let unknown extra keys ride along;
+    // decodeAlignment normalizes to one canonical in-memory shape.
     const alignment = decodeAlignment(entry.alignment);
     if (!alignment) continue;
     const drift = entry.drift ?? null;
@@ -272,10 +231,8 @@ export function readDocAlignment(doc: Y.Doc, takeId: string): TakeAlignmentRecor
 }
 
 /** Write a take's verdict iff it differs from what the doc holds (LWW per
- * takeId key; equal-content writes skipped — no echo loops; wire-encoded,
- * see the WIRE COMPAT header note). A legacy record that decodes equal
- * but re-encodes differently (e.g. gains the explicit method) causes one
- * converging rewrite, never a loop — the second compare is byte-equal. */
+ * takeId; equal-content writes skipped — no echo loops). A legacy record
+ * re-encoding differently causes one converging rewrite, never a loop. */
 export function writeDocAlignmentIfChanged(
   doc: Y.Doc,
   takeId: string,
@@ -322,11 +279,9 @@ export function persistTakeAlignment(
   saveLocalAlignment(sessionId, takeId, record);
 }
 
-/** Newest-wins between the two layers (ties → the doc, the shared source
- * of truth), then write the winner back to the losing layer: a verdict
- * measured moments before a reload (shadow fresher than the unsynced doc)
- * survives AND propagates; a doc verdict from another desk refreshes the
- * shadow. */
+/** Newest-wins between the two layers (ties → the doc), then write the
+ * winner back to the losing layer: a verdict measured moments before a
+ * reload survives AND propagates; a remote doc verdict refreshes the shadow. */
 function reconcile(
   collab: CollabDocHandle,
   sessionId: string,
@@ -341,10 +296,9 @@ function reconcile(
   return winner;
 }
 
-/** Read a take's persisted verdict without a player in the loop (W6-B:
- * the engine's look-ahead mounts and the session render apply verdicts to
- * takes that were never selected). Runs the same newest-wins reconcile as
- * a restore, so both layers converge as a side effect. */
+/** Read a take's persisted verdict without a player in the loop (look-ahead
+ * mounts, session render). Runs the same newest-wins reconcile as a
+ * restore, so both layers converge as a side effect. */
 export function readTakeAlignment(
   collab: CollabDocHandle,
   sessionId: string,
@@ -365,13 +319,10 @@ export function restoreTakeAlignment(
   return winner ? player.restoreAlignment(takeId, winner.entries) : false;
 }
 
-/** Two-way binding, mirroring use-collab.ts bindMixToCollab: settled
- * align() runs persist (player → doc/shadow); remote doc updates reconcile
- * newest-wins and reapply to the loaded take (doc → player). Loop-safe by
- * construction: local writes carry `collab.origin` (observer skips them),
- * restores never fire onAlignmentSettled, equal-content writes/restores
- * are no-ops, and a fresher-shadow push-back strictly increases the doc's
- * `at` (so it can happen at most once per stale remote write). */
+/** Two-way binding: settled align() runs persist (player → doc/shadow);
+ * remote doc updates reconcile newest-wins and reapply (doc → player).
+ * Loop-safe: local writes carry `collab.origin`, restores never fire
+ * onAlignmentSettled, and equal-content writes/restores are no-ops. */
 export function bindAlignmentToCollab(
   collab: CollabDocHandle,
   player: AlignmentPlayerPort,

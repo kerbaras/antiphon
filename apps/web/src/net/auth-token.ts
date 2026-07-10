@@ -1,9 +1,6 @@
-// W8-A token plumbing between React (where Clerk lives) and the non-React
-// network layer (DeskSession, SignalingClient, CollabClient, raw fetches).
-// KEYLESS INVARIANT: with no getter registered — keyless mode, or Clerk not
-// yet mounted — every helper degrades to exactly today's behavior: plain
-// fetch, hello without authToken, collab URL without a query string. The
-// registry is the ONLY coupling; nothing in /net imports Clerk.
+// Token plumbing between React (where Clerk lives) and the non-React net
+// layer. Keyless invariant: with no getter registered, every helper degrades
+// to unauthenticated behavior. Nothing in /net imports Clerk.
 
 type TokenGetter = () => Promise<string | null>;
 

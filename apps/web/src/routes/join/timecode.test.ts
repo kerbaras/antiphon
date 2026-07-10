@@ -1,6 +1,3 @@
-// QA #16: phone timecode must read as minutes:seconds.centiseconds — the
-// old MM:SS:CC triple read as HH:MM:SS.
-
 import { describe, expect, it } from "vitest";
 import { formatClock } from "./timecode";
 

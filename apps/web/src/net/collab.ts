@@ -1,78 +1,39 @@
-// W3-A collab provider: owns the session's Y.Doc + awareness and keeps them
-// synced over the /session/:uuid/collab WSS route (same origin as the
-// signaling socket; vite proxies in dev/preview). Doc SHAPE and mutation
-// rules live in collab-doc.ts; desk bindings (player/markers/comments/
-// arrange/presence) live in routes/desk/use-collab.ts.
-//
-// Wire protocol — mirror of apps/server/src/collab (1-byte tag + payload):
-//   0x00 sync-step-1  payload = Y.encodeStateVector   "what do you have?"
-//   0x01 update       payload = Y update              step-2 reply / live edit
-//   0x02 awareness    payload = awareness update      presence
-// On open both sides send their step-1 and answer the other's with a diff
-// update. Outgoing doc updates are coalesced (~30 Hz, Y.mergeUpdates) and
-// awareness sends are throttled (~5 Hz) so a fader/clip drag can never trip
-// the server's per-connection flood guard.
-//
-// OFFLINE FALLBACK: the doc is local-first — with no server reachable every
-// read/write works against the in-memory doc, the desk behaves exactly as a
-// single-operator desk, and localStorage shadow writes (see use-desk.ts
-// hooks) keep persistence at single-desk parity. Reconnects re-run the full
-// step-1/step-2 exchange, so nothing buffered is ever lost to a dropout.
-//
-// AUTHORITY BOUNDARY (W3-A, documented): this doc carries mix state,
-// markers, comments and clip arrangement ONLY. Transport control
-// (record/stop/chirp/delete/disarm) stays on the signaling protocol — any
-// desk may issue them, last write wins exactly as with a single desk, and
-// A14 re-assert semantics are unchanged. Multi-desk take authority needs a
-// server-side room epoch: the documented v2 follow-up, out of scope here.
+// Collab provider: owns the session's Y.Doc + awareness and keeps them
+// synced over the /session/:uuid/collab WSS route. Local-first: offline,
+// every read/write hits the in-memory doc; a reconnect re-runs the full
+// sync handshake, so nothing buffered is ever lost to a dropout.
 
 import { Awareness, applyAwarenessUpdate, encodeAwarenessUpdate } from "y-protocols/awareness";
 import * as Y from "yjs";
 import { authToken } from "./auth-token";
 import { createArrangementUndo } from "./collab-doc";
+import {
+  type CollabPeer,
+  type CollabSnapshot,
+  type CollabStatus,
+  defaultPresence,
+  type PresenceState,
+  readPeers,
+} from "./collab-presence";
+import {
+  MSG_AWARENESS,
+  MSG_SYNC_STEP1,
+  MSG_UPDATE,
+  openCollabSocket,
+  sendFrame,
+} from "./collab-socket";
 
-const MSG_SYNC_STEP1 = 0;
-const MSG_UPDATE = 1;
-const MSG_AWARENESS = 2;
+export type { CollabPeer, CollabSnapshot, CollabStatus, PresenceState };
 
 const RECONNECT_BASE_MS = 1_000;
 const RECONNECT_MAX_MS = 8_000;
-/** Upgrade answered within this or the attempt is aborted (see open()). */
-const HANDSHAKE_TIMEOUT_MS = 10_000;
-/** Outgoing doc updates coalesce into ≤ ~30 frames/s. */
+/** Outgoing doc updates coalesce into ≤ ~30 frames/s so a fader/clip drag
+ * can never trip the server's per-connection flood guard. */
 const UPDATE_FLUSH_MS = 33;
 /** Outgoing presence coalesces into ≤ ~5 frames/s. */
 const AWARENESS_FLUSH_MS = 200;
 /** An `editing` presence mark decays this long after the last touch. */
 const EDITING_DECAY_MS = 2_500;
-
-export type CollabStatus = "connecting" | "connected" | "offline";
-
-/** What each desk publishes about itself (awareness; never in the doc). */
-export interface PresenceState {
-  /** Operator label (the comment-author preference; "Desk" by default). */
-  name: string;
-  /** Track-palette hex, derived from the clientID. */
-  color: string;
-  /** Account profile picture (A16) — the top-bar face of a remote desk. */
-  avatarUrl: string | null;
-  /** Ghost-cursor position on the shared arrangement timeline. */
-  playheadSec: number | null;
-  activeTakeId: string | null;
-  /** What the desk is touching: "mix:<channelKey>" | "markers" | "comments". */
-  editing: string | null;
-}
-
-export interface CollabPeer extends PresenceState {
-  clientId: number;
-}
-
-export interface CollabSnapshot {
-  status: CollabStatus;
-  synced: boolean;
-  /** OTHER desks in the room (never includes this client). */
-  peers: CollabPeer[];
-}
 
 export class CollabClient {
   readonly sessionId: string;
@@ -85,8 +46,8 @@ export class CollabClient {
    * to the wire like `origin`, but excluded from the undo ledger — Ctrl+Z
    * must never resurrect doc keys for durably deleted streams. */
   readonly systemOrigin: object = {};
-  /** Arrangement undo ledger (W9-F): this desk's own regions/arrange
-   * edits, undoable in gesture-sized steps. */
+  /** Arrangement undo ledger: this desk's own regions/arrange edits,
+   * undoable in gesture-sized steps. */
   private readonly undoManager: Y.UndoManager;
   private static readonly REMOTE = "collab-remote";
 
@@ -136,12 +97,10 @@ export class CollabClient {
 
   connect(): void {
     if (this.closed) return;
-    // W8-A: collab is desk surface. The Yjs wire has no message-level
-    // handshake to carry a token, so it rides an `auth_token` query param
-    // and the server judges the UPGRADE. Keyless resolves null → today's
-    // bare URL byte-for-byte. A rejected upgrade lands in the ordinary
-    // close/backoff path: the desk shows "offline" while the signaling
-    // socket's fatal `unauthorized` carries the honest message.
+    // The Yjs wire has no message-level handshake to carry a token, so it
+    // rides an `auth_token` query param and the server judges the UPGRADE.
+    // Keyless resolves null → bare URL; a rejected upgrade lands in the
+    // ordinary close/backoff path.
     void authToken().then((token) => {
       if (this.closed) return;
       const proto = location.protocol === "https:" ? "wss" : "ws";
@@ -151,68 +110,54 @@ export class CollabClient {
   }
 
   private open(url: string): void {
-    const ws = new WebSocket(url);
-    ws.binaryType = "arraybuffer";
-    this.ws = ws;
-    // Handshake deadline: a proxy that never answers the upgrade leaves
-    // the socket in CONNECTING forever, and the browser serializes ws
-    // handshakes per host (RFC 6455 §4.1) — one hung handshake would dam
-    // every later WebSocket to this origin (signaling, the desk-input
-    // recorder…). Abort into the ordinary close/backoff path instead.
-    const deadline = window.setTimeout(() => {
-      if (ws.readyState === WebSocket.CONNECTING) ws.close();
-    }, HANDSHAKE_TIMEOUT_MS);
-    ws.addEventListener("open", () => {
-      window.clearTimeout(deadline);
-      this.attempts = 0;
-      this.setStatus("connected");
-      // Full sync handshake: anything queued while offline is covered by
-      // the step-1/step-2 exchange, so the pending buffer can drop.
-      this.pendingUpdates = [];
-      this.send(MSG_SYNC_STEP1, Y.encodeStateVector(this.doc));
-      if (this.awareness.getLocalState() !== null) {
-        this.send(MSG_AWARENESS, encodeAwarenessUpdate(this.awareness, [this.doc.clientID]));
-      }
+    this.ws = openCollabSocket(url, {
+      onOpen: () => {
+        this.attempts = 0;
+        this.setStatus("connected");
+        // Full sync handshake: anything queued while offline is covered by
+        // the step-1/step-2 exchange, so the pending buffer can drop.
+        this.pendingUpdates = [];
+        this.send(MSG_SYNC_STEP1, Y.encodeStateVector(this.doc));
+        if (this.awareness.getLocalState() !== null) {
+          this.send(MSG_AWARENESS, encodeAwarenessUpdate(this.awareness, [this.doc.clientID]));
+        }
+      },
+      onFrame: (tag, payload) => this.onFrame(tag, payload),
+      onClose: (ws) => {
+        if (this.ws !== ws) return; // an old socket superseded by reconnect
+        this.ws = null;
+        this.setStatus("offline");
+        if (!this.closed) {
+          const delay = Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * 2 ** this.attempts++);
+          window.setTimeout(() => this.connect(), delay);
+        }
+      },
     });
-    ws.addEventListener("message", (ev) => {
-      if (!(ev.data instanceof ArrayBuffer)) return;
-      const bytes = new Uint8Array(ev.data);
-      if (bytes.length < 1) return;
-      const payload = bytes.subarray(1);
-      switch (bytes[0]) {
-        case MSG_SYNC_STEP1:
-          this.send(MSG_UPDATE, Y.encodeStateAsUpdate(this.doc, payload));
-          break;
-        case MSG_UPDATE:
-          Y.applyUpdate(this.doc, payload, CollabClient.REMOTE);
-          if (!this.synced) {
-            this.synced = true;
-            this.invalidate();
-            for (const waiter of this.syncedWaiters) waiter();
-            this.syncedWaiters.clear();
-          }
-          break;
-        case MSG_AWARENESS:
-          applyAwarenessUpdate(this.awareness, payload, CollabClient.REMOTE);
-          break;
-        default:
-          break; // unknown tag from a future version: ignore
-      }
-    });
-    ws.addEventListener("close", () => {
-      window.clearTimeout(deadline);
-      if (this.ws !== ws) return; // an old socket superseded by reconnect
-      this.ws = null;
-      this.setStatus("offline");
-      if (!this.closed) {
-        const delay = Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * 2 ** this.attempts++);
-        window.setTimeout(() => this.connect(), delay);
-      }
-    });
-    ws.addEventListener("error", () => ws.close());
   }
 
-  // ---- arrangement undo (W9-F) ------------------------------------------------
+  private onFrame(tag: number, payload: Uint8Array): void {
+    switch (tag) {
+      case MSG_SYNC_STEP1:
+        this.send(MSG_UPDATE, Y.encodeStateAsUpdate(this.doc, payload));
+        break;
+      case MSG_UPDATE:
+        Y.applyUpdate(this.doc, payload, CollabClient.REMOTE);
+        if (!this.synced) {
+          this.synced = true;
+          this.invalidate();
+          for (const waiter of this.syncedWaiters) waiter();
+          this.syncedWaiters.clear();
+        }
+        break;
+      case MSG_AWARENESS:
+        applyAwarenessUpdate(this.awareness, payload, CollabClient.REMOTE);
+        break;
+      default:
+        break; // unknown tag from a future version: ignore
+    }
+  }
+
+  // ---- arrangement undo ---------------------------------------------------
 
   /** Undo the last local arrangement edit (split/drag/trim/delete/align
    * reset). Returns whether anything was reverted. */
@@ -236,14 +181,7 @@ export class CollabClient {
 
   /** Merge fields into this desk's presence (missing fields default). */
   setPresence(fields: Partial<PresenceState>): void {
-    const current = (this.awareness.getLocalState() as PresenceState | null) ?? {
-      name: "Desk",
-      color: "#c8c9cb",
-      avatarUrl: null,
-      playheadSec: null,
-      activeTakeId: null,
-      editing: null,
-    };
+    const current = (this.awareness.getLocalState() as PresenceState | null) ?? defaultPresence();
     const next = { ...current, ...fields };
     if (JSON.stringify(current) === JSON.stringify(next) && this.awareness.getLocalState()) {
       return;
@@ -271,26 +209,11 @@ export class CollabClient {
 
   snapshot(): CollabSnapshot {
     if (!this.snapshotCache) {
-      const peers: CollabPeer[] = [];
-      for (const [clientId, state] of this.awareness.getStates()) {
-        if (clientId === this.doc.clientID || !state) continue;
-        const p = state as Partial<PresenceState>;
-        peers.push({
-          clientId,
-          name: typeof p.name === "string" && p.name ? p.name : "Desk",
-          color: typeof p.color === "string" ? p.color : "#c8c9cb",
-          // https only — the same bound the A16 wire schema enforces.
-          avatarUrl:
-            typeof p.avatarUrl === "string" && p.avatarUrl.startsWith("https://")
-              ? p.avatarUrl
-              : null,
-          playheadSec: typeof p.playheadSec === "number" ? p.playheadSec : null,
-          activeTakeId: typeof p.activeTakeId === "string" ? p.activeTakeId : null,
-          editing: typeof p.editing === "string" ? p.editing : null,
-        });
-      }
-      peers.sort((a, b) => a.clientId - b.clientId);
-      this.snapshotCache = { status: this.status, synced: this.synced, peers };
+      this.snapshotCache = {
+        status: this.status,
+        synced: this.synced,
+        peers: readPeers(this.awareness, this.doc.clientID),
+      };
     }
     return this.snapshotCache;
   }
@@ -351,15 +274,7 @@ export class CollabClient {
   }
 
   private send(tag: number, payload: Uint8Array): void {
-    if (this.ws?.readyState !== WebSocket.OPEN) return;
-    const framed = new Uint8Array(1 + payload.length);
-    framed[0] = tag;
-    framed.set(payload, 1);
-    try {
-      this.ws.send(framed);
-    } catch {
-      // socket died mid-send; the close handler reconnects
-    }
+    sendFrame(this.ws, tag, payload);
   }
 
   private setStatus(status: CollabStatus): void {

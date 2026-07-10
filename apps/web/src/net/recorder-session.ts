@@ -4,38 +4,33 @@
 // worker immediately; channels catch up whenever they can.
 
 import { SERVER_PEER_ID, type SignalingMessage } from "@antiphon/protocol";
-import type { CaptureController, SinkPort } from "../audio/capture-controller";
+import type { CaptureController } from "../audio/capture-controller";
 import { uuidToBytes } from "../audio/capture-controller";
 import { getNickname, normalizeNickname, setNickname } from "./device-identity";
 import { offerChannel } from "./rtc";
 import { type FatalSignalingError, SignalingClient } from "./signaling-client";
+import {
+  adoptSinkChannel,
+  createSinkPort,
+  newSinkLink,
+  type SinkLink,
+  teardownSinkLink,
+} from "./sink-link";
 
 export const SINK_SERVER = 0;
 export const SINK_DESK = 1;
 
-const HIGH_WATERMARK = 1 << 20;
-const LOW_WATERMARK = 256 * 1024;
 const TIME_SYNC_INTERVAL_MS = 5_000;
 const RECONNECT_DELAY_MS = 2_000;
 
-interface SinkLink {
-  sinkId: number;
-  targetPeerId: string;
-  label: string;
-  dispose: (() => void) | null;
-  channel: RTCDataChannel | null;
-  connecting: boolean;
-  wanted: boolean;
-}
-
-/** Alternate identity for an embedded recorder (the desk's hardware input,
- * W2-D). Omitted = phone defaults: persisted nickname + browser deviceId. */
+/** Alternate identity for an embedded recorder (the desk's hardware input).
+ * Omitted = phone defaults: persisted nickname + browser deviceId. */
 export interface RecorderIdentity {
-  /** Stable A12 deviceId this recorder joins with. */
+  /** Stable deviceId this recorder joins with (server resumes the peer). */
   deviceId: string;
   /** Initial lane label (nickname). */
   label: string | null;
-  /** Where renames (self- or desk-initiated, A13) persist. */
+  /** Where renames (self- or desk-initiated) persist. */
   persistLabel: (label: string) => void;
 }
 
@@ -51,7 +46,7 @@ export interface RecorderSessionState {
   outageUntil: number | null;
   /** A take is rolling but the desk disarmed this lane — we sit it out. */
   sittingOut: boolean;
-  /** Terminal control-plane halt (F3): superseded / session-deleted / caps.
+  /** Terminal control-plane halt: superseded / session-deleted / caps.
    * Capture is stopped and every transport is down; the only exit is a
    * deliberate takeOver() (or leaving the page). */
   fatal: FatalSignalingError | null;
@@ -83,7 +78,7 @@ export class RecorderSession {
       identity ? identity.label : getNickname(),
       identity?.deviceId ?? null,
       // Embedded recorders (the desk's room mic) are hardware, not a
-      // person: no account pfp, no email-default label (A16).
+      // person: no account pfp, no email-default label.
       identity === undefined,
     );
   }
@@ -135,18 +130,16 @@ export class RecorderSession {
     };
   }
 
-  /** Fatal control error (F3): this connection is terminally dead — most
-   * likely our own deviceId reconnected in another tab (A12 supersede).
-   * STOP everything: no reconnect (the SignalingClient already halted), no
-   * data-plane trickle from still-open channels, and no hot mic in a tab
-   * that can no longer deliver audio anywhere — release it (and the wake
-   * lock) so the successor tab can grab the hardware. */
+  /** Fatal control error: this connection is terminally dead — most likely
+   * our deviceId reconnected in another tab and superseded us. STOP
+   * everything, including the mic: a hot mic in a tab that can no longer
+   * deliver audio must release the hardware for the successor tab. */
   private haltForFatal(): void {
     this.activeTakeId = null;
     this.streamId = null;
     this.sittingOutTakeId = null;
     this.stoppedForFinal = null;
-    for (const link of this.links.values()) this.teardownLink(link);
+    for (const link of this.links.values()) teardownSinkLink(link, this.controller);
     // Links are rebuilt (and their sinks re-attached to the fresh worker)
     // from scratch on takeOver(); stale entries would skip attachSink.
     this.links.clear();
@@ -154,9 +147,9 @@ export class RecorderSession {
   }
 
   /** Deliberate re-join after a fatal supersede ("Take over in this tab"):
-   * reopens signaling under the same device identity, which supersedes the
-   * OTHER tab — exactly what the user asked for. The caller must restart
-   * the capture pipeline first (mic re-acquisition needs the user gesture). */
+   * reopens signaling under the same device identity, superseding the OTHER
+   * tab. The caller must restart the capture pipeline first (mic
+   * re-acquisition needs the user gesture). */
   takeOver(): void {
     if (!this.signaling.state.fatal) return;
     this.fatalHandled = false;
@@ -164,10 +157,9 @@ export class RecorderSession {
     this.publish();
   }
 
-  /** Rename ourselves (A13): persist locally, carry on future hellos, and
-   * tell the room when connected. Empty clears back to the device name.
-   * Normalized at THIS commit point (48-char cap, surrogate-safe) so
-   * paste/programmatic paths can't outrun the input's maxLength. */
+  /** Rename ourselves: persist locally, carry on future hellos, and tell
+   * the room when connected. Empty clears back to the device name.
+   * Normalized at THIS commit point so paste can't outrun maxLength. */
   rename(label: string): void {
     const trimmed = normalizeNickname(label);
     this.persistLabel(trimmed);
@@ -180,10 +172,10 @@ export class RecorderSession {
   }
 
   /** Demo/testing hook: kill every transport for `ms`. Capture continues;
-   * reconnect + backfill happen automatically afterwards (the M1 story). */
+   * reconnect + backfill happen automatically afterwards. */
   simulateOutage(ms: number): void {
     this.outageUntil = Date.now() + ms;
-    for (const link of this.links.values()) this.teardownLink(link);
+    for (const link of this.links.values()) teardownSinkLink(link, this.controller);
     this.publish();
     window.setTimeout(() => {
       this.outageUntil = null;
@@ -212,9 +204,9 @@ export class RecorderSession {
         this.ensureLinks();
         break;
       case "peer-update":
-        // The desk renamed us: adopt + persist so the name survives reloads.
-        // Normalized on adoption too — the wire allows 256 (A13), the UI
-        // norm is 48, and every commit path must agree.
+        // The desk renamed us: adopt + persist so the name survives
+        // reloads. Normalized on adoption too — the wire allows 256, the
+        // UI norm is 48, and every commit path must agree.
         if (msg.peerId === this.signaling.state.peerId) {
           const adopted = normalizeNickname(msg.label);
           this.persistLabel(adopted);
@@ -285,66 +277,41 @@ export class RecorderSession {
     if (!this.signaling.state.connected) return;
     this.ensureLink(SINK_SERVER, SERVER_PEER_ID, "antiphon/1");
     const deskId = this.deskPeerId();
-    if (deskId) {
-      const existing = this.links.get(SINK_DESK);
-      if (existing && existing.targetPeerId !== deskId) {
-        // Desk reconnected under a new peer id.
-        this.teardownLink(existing);
-        this.links.delete(SINK_DESK);
-      }
-      this.ensureLink(SINK_DESK, deskId, "antiphon/1");
+    if (!deskId) return;
+    const existing = this.links.get(SINK_DESK);
+    if (existing && existing.targetPeerId !== deskId) {
+      // Desk reconnected under a new peer id.
+      teardownSinkLink(existing, this.controller);
+      this.links.delete(SINK_DESK);
     }
+    this.ensureLink(SINK_DESK, deskId, "antiphon/1");
   }
 
   private ensureLink(sinkId: number, targetPeerId: string, label: string): void {
     let link = this.links.get(sinkId);
     if (!link) {
-      link = {
-        sinkId,
-        targetPeerId,
-        label,
-        dispose: null,
-        channel: null,
-        connecting: false,
-        wanted: true,
-      };
+      link = newSinkLink(sinkId, targetPeerId, label);
       this.links.set(sinkId, link);
-      this.controller.attachSink(sinkId, this.portFor(link));
+      this.controller.attachSink(sinkId, createSinkPort(link, this.controller));
     }
     if (link.connecting || link.channel?.readyState === "open") return;
     link.connecting = true;
     this.publish();
     void offerChannel(this.signaling, targetPeerId, label)
       .then(({ pc, channel, dispose }) => {
-        link.dispose = dispose;
-        link.channel = channel;
-        link.connecting = false;
-        channel.bufferedAmountLowThreshold = LOW_WATERMARK;
-        channel.addEventListener("bufferedamountlow", () => {
-          this.controller.requestDrain(sinkId);
+        adoptSinkChannel({
+          link,
+          pc,
+          channel,
+          dispose,
+          controller: this.controller,
+          onDown: () => this.linkDown(link),
         });
-        channel.addEventListener("message", (ev) => {
-          if (ev.data instanceof ArrayBuffer) {
-            this.controller.deliverFrame(sinkId, ev.data);
-          }
-        });
-        const onDown = () => {
-          if (link.channel === channel) this.linkDown(link);
-        };
-        channel.addEventListener("close", onDown);
-        pc.addEventListener("connectionstatechange", () => {
-          if (pc.connectionState === "failed" || pc.connectionState === "disconnected") {
-            onDown();
-          }
-        });
-        this.controller.setSinkConnected(sinkId, true);
-        this.controller.requestDrain(sinkId);
         this.publish();
       })
       .catch(() => {
-        // Silent by design: the link state is surfaced on the phone page
-        // (server/desk sink "down") and this retry loop re-offers every
-        // ~2 s while the sink is unreachable — logging would just spam.
+        // Silent by design: link state is surfaced on the phone page and
+        // this retry loop re-offers every ~2s — logging would just spam.
         link.connecting = false;
         this.controller.setSinkConnected(sinkId, false);
         this.publish();
@@ -353,42 +320,9 @@ export class RecorderSession {
   }
 
   private linkDown(link: SinkLink): void {
-    this.teardownLink(link);
+    teardownSinkLink(link, this.controller);
     this.publish();
     window.setTimeout(() => this.ensureLinks(), RECONNECT_DELAY_MS);
-  }
-
-  private teardownLink(link: SinkLink): void {
-    this.controller.setSinkConnected(link.sinkId, false);
-    link.dispose?.();
-    link.dispose = null;
-    link.channel = null;
-    link.connecting = false;
-  }
-
-  private portFor(link: SinkLink): SinkPort {
-    return {
-      send: (frames) => {
-        const channel = link.channel;
-        if (channel?.readyState !== "open") return;
-        for (const frame of frames) {
-          try {
-            channel.send(frame);
-          } catch {
-            return; // channel died mid-batch; reconnect path handles it
-          }
-        }
-        // More might be waiting if the budget was the limiter.
-        if (channel.bufferedAmount < LOW_WATERMARK) {
-          this.controller.requestDrain(link.sinkId);
-        }
-      },
-      budget: () => {
-        const channel = link.channel;
-        if (channel?.readyState !== "open") return 0;
-        return Math.max(0, HIGH_WATERMARK - channel.bufferedAmount);
-      },
-    };
   }
 
   private publish(): void {
@@ -398,7 +332,7 @@ export class RecorderSession {
 
   close(): void {
     if (this.timeSyncTimer !== null) window.clearInterval(this.timeSyncTimer);
-    for (const link of this.links.values()) this.teardownLink(link);
+    for (const link of this.links.values()) teardownSinkLink(link, this.controller);
     this.signaling.close();
   }
 }

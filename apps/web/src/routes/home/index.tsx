@@ -1,15 +1,6 @@
-// Landing — "/". Two modes, one route (W8-A):
-//
-// - Keyless (no Clerk keys anywhere): today's landing byte-for-byte —
-//   wordmark, the one-line pitch, Create session, join-by-code (paste a
-//   link or a raw uuid), and the desk sessions this browser has visited.
-//   Pinned by e2e (auth-keyless.spec).
-// - Auth mode: authed-home.tsx (lazy — keyless visitors never download
-//   Clerk bytes): sign-in/up signed out; "Your sessions" / "Shared with
-//   me" / create / UserButton signed in. Join-by-code stays accountless
-//   in every variant (mic capability, RFC §12).
-//
-// Same instrument-panel language as everything else; no marketing surface.
+// Landing — "/". Two modes, one route: keyless (no Clerk keys) renders the
+// static landing; auth mode loads authed-home.tsx lazily so keyless visitors
+// never download Clerk bytes. Join-by-code stays accountless in every variant.
 
 import { lazy, Suspense, useState } from "react";
 import { useNavigate } from "react-router";

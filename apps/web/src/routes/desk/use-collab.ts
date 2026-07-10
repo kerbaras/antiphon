@@ -1,8 +1,6 @@
-// W3-A desk↔doc bindings: the mixer loop-guarded two-way sync, the clip
-// arrangement hook, and the presence subscription. Transport plumbing lives
-// in net/collab.ts; doc shape/mutation rules in net/collab-doc.ts; the
-// markers/comments hooks stay in use-desk.ts at their documented
-// persistence boundary.
+// Desk↔doc bindings: the mixer loop-guarded two-way sync, the clip
+// arrangement/region/lane-order hooks, and the presence subscription.
+// Transport plumbing: net/collab.ts; doc mutation rules: net/collab-doc.ts.
 
 import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
 import type { CollabClient, CollabSnapshot } from "../../net/collab";
@@ -21,14 +19,10 @@ import {
 } from "../../net/collab-doc";
 import type { ChannelStrip, SessionPlayer } from "./player";
 
-/** Two-way mixer sync. The player stays the AUDIO authority (all gains/EQ
- * still flow through its graph); the doc is the STATE source. Local knob
- * moves surface as player snapshots and are diffed into the doc; remote doc
- * changes apply back through the player's public setters. Loop guard is
- * twofold: local writes carry `collab.origin` (the observer skips them) and
- * doc→player application sets `applying` so the resulting player notify
- * can't echo — plus writeMixIfChanged never writes an equal state, so the
- * cycle terminates by construction. */
+/** Two-way mixer sync: the player stays the AUDIO authority, the doc the
+ * STATE source. Loop guard: local writes carry `collab.origin` (skipped by
+ * the observer), doc→player application sets `applying` so the resulting
+ * player notify can't echo, and equal states never write. */
 export function bindMixToCollab(collab: CollabClient, player: SessionPlayer): () => void {
   let applying = false;
   const mixMap = collab.doc.getMap<MixStripState>("mix");
@@ -153,11 +147,10 @@ export function useCollabArrange(
   return [overrides, update];
 }
 
-/** Clip regions (W7-B) through the doc: streamId → split pieces. Local
- * splits/region drags write one stream's WHOLE list; remote desks' edits
- * land in the returned record live. Streams absent from the record are
- * never-split — the caller derives their implicit region and keeps the
- * legacy `arrange` wire shape for them (collab-doc.ts compat stance). */
+/** Clip regions through the doc: streamId → split pieces. Local splits/
+ * region drags write one stream's WHOLE list; remote edits land live.
+ * Streams absent from the record are never-split — the caller derives
+ * their implicit region and keeps the legacy `arrange` wire shape. */
 export function useCollabRegions(
   collab: CollabClient,
 ): [Record<string, ClipRegion[]>, (streamId: string, regions: ClipRegion[]) => void] {
@@ -180,11 +173,9 @@ export function useCollabRegions(
   return [regions, write];
 }
 
-/** Deliberate lane order (W4-E) through the doc: a Move up/down writes the
- * complete laneKey → ordinal map; remote desks' moves land here live and a
- * reload restores the persisted order. Same read/observe shape as
- * useCollabArrange — the setter takes the full map since every move
- * reassigns every lane's position anyway. */
+/** Deliberate lane order through the doc: a Move up/down writes the
+ * complete laneKey → ordinal map (every move reassigns every position);
+ * remote moves land live and a reload restores the persisted order. */
 export function useCollabLaneOrder(
   collab: CollabClient,
 ): [Record<string, number>, (next: Record<string, number>) => void] {

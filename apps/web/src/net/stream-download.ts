@@ -1,14 +1,12 @@
-// W8-A: /api/streams/:id/flac sits behind desk auth when auth is on, and a
-// bare <a href> can't carry an Authorization header. Keyless keeps the
-// anchor navigation byte-for-byte (server naming via Content-Disposition,
-// F14, included); auth mode fetches with the token and hands the browser a
-// blob whose filename honors the same server header.
+// /api/streams/:id/flac sits behind desk auth when auth is on, and a bare
+// <a href> can't carry an Authorization header. Keyless keeps plain anchor
+// navigation; auth mode fetches with the token and downloads a blob.
 
 import { authActive, authFetch } from "./auth-token";
 
 /** RFC 6266-lite: pull a filename out of Content-Disposition — the
- * filename* (UTF-8) form first (that is what the server emits for
- * nicknamed lanes, F14), plain filename= as fallback. */
+ * filename* (UTF-8) form first (what the server emits for nicknamed
+ * lanes), plain filename= as fallback. */
 export function filenameFromDisposition(header: string | null): string | null {
   if (!header) return null;
   const star = header.match(/filename\*=UTF-8''([^;]+)/i);
@@ -41,7 +39,6 @@ export async function downloadStreamFlac(
 ): Promise<void> {
   const href = `/api/streams/${streamId}/flac`;
   if (!authActive()) {
-    // Keyless: plain navigation, exactly the pre-W8-A path.
     clickAnchor(href, preferredName);
     return;
   }

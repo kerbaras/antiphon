@@ -1,24 +1,6 @@
-// W7-A — selection-aware auto-align orchestration: the pure plan (which
-// takes, which streams, in what order) and the sequential runner that
-// walks it through the F5 load queue. The player owns the measurement
-// (align(force, scope) — player.ts); the desk owns eligibility, ordering,
-// the manual-move reset, and the restore of the operator's loaded take.
-//
-// CANCEL SEMANTICS — latest wins, mirroring the queue the flow rides on:
-//   · a foreign load landing mid-step supersedes that step (the queue's
-//     own superseded() signal), and a superseded step aborts the WHOLE
-//     flow WITHOUT restoring the original take — the newer request IS the
-//     operator's newest intent; restoring would fight it;
-//   · recording starting (or a session switch / unmount) cancels before
-//     the next step for the same reason — the flow never queues work the
-//     desk's own gates would refuse;
-//   · a step that merely FAILS (decode error) reports on the error strip
-//     through the queue's own error path and the flow moves on — one
-//     broken take must not hold the rest hostage.
-// A cancelled flow may leave scoped clips' manual offsets already reset
-// but not yet re-measured: the persisted verdict still draws AND plays
-// them aligned (W7-A fold-in), so nothing tears — the next align run
-// simply refreshes the measurement.
+// Selection-aware auto-align orchestration: the pure plan (which takes,
+// which streams, in what order) and the sequential runner that walks it
+// through the load queue. The player owns the measurement (align()).
 
 export interface AlignScopeStream {
   streamId: string;
@@ -34,10 +16,9 @@ export interface AlignTakeScope {
 }
 
 /** Group an eligible selection into per-take align scopes. Eligibility is
- * filter-not-fail (W7-A): live-take clips, incomplete streams, and F9
- * orphans silently drop out — a mixed selection aligns what it can.
- * Order: the LOADED take first (no re-decode — the cheapest step, and the
- * operator is looking at it), then timeline take order. */
+ * filter-not-fail: live-take clips, incomplete streams, and orphans
+ * silently drop out — a mixed selection aligns what it can. Order: the
+ * LOADED take first (no re-decode), then timeline take order. */
 export function planAlignScopes(
   selection: readonly string[],
   streams: readonly AlignScopeStream[],
@@ -73,7 +54,7 @@ export interface AlignFlowDeps {
   /** Recording / session switch / unmount — checked before every step. */
   cancelled(): boolean;
   /** Load `takeId` (whole take) and force-align `streamIds` through the
-   * F5 queue; resolves with the queue's honest settle status. */
+   * load queue; resolves with the queue's honest settle status. */
   runStep(takeId: string, streamIds: readonly string[]): Promise<AlignStepStatus>;
   /** Re-request the operator's original take (standard load + restore). */
   restore(takeId: string): void;
@@ -82,8 +63,8 @@ export interface AlignFlowDeps {
 }
 
 /** Walk the scopes sequentially (load → align → next), then restore the
- * originally loaded take when the flow moved off it. See the module
- * header for the cancel semantics. */
+ * originally loaded take when the flow moved off it. Latest wins: a superseded
+ * step aborts the flow WITHOUT restoring; a merely failed step moves on. */
 export async function runAlignFlow(
   scopes: readonly AlignTakeScope[],
   deps: AlignFlowDeps,

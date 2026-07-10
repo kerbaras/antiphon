@@ -1,19 +1,6 @@
-// Song markers (W2-B) — pure model + interim persistence.
-//
-// A marker is a named POINT on the loaded take's room timeline (the exact
-// domain of player.position()/seek(): 0 = take head). A "song" is the span
-// from one marker to the next marker — or the take end for the last one —
-// which gives bookmarking AND per-song render ranges (W2-A RenderRange)
-// with no range-editing UI at all.
-//
-// PERSISTENCE BOUNDARY (W3-A landed): the source of truth is the shared
-// project doc — a Y.Array of {id,name,atSec} per takeId (net/collab-doc.ts,
-// wired in use-desk.ts). Exactly as documented, ONLY the load/save layer
-// changed: the pure model above this line is untouched. loadMarkers/
-// saveMarkers remain as the doc's localStorage SHADOW — the seed source
-// (once per take), the display fallback while the doc has no entry
-// (offline single-desk parity), and cheap offline insurance on every
-// change.
+// Song markers: named points on the take's room timeline (the
+// player.position() domain); a "song" spans marker→next marker. Source of
+// truth is the shared doc; loadMarkers/saveMarkers are its local shadow.
 
 import { dedupeById } from "../../net/collab-doc";
 
@@ -92,10 +79,8 @@ export function songsOf(markers: readonly Marker[]): Song[] {
 }
 
 /** `NN <name>`, filesystem-safe on macOS/Windows/Linux: keep letters,
- * numbers and tame punctuation; collapse whitespace; no edge dots (hidden
- * files / Windows trailing-dot stripping); bounded length. The shared stem
- * of every per-song export name (W5-C: `<take> — NN <name> — stems.zip`
- * and friends compose around it). */
+ * numbers and tame punctuation; collapse whitespace; no edge dots; bounded
+ * length. The shared stem of every per-song export name. */
 export function songSlug(index: number, name: string): string {
   const safe = name
     .replace(/[^\p{L}\p{N}\s'&()[\].,+#@!_-]/gu, "")
@@ -111,7 +96,7 @@ export function songFileName(index: number, name: string): string {
   return `${songSlug(index, name)}.wav`;
 }
 
-// ---- persistence (doc shadow — see the W3-A boundary note up top) -------------
+// ---- persistence (localStorage shadow of the shared doc) -----------------------
 
 const SCHEMA_VERSION = 1;
 
@@ -163,9 +148,8 @@ export function loadMarkers(
         Number.isFinite(m.atSec) &&
         m.atSec >= 0,
     );
-    // Same-id entries (an F16-era shadow snapshot) collapse to the last
-    // occurrence — the same winner rule as the doc read path, and this
-    // list may seed the doc.
+    // Same-id entries collapse to the last occurrence — the same winner
+    // rule as the doc read path, and this list may seed the doc.
     return sortMarkers(dedupeById(valid).map((m) => ({ id: m.id, name: m.name, atSec: m.atSec })));
   } catch {
     return [];

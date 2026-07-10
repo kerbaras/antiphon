@@ -1,143 +1,104 @@
 // Desk-side session orchestration: the desk is a sink AND the control
-// authority. It answers recorder P2P offers (LAN path), keeps a sync
-// channel to the server (HAVE-diff replication, §6.8), persists every chunk
-// to OPFS via the sink worker, and drives take lifecycle + calibration.
+// authority. It answers recorder P2P offers, keeps a sync channel to the
+// server (HAVE-diff replication, §6.8), and drives take lifecycle.
 
-import { decode_meter_frame, generate_chirp, init as initWasm } from "@antiphon/core-wasm";
+import { decode_meter_frame, init as initWasm } from "@antiphon/core-wasm";
 import {
-  DEFAULT_CHIRP_SPEC,
   SERVER_PEER_ID,
   type SessionState,
   type SignalingMessage,
   type TakeStartMessage,
 } from "@antiphon/protocol";
-import type { DeskStreamStatus, FromSinkWorker, ToSinkWorker } from "../audio/sink-worker-protocol";
+import { playCalibrationChirp } from "./desk-chirp";
+import { answerRecorderOffer, type Conn } from "./desk-conns";
+import { createServerSync, type ServerSyncLink } from "./desk-server-sync";
+import {
+  type DeskSessionState,
+  dropDeletedStreams,
+  initialDeskSessionState,
+  planStreamSeed,
+  type StreamMeta,
+  upsertAnnouncedStream,
+  withStreamFinal,
+} from "./desk-session-state";
+import { createSinkWorkerLink, type SinkWorkerLink } from "./desk-sink-worker";
 import { normalizeNickname } from "./device-identity";
-import { offerChannel, RTC_CONFIG, wireIce } from "./rtc";
-import { type FatalSignalingError, SignalingClient } from "./signaling-client";
+import { SignalingClient } from "./signaling-client";
+
+export type { DeskSessionState, StreamMeta };
 
 const ACK_INTERVAL_MS = 2_000;
 const HAVE_INTERVAL_MS = 5_000;
 const STATUS_INTERVAL_MS = 1_000;
-const RECONNECT_DELAY_MS = 2_000;
-const HIGH_WATERMARK = 1 << 20;
-/** Error-strip hygiene (F3): non-fatal errors self-expire. */
+/** Non-fatal errors self-expire off the error strip. */
 const ERROR_TTL_MS = 30_000;
-
-export interface StreamMeta {
-  takeId: string;
-  streamId: string;
-  peerId: string | null;
-  finalSeq: number | null;
-}
-
-export interface DeskSessionState {
-  signalingConnected: boolean;
-  peerId: string | null;
-  session: SessionState | null;
-  serverSync: "connected" | "connecting" | "down";
-  activeTakeId: string | null;
-  takeStartedAt: number | null;
-  streams: StreamMeta[];
-  deskStatus: DeskStreamStatus[];
-  rebuiltChunks: number;
-  lastChirpAt: number | null;
-  /** Transient, non-fatal errors: each dismissible and self-expiring (F3). */
-  errors: string[];
-  /** Terminal control-plane halt (F3), e.g. this desk's device identity
-   * reconnected in another tab (A12 supersede). Signaling reconnect is
-   * stopped for good; the UI should render a terminal state, not a banner. */
-  fatal: FatalSignalingError | null;
-  /** Live capture peaks per stream (METER telemetry): value + received-at. */
-  liveLevels: Record<string, { peak: number; at: number }>;
-  /** Lanes (peer ids) the desk disarmed: they sit out the next take. */
-  disarmedPeers: string[];
-}
 
 type Listener = (state: DeskSessionState) => void;
 
-interface Conn {
-  id: number;
-  channel: RTCDataChannel;
-  dispose(): void;
-}
-
 export class DeskSession {
   private readonly signaling: SignalingClient;
-  private readonly worker: Worker;
+  private readonly worker: SinkWorkerLink;
+  private readonly serverSync: ServerSyncLink;
   private readonly listeners = new Set<Listener>();
   private readonly conns = new Map<number, Conn>();
   private nextConnId = 1;
-  private serverConn: Conn | null = null;
-  private serverConnecting = false;
-  private state: DeskSessionState = {
-    signalingConnected: false,
-    peerId: null,
-    session: null,
-    serverSync: "down",
-    activeTakeId: null,
-    takeStartedAt: null,
-    streams: [],
-    deskStatus: [],
-    rebuiltChunks: 0,
-    lastChirpAt: null,
-    errors: [],
-    fatal: null,
-    liveLevels: {},
-    disarmedPeers: [],
-  };
+  private state: DeskSessionState = initialDeskSessionState();
   private wasmReady = false;
   private timers: number[] = [];
-  private waiters: {
-    acks: Array<(f: ArrayBuffer[]) => void>;
-    haves: Array<(f: ArrayBuffer[]) => void>;
-    frames: Array<(f: ArrayBuffer[]) => void>;
-  } = { acks: [], haves: [], frames: [] };
-  private flacWaiters = new Map<
-    number,
-    (result: { flac: ArrayBuffer | null; reason?: string }) => void
-  >();
-  private nextRequestId = 1;
   private audioContext: AudioContext | null = null;
   private readonly deletedListeners = new Set<
     (streamIds: string[], deletedTakeIds: string[]) => void
   >();
-  /** The active take exactly as started, kept for re-assertion (A14): a
-   * reconnect welcome from a rebooted server carries activeTake=null while
-   * recorders keep rolling — the desk (control authority, §3) re-sends
-   * this take-start rather than adopt the empty snapshot. */
+  /** The active take exactly as started, kept for re-assertion: a reconnect
+   * welcome from a rebooted server carries activeTake=null while recorders
+   * keep rolling — the desk (control authority, §3) re-sends this
+   * take-start rather than adopt the empty snapshot. */
   private activeTakeStart: Omit<TakeStartMessage, "v" | "type"> | null = null;
 
   constructor(readonly sessionId: string) {
     this.signaling = new SignalingClient("desk", sessionId);
-    this.worker = new Worker(new URL("../audio/sink.worker.ts", import.meta.url), {
-      type: "module",
+    this.worker = createSinkWorkerLink({
+      onReady: (rebuiltChunks) => this.patch({ rebuiltChunks }),
+      onReply: (connId, bytes) => this.sendToConn(connId, bytes),
+      onPushPlan: (plan) => {
+        if (plan.ranges.length === 0) return;
+        this.worker.getFrames(plan.takeId, plan.streamId, plan.ranges, (frames) =>
+          this.serverSync.pushFrames(frames),
+        );
+      },
+      onStatus: (streams) => this.patch({ deskStatus: streams }),
+      onError: (message) => this.pushError(message),
     });
-    this.worker.onmessage = (e: MessageEvent<FromSinkWorker>) => this.onWorker(e.data);
+    this.serverSync = createServerSync({
+      signaling: this.signaling,
+      worker: this.worker,
+      conns: this.conns,
+      nextConnId: () => this.nextConnId++,
+      interceptMeter: (bytes) => this.interceptMeter(bytes),
+      onStatus: (serverSync) => this.patch({ serverSync }),
+    });
   }
 
   start(): void {
     void initWasm().then(() => {
       this.wasmReady = true;
     });
-    this.post({ type: "configure", sessionId: this.sessionId });
+    this.worker.post({ type: "configure", sessionId: this.sessionId });
     this.signaling.onMessage((msg) => this.onSignal(msg));
     this.signaling.onState(() => {
       this.patch({
         signalingConnected: this.signaling.state.connected,
         peerId: this.signaling.state.peerId,
         session: this.signaling.state.session,
-        // Fatal halt (F3): the SignalingClient stopped reconnecting; the
-        // desk surfaces the terminal state instead of a permanent banner.
         fatal: this.signaling.state.fatal,
       });
-      if (this.signaling.state.connected) this.ensureServerSync();
+      if (this.signaling.state.connected) this.serverSync.ensure();
     });
     this.signaling.connect();
     this.timers.push(
       window.setInterval(() => this.broadcastAcks(), ACK_INTERVAL_MS),
-      window.setInterval(() => this.exchangeHaves(), HAVE_INTERVAL_MS),
-      window.setInterval(() => this.post({ type: "status" }), STATUS_INTERVAL_MS),
+      window.setInterval(() => this.serverSync.exchangeHaves(), HAVE_INTERVAL_MS),
+      window.setInterval(() => this.worker.post({ type: "status" }), STATUS_INTERVAL_MS),
     );
   }
 
@@ -166,8 +127,7 @@ export class DeskSession {
   }
 
   /** Per-lane record-arm: a disarmed peer sits out subsequent takes until
-   * re-armed. Purely a control-plane instruction — the rolling take is
-   * never interrupted. */
+   * re-armed. Purely control-plane — the rolling take is never interrupted. */
   toggleArm(peerId: string): void {
     const disarmedPeers = this.state.disarmedPeers.includes(peerId)
       ? this.state.disarmedPeers.filter((p) => p !== peerId)
@@ -180,57 +140,32 @@ export class DeskSession {
     this.signaling.send({ v: 1, type: "take-stop", takeId: this.state.activeTakeId });
   }
 
-  /** Deliberate rejoin after a fatal halt (F3) — the desk flavor of the
-   * phone's take-over: clears the terminal state and reconnects under this
-   * device identity, knowingly superseding whichever tab owns it now. */
+  /** Deliberate rejoin after a fatal halt: clears the terminal state and
+   * reconnects under this device identity, knowingly superseding whichever
+   * tab owns it now. */
   takeOver(): void {
     this.signaling.reopen();
   }
 
-  /** Rename any peer (A13: the desk is the session authority). The server
+  /** Rename any peer (the desk is the session authority). The server
    * validates, persists, and fans out; our snapshot updates on the echo.
-   * Normalized at commit (48-char UI cap, surrogate-safe) — the lane
-   * input's maxLength alone doesn't survive paste/programmatic writes. */
+   * Normalized at commit — input maxLength alone doesn't survive paste. */
   renamePeer(peerId: string, label: string): void {
     this.signaling.send({ v: 1, type: "peer-update", peerId, label: normalizeNickname(label) });
   }
 
   /** Play the calibration chirp (RFC §10) and announce it. */
   async playChirp(): Promise<void> {
-    await initWasm();
-    const spec = DEFAULT_CHIRP_SPEC;
-    if (!this.audioContext) this.audioContext = new AudioContext();
-    const context = this.audioContext;
-    await context.resume();
-    const samples = generate_chirp(
-      context.sampleRate,
-      spec.startHz,
-      spec.endHz,
-      spec.durationMs,
-      spec.gainDbfs,
-    );
-    const buffer = context.createBuffer(1, samples.length, context.sampleRate);
-    buffer.copyToChannel(new Float32Array(samples), 0);
-    const startAt = context.currentTime + 0.15;
-    for (let i = 0; i < spec.repeats; i++) {
-      const source = context.createBufferSource();
-      source.buffer = buffer;
-      source.connect(context.destination);
-      source.start(startAt + (i * (spec.durationMs + spec.gapMs)) / 1_000);
-    }
-    this.signaling.send({
-      v: 1,
-      type: "calibration-chirp",
-      chirpId: crypto.randomUUID(),
-      emitTsDeskUs: Math.round((performance.timeOrigin + performance.now()) * 1_000),
-      spec,
-    });
+    await playCalibrationChirp(() => {
+      if (!this.audioContext) this.audioContext = new AudioContext();
+      return this.audioContext;
+    }, this.signaling);
     this.patch({ lastChirpAt: Date.now() });
   }
 
-  /** Ask the server (the archive authority) to delete streams. Local
-   * copies are dropped only when the `streams-deleted` confirm fans out —
-   * a failed delete never leaves the desk disagreeing with the archive. */
+  /** Ask the server (the archive authority) to delete streams. Local copies
+   * drop only when the `streams-deleted` confirm fans out — a failed delete
+   * never leaves the desk disagreeing with the archive. */
   deleteStreams(refs: Array<{ takeId: string; streamId: string }>): void {
     if (refs.length === 0) return;
     if (!this.signaling.state.connected) {
@@ -240,7 +175,7 @@ export class DeskSession {
     this.signaling.send({ v: 1, type: "streams-delete", streams: refs });
   }
 
-  /** Push a transient error to the strip: capped, self-expiring (F3). */
+  /** Push a transient error to the strip: capped, self-expiring. */
   private pushError(message: string): void {
     this.patch({ errors: [...this.state.errors.slice(-4), message] });
     window.setTimeout(() => {
@@ -249,117 +184,45 @@ export class DeskSession {
     }, ERROR_TTL_MS);
   }
 
-  /** Dismiss affordance for the error strip (F3): drop one entry now. */
   dismissError(index: number): void {
     this.patch({ errors: this.state.errors.filter((_, i) => i !== index) });
   }
 
   /** Fires after a server-confirmed deletion with the stream ids removed
-   * and the take ids the server dropped entirely (last stream gone) — the
-   * signal for take-scoped side stores (desk MIDI) to clean up too. */
+   * and the take ids the server dropped entirely — the signal for
+   * take-scoped side stores (desk MIDI) to clean up too. */
   onStreamsDeleted(listener: (streamIds: string[], deletedTakeIds: string[]) => void): () => void {
     this.deletedListeners.add(listener);
     return () => this.deletedListeners.delete(listener);
   }
 
-  /** Seed streams the ARCHIVE knows but this desk never saw announced
-   * (F1 — cold desk/reload): registers each with the sink worker
-   * (set-final), so the HAVE exchange covers it and the server backfills
-   * our copy, and records the announce-equivalent metadata so attribution
-   * and take ordering see it. Idempotent per stream; live announces for
-   * the same stream win (they arrive first by construction). */
-  seedArchivedStreams(
-    metas: Array<{
-      takeId: string;
-      streamId: string;
-      peerId: string | null;
-      finalSeq: number | null;
-    }>,
-  ): void {
-    const added: StreamMeta[] = [];
-    let finalized = false;
-    for (const meta of metas) {
-      const known = this.state.streams.find((s) => s.streamId === meta.streamId);
-      if (known && known.finalSeq !== null) continue; // fully known already
-      if (meta.finalSeq !== null) {
-        this.post({
-          type: "set-final",
-          takeId: meta.takeId,
-          streamId: meta.streamId,
-          finalSeq: meta.finalSeq,
-        });
-        if (known) finalized = true;
-      }
-      if (!known) added.push({ ...meta });
-    }
-    if (added.length > 0 || finalized) {
-      const seededFinal = new Map(
-        metas.filter((m) => m.finalSeq !== null).map((m) => [m.streamId, m.finalSeq]),
-      );
-      this.patch({
-        streams: [
-          ...this.state.streams.map((s) =>
-            s.finalSeq === null && seededFinal.has(s.streamId)
-              ? { ...s, finalSeq: seededFinal.get(s.streamId) as number }
-              : s,
-          ),
-          ...added,
-        ],
-      });
-      // Reconcile immediately: announce our HAVEs (now covering the seeded
-      // streams) so the server can start pushing the missing chunks.
-      this.exchangeHaves();
-    }
+  /** Seed streams the archive knows but this desk never saw announced
+   * (cold desk/reload); see planStreamSeed. */
+  seedArchivedStreams(metas: StreamMeta[]): void {
+    const plan = planStreamSeed(this.state.streams, metas);
+    for (const entry of plan.setFinal) this.worker.post({ type: "set-final", ...entry });
+    if (!plan.streams) return;
+    this.patch({ streams: plan.streams });
+    // Reconcile immediately: announce our HAVEs (now covering the seeded
+    // streams) so the server can start pushing the missing chunks.
+    this.serverSync.exchangeHaves();
   }
 
   /** Reassemble a stream's playable FLAC from the desk's own OPFS store. */
   assembleFlac(takeId: string, streamId: string): Promise<ArrayBuffer | null> {
-    const requestId = this.nextRequestId++;
-    return new Promise((resolve) => {
-      this.flacWaiters.set(requestId, ({ flac }) => resolve(flac));
-      this.post({ type: "assemble-flac", requestId, takeId, streamId });
-    });
+    return this.worker.assembleFlac(takeId, streamId);
   }
 
   // ---- signaling ------------------------------------------------------------
 
   private onSignal(msg: SignalingMessage): void {
     switch (msg.type) {
-      case "welcome": {
-        const active = msg.session.activeTake;
-        if (active) {
-          // Snapshot carries a take: adopt it. A different id than ours
-          // means the room genuinely moved on — stale local state loses.
-          if (active.takeId !== this.state.activeTakeId) {
-            this.activeTakeStart = {
-              takeId: active.takeId,
-              wallClockHint: active.startedAt,
-              ...(active.disarmedPeerIds?.length
-                ? { disarmedPeerIds: active.disarmedPeerIds }
-                : {}),
-            };
-            this.patch({
-              activeTakeId: active.takeId,
-              takeStartedAt: Date.parse(active.startedAt),
-            });
-          }
-        } else if (this.activeTakeStart) {
-          // Empty snapshot while OUR take is rolling: the server rebooted
-          // mid-take (room state is in-memory) and recorders kept capturing
-          // (§7.1). The desk is the control authority (§3) — re-assert the
-          // take to the reborn room instead of adopting the null (A14).
-          // Idempotent: recorders already rolling this take ignore it, and
-          // the archive keeps the original wallClockHint.
-          this.signaling.send({ v: 1, type: "take-start", ...this.activeTakeStart });
-        } else {
-          this.patch({ activeTakeId: null });
-        }
-        this.ensureServerSync();
+      case "welcome":
+        this.onWelcome(msg.session.activeTake);
         break;
-      }
       case "take-start":
-        // Remembered verbatim so a post-restart re-assertion (A14) replays
-        // the exact original message.
+        // Remembered verbatim so a post-restart re-assertion replays the
+        // exact original message.
         this.activeTakeStart = {
           takeId: msg.takeId,
           wallClockHint: msg.wallClockHint,
@@ -375,56 +238,46 @@ export class DeskSession {
         this.patch({ activeTakeId: null });
         // §6.4: ack immediately on take close + reconcile with the server.
         this.broadcastAcks();
-        this.exchangeHaves();
+        this.serverSync.exchangeHaves();
         break;
-      case "stream-announce": {
-        const streams = this.state.streams.filter((s) => s.streamId !== msg.streamId);
-        streams.push({
-          takeId: msg.takeId,
-          streamId: msg.streamId,
-          peerId: msg.fromPeerId ?? null,
-          finalSeq: null,
-        });
-        this.patch({ streams });
+      case "stream-announce":
+        this.patch({ streams: upsertAnnouncedStream(this.state.streams, msg) });
         break;
-      }
-      case "stream-final": {
-        this.post({
+      case "stream-final":
+        this.worker.post({
           type: "set-final",
           takeId: msg.takeId,
           streamId: msg.streamId,
           finalSeq: msg.finalSeq,
         });
-        this.patch({
-          streams: this.state.streams.map((s) =>
-            s.streamId === msg.streamId ? { ...s, finalSeq: msg.finalSeq } : s,
-          ),
-        });
+        this.patch({ streams: withStreamFinal(this.state.streams, msg.streamId, msg.finalSeq) });
         break;
-      }
       case "streams-deleted": {
         const ids = new Set(msg.streams.map((s) => s.streamId));
-        this.post({ type: "delete-streams", streams: msg.streams });
-        this.post({ type: "status" }); // worker chain: runs after the delete
-        const liveLevels = Object.fromEntries(
-          Object.entries(this.state.liveLevels).filter(([id]) => !ids.has(id)),
-        );
-        this.patch({
-          streams: this.state.streams.filter((s) => !ids.has(s.streamId)),
-          liveLevels,
-        });
+        this.worker.post({ type: "delete-streams", streams: msg.streams });
+        this.worker.post({ type: "status" }); // worker chain: runs after the delete
+        this.patch(dropDeletedStreams(this.state, ids));
         for (const listener of this.deletedListeners) listener([...ids], msg.deletedTakeIds);
         break;
       }
-      case "ice-offer": {
+      case "ice-offer":
         if (msg.fromPeerId && msg.fromPeerId !== SERVER_PEER_ID) {
-          void this.answerRecorderOffer(msg.fromPeerId, msg.sdp);
+          void answerRecorderOffer({
+            signaling: this.signaling,
+            fromPeerId: msg.fromPeerId,
+            sdp: msg.sdp,
+            connId: this.nextConnId++,
+            conns: this.conns,
+            onFrame: (connId, bytes) => {
+              if (this.interceptMeter(bytes)) return;
+              this.worker.post({ type: "frame", connId, bytes }, [bytes]);
+            },
+          });
         }
         break;
-      }
       case "error":
         // Fatal errors are terminal state (state.fatal via onState), not
-        // strip noise — the old permanent "superseded" banner (F3).
+        // strip noise.
         if (msg.fatal) break;
         this.pushError(`${msg.code}: ${msg.message}`);
         break;
@@ -433,116 +286,27 @@ export class DeskSession {
     }
   }
 
-  // ---- transports ------------------------------------------------------------
-
-  /** Recorders offer `antiphon/1` directly to the desk (LAN path). */
-  private async answerRecorderOffer(fromPeerId: string, sdp: string): Promise<void> {
-    const pc = new RTCPeerConnection(RTC_CONFIG);
-    const unwire = wireIce(pc, this.signaling, fromPeerId);
-    const connId = this.nextConnId++;
-    pc.addEventListener("datachannel", (ev) => {
-      const channel = ev.channel;
-      channel.binaryType = "arraybuffer";
-      const conn: Conn = {
-        id: connId,
-        channel,
-        dispose: () => {
-          unwire();
-          try {
-            channel.close();
-            pc.close();
-          } catch {
-            // teardown race
-          }
-        },
-      };
-      this.conns.set(connId, conn);
-      channel.addEventListener("message", (mev) => {
-        if (mev.data instanceof ArrayBuffer) {
-          if (this.interceptMeter(mev.data)) return;
-          this.post({ type: "frame", connId, bytes: mev.data }, [mev.data]);
-        }
-      });
-      channel.addEventListener("close", () => {
-        this.conns.delete(connId);
-        conn.dispose();
-      });
-    });
-    pc.addEventListener("connectionstatechange", () => {
-      if (pc.connectionState === "failed") {
-        this.conns.get(connId)?.dispose();
-        this.conns.delete(connId);
-      }
-    });
-    await pc.setRemoteDescription({ type: "offer", sdp });
-    const answer = await pc.createAnswer();
-    await pc.setLocalDescription(answer);
-    this.signaling.send({
-      v: 1,
-      type: "ice-answer",
-      targetPeerId: fromPeerId,
-      sdp: answer.sdp ?? "",
-    });
-  }
-
-  /** Desk→server sync channel (antiphon-sync/1). */
-  private ensureServerSync(): void {
-    if (this.serverConnecting || this.serverConn?.channel.readyState === "open") return;
-    if (!this.signaling.state.connected) return;
-    this.serverConnecting = true;
-    this.patch({ serverSync: "connecting" });
-    void offerChannel(this.signaling, SERVER_PEER_ID, "antiphon-sync/1")
-      .then(({ pc, channel, dispose }) => {
-        const connId = this.nextConnId++;
-        const conn: Conn = { id: connId, channel, dispose };
-        this.serverConn = conn;
-        this.conns.set(connId, conn);
-        this.serverConnecting = false;
-        this.patch({ serverSync: "connected" });
-        channel.addEventListener("message", (ev) => {
-          if (ev.data instanceof ArrayBuffer) {
-            this.onServerSyncFrame(ev.data, connId);
-          }
-        });
-        const onDown = () => {
-          if (this.serverConn === conn) {
-            this.serverConn = null;
-            this.conns.delete(connId);
-            conn.dispose();
-            this.patch({ serverSync: "down" });
-            window.setTimeout(() => this.ensureServerSync(), RECONNECT_DELAY_MS);
-          }
+  private onWelcome(active: SessionState["activeTake"]): void {
+    if (active) {
+      // Snapshot carries a take: adopt it. A different id than ours means
+      // the room genuinely moved on — stale local state loses.
+      if (active.takeId !== this.state.activeTakeId) {
+        this.activeTakeStart = {
+          takeId: active.takeId,
+          wallClockHint: active.startedAt,
+          ...(active.disarmedPeerIds?.length ? { disarmedPeerIds: active.disarmedPeerIds } : {}),
         };
-        channel.addEventListener("close", onDown);
-        pc.addEventListener("connectionstatechange", () => {
-          if (pc.connectionState === "failed" || pc.connectionState === "disconnected") onDown();
-        });
-        // Announce our HAVEs immediately (§6.8).
-        this.exchangeHaves();
-      })
-      .catch(() => {
-        // Silent by design: serverSync "down" is surfaced in the top bar
-        // and this retry loop fires every ~2 s while the server is away —
-        // per-attempt logging would flood the console during a restart.
-        this.serverConnecting = false;
-        this.patch({ serverSync: "down" });
-        window.setTimeout(() => this.ensureServerSync(), RECONNECT_DELAY_MS);
-      });
-  }
-
-  private onServerSyncFrame(bytes: ArrayBuffer, connId: number): void {
-    // Meter telemetry (teed by the server for recorders without a P2P leg)
-    // never reaches the protocol worker.
-    if (this.interceptMeter(bytes)) return;
-    // Frame type dispatch happens in the worker for chunks/gaps; HAVEs from
-    // the server additionally trigger a push plan from OUR store.
-    const view = new Uint8Array(bytes);
-    const isHave = view.length >= 4 && view[3] === 0x07;
-    if (isHave) {
-      const copy = bytes.slice(0);
-      this.requestPushPlan(copy);
+        this.patch({ activeTakeId: active.takeId, takeStartedAt: Date.parse(active.startedAt) });
+      }
+    } else if (this.activeTakeStart) {
+      // Empty snapshot while OUR take is rolling: the server rebooted
+      // mid-take and recorders kept capturing (§7.1). Re-assert the take to
+      // the reborn room — idempotent for recorders already rolling it.
+      this.signaling.send({ v: 1, type: "take-start", ...this.activeTakeStart });
+    } else {
+      this.patch({ activeTakeId: null });
     }
-    this.post({ type: "frame", connId, bytes }, [bytes]);
+    this.serverSync.ensure();
   }
 
   /** METER frames (experimental 0x80) are UI telemetry, handled here. */
@@ -555,23 +319,16 @@ export class DeskSession {
     if (json) {
       const { streamId, peak } = JSON.parse(json) as { streamId: string; peak: number };
       this.patch({
-        liveLevels: {
-          ...this.state.liveLevels,
-          [streamId]: { peak, at: Date.now() },
-        },
+        liveLevels: { ...this.state.liveLevels, [streamId]: { peak, at: Date.now() } },
       });
     }
     return true;
   }
 
-  private requestPushPlan(haveBytes: ArrayBuffer): void {
-    this.post({ type: "plan-push", haveBytes }, [haveBytes]);
-  }
-
   // ---- reconciliation loops ----------------------------------------------
 
   private broadcastAcks(): void {
-    this.requestFromWorker("acks", (frames) => {
+    this.worker.request("acks", (frames) => {
       for (const conn of this.conns.values()) {
         if (conn.channel.readyState !== "open") continue;
         for (const frame of frames) {
@@ -585,103 +342,14 @@ export class DeskSession {
     });
   }
 
-  private exchangeHaves(): void {
-    const server = this.serverConn;
-    if (server?.channel.readyState !== "open") return;
-    this.requestFromWorker("haves", (frames) => {
-      for (const frame of frames) {
-        try {
-          server.channel.send(frame);
-        } catch {
-          break; // channel died mid-burst; the reconnect loop re-exchanges
-        }
-      }
-    });
-  }
-
-  private requestFromWorker(
-    kind: "acks" | "haves",
-    handler: (frames: ArrayBuffer[]) => void,
-  ): void {
-    this.waiters[kind].push(handler);
-    this.post({ type: kind });
-  }
-
-  private onWorker(msg: FromSinkWorker): void {
-    switch (msg.type) {
-      case "ready":
-        this.patch({ rebuiltChunks: msg.rebuiltChunks });
-        break;
-      case "reply": {
-        const conn = this.conns.get(msg.connId);
-        if (conn?.channel.readyState === "open") {
-          try {
-            conn.channel.send(msg.bytes);
-          } catch {
-            // dead channel
-          }
-        }
-        break;
-      }
-      case "acks-result":
-        this.waiters.acks.shift()?.(msg.frames);
-        break;
-      case "haves-result":
-        this.waiters.haves.shift()?.(msg.frames);
-        break;
-      case "push-plan": {
-        if (msg.ranges.length === 0) break;
-        this.waiters.frames.push((frames) => this.pushFramesToServer(frames));
-        this.post({
-          type: "get-frames",
-          takeId: msg.takeId,
-          streamId: msg.streamId,
-          ranges: msg.ranges,
-        });
-        break;
-      }
-      case "frames-result":
-        this.waiters.frames.shift()?.(msg.frames);
-        break;
-      case "flac-result": {
-        const waiter = this.flacWaiters.get(msg.requestId);
-        this.flacWaiters.delete(msg.requestId);
-        waiter?.({ flac: msg.flac, ...(msg.reason !== undefined ? { reason: msg.reason } : {}) });
-        break;
-      }
-      case "status-result":
-        this.patch({ deskStatus: msg.streams });
-        break;
-      case "error":
-        this.pushError(msg.message);
-        break;
+  private sendToConn(connId: number, bytes: ArrayBuffer): void {
+    const conn = this.conns.get(connId);
+    if (conn?.channel.readyState !== "open") return;
+    try {
+      conn.channel.send(bytes);
+    } catch {
+      // dead channel
     }
-  }
-
-  private pushFramesToServer(frames: ArrayBuffer[]): void {
-    const channel = this.serverConn?.channel;
-    if (channel?.readyState !== "open") return;
-    let i = 0;
-    const pump = () => {
-      while (i < frames.length && channel.bufferedAmount < HIGH_WATERMARK) {
-        const frame = frames[i++];
-        if (!frame) break;
-        try {
-          channel.send(frame);
-        } catch {
-          return; // channel died mid-push; reconciliation re-plans on reconnect
-        }
-      }
-      if (i < frames.length) {
-        channel.addEventListener("bufferedamountlow", pump, { once: true });
-      }
-    };
-    channel.bufferedAmountLowThreshold = HIGH_WATERMARK / 4;
-    pump();
-  }
-
-  private post(msg: ToSinkWorker, transfer: Transferable[] = []) {
-    this.worker.postMessage(msg, transfer);
   }
 
   private patch(patch: Partial<DeskSessionState>): void {

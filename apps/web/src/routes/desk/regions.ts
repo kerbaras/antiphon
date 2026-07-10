@@ -1,9 +1,6 @@
-// W7-B clip-region domain math — the pure half of the Split tool. The doc
-// shape and its read/write helpers live in net/collab-doc.ts (wire layer);
-// this module owns what a split MEANS: seeding the implicit region of a
-// never-split stream, cutting a region in two, and the invariants every
-// stored list must satisfy. All functions are pure so the rules are
-// unit-testable without a Y.Doc or a pointer event.
+// Clip-region domain math — the pure half of the Split tool: seeding the
+// implicit region of a never-split stream, cutting a region in two, and
+// the invariants every stored list must satisfy (wire shape: collab-doc).
 
 import type { ClipRegion } from "../../net/collab-doc";
 
@@ -13,22 +10,16 @@ import type { ClipRegion } from "../../net/collab-doc";
 export const MIN_REGION_SEC = 0.1;
 
 /** The implicit single region of a never-split stream: the whole source at
- * its arrangement position. Its id IS the streamId — selection, delete
- * staging, and every pre-region spec key off that identity, and the first
- * split keeps it on the left piece so nothing re-keys under the operator. */
+ * its arrangement position. Its id IS the streamId — the first split keeps
+ * it on the left piece so nothing re-keys under the operator. */
 export function seedRegion(streamId: string, startSec: number, durationSec: number): ClipRegion {
   return { id: streamId, startSec, sourceOffsetSec: 0, durationSec };
 }
 
-/** Split one region of a stream's list at `atSourceSec` (SOURCE-domain
- * seconds, same axis as sourceOffsetSec). Returns the new list — source-
- * ordered, the left piece keeping the original id (stable identity for
- * selection and the seeded streamId id), the right piece minted fresh —
- * or null when the cut is rejected: unknown region, or either piece would
- * fall under MIN_REGION_SEC. The pieces ABUT both in source and on the
- * arrangement (right.startSec = left.startSec + left.durationSec), so a
- * fresh split plays and draws exactly like the uncut region.
- */
+/** Split one region at `atSourceSec` (SOURCE seconds). The left piece keeps
+ * the original id; pieces ABUT in both domains, so a fresh split plays like
+ * the uncut region. Null = rejected (unknown id, or a piece would fall
+ * under MIN_REGION_SEC). */
 export function splitRegion(
   regions: readonly ClipRegion[],
   regionId: string,
@@ -57,11 +48,8 @@ export function sortRegions(regions: readonly ClipRegion[]): ClipRegion[] {
 
 /** Resolve selected REGION ids to their owning streamIds (deduped, selection
  * order). A never-split region's id IS its streamId; split pieces resolve
- * through the doc map. Selecting ANY piece of a split stream selects the
- * whole STREAM for stream-scoped actions — delete staging (W7-B) and the
- * align scope (W7-A × W7-B) alike, because both are per-stream by
- * construction: deletion is durable stream removal, and alignment
- * head-trims are properties of the capture, shared by all its pieces. */
+ * through the doc map. Any piece selects the whole STREAM for stream-scoped
+ * actions (delete, align scope) — both are per-stream by construction. */
 export function selectionStreamIds(
   selection: readonly string[],
   docRegions: Readonly<Record<string, ClipRegion[]>>,
@@ -80,20 +68,13 @@ export function selectionStreamIds(
   return out;
 }
 
-/** Which end of a clip a trim gesture grabs (W9-F). */
+/** Which end of a clip a trim gesture grabs. */
 export type TrimEdge = "head" | "tail";
 
-/** Trim or extend one region's edge by `deltaSec` SOURCE seconds (W9-F —
- * clips are projections of the raw audio, so an edge drag can re-open
- * material a cut or an earlier trim hid). The delta is CLAMPED, never
- * rejected:
- *   · the region keeps ≥ MIN_REGION_SEC;
- *   · the source window stays inside [0, streamDurationSec] and never
- *     overlaps a sibling's window (source disjointness is the stored-list
- *     invariant — regionsValid);
- *   · a head trim moves startSec WITH sourceOffsetSec, so the untrimmed
- *     material holds its arrangement position (DAW-standard edge feel);
- *   · startSec stays ≥ 0.
+/** Trim/extend one region's edge by `deltaSec` SOURCE seconds; an edge drag
+ * can re-open hidden material. Clamped, never rejected: ≥ MIN_REGION_SEC,
+ * source window in-bounds and sibling-disjoint, startSec ≥ 0; a head trim
+ * moves startSec WITH sourceOffsetSec so untrimmed material holds position.
  * Returns the new list, or null for an unknown region id. */
 export function trimRegion(
   regions: readonly ClipRegion[],
@@ -150,20 +131,13 @@ export function trimRegion(
   );
 }
 
-/** The stored-list invariants (collab-doc.ts ClipRegion doc): source-ordered,
- * non-overlapping in the source domain, within [0, streamDurationSec], every
- * region ≥ MIN_REGION_SEC (a hair of float slack so a boundary computed
- * through pixel geometry never fails its own invariant). Write-guards call
- * this; a false return means drop the write, not throw.
- *
- * ARRANGEMENT-axis overlap between pieces is deliberately ALLOWED (pinned
- * in regions.test.ts): drag two pieces of one stream over each other and
- * BOTH sound — mixed/doubled audio, exactly what two whole clips dragged
- * onto each other have always done. Source disjointness is the only
- * overlap rule; where the operator stacks the pieces is arrangement. */
+/** Stored-list invariants: source-ordered, source-disjoint, within
+ * [0, streamDurationSec], every region ≥ MIN_REGION_SEC (float slack for
+ * pixel-derived boundaries). ARRANGEMENT-axis overlap is deliberately
+ * allowed — overlapping pieces both sound, like two whole clips would.
+ * Write-guards call this; a false return means drop the write, not throw. */
 export function regionsValid(regions: readonly ClipRegion[], streamDurationSec: number): boolean {
-  // Empty is valid (W9-F): every clip deleted from the arrangement — a
-  // projection state, the raw audio stays archived.
+  // Empty is valid: every clip deleted — a projection state, audio archived.
   const EPS = 1e-6;
   let cursor = 0;
   for (const r of sortRegions(regions)) {

@@ -1,9 +1,6 @@
 // Dependency-free ZIP writer, STORE method only (APPNOTE 4.4.x subset):
-// local file headers + central directory + end-of-central-directory, CRC-32
-// per entry, UTF-8 filenames. No compression — the payload is WAV, and PCM
-// barely deflates; STORE keeps the writer ~100 lines and byte-predictable.
-// (The wasm core exposes CRC-32C — Castagnoli — which ZIP does not accept;
-// ZIP wants the IEEE 802.3 polynomial, hand-rolled below.)
+// PCM barely deflates, and STORE keeps the bytes predictable. ZIP wants
+// IEEE CRC-32 (the wasm core's CRC-32C is not acceptable), hand-rolled below.
 
 export interface ZipEntry {
   /** Path inside the archive (UTF-8, forward slashes). */

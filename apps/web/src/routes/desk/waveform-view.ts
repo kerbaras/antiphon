@@ -1,22 +1,9 @@
-// F18 — per-clip waveform VIEW gain. Two waveform sources feed the clips:
-// the live take draws the encoder's signal-complexity proxy (self-scaled to
-// the clip height by construction — it has no amplitude axis at all), and
-// completed streams draw true decoded peaks. Drawing the decoded peaks at
-// ABSOLUTE amplitude made every quiet take "collapse" the moment it
-// finished: tall proxy → flat dotted strip, which QA read as data loss.
-//
-// The honest fix (design-system rule: never fake, always say so): draw the
-// decoded waveform peak-normalized per clip — the shape is real, only the
-// vertical scale changes — and DECLARE the view gain with a dim mono "×N"
-// chip once the boost is significant. Two guards keep it truthful:
-//   · silence floor: near-silence (≤ −54 dBFS) is NOT normalized — a take
-//     of room hiss must still read as silence, not amplified-to-full noise;
-//   · gain cap: the boost never exceeds ×24 (+27.6 dB), so genuinely tiny
-//     signal stays visibly tiny even in the normalized view.
-// Amplitude ground truth remains one hover away (load the take → mixer VU)
-// and untouched everywhere it matters: playback, alignment, exports.
+// Per-clip waveform VIEW gain: decoded peaks draw peak-normalized per clip
+// (shape is real, only vertical scale changes) and the boost is declared
+// with a "×N" chip. Playback/alignment/export amplitudes are untouched.
 
-/** Peaks at/below this (−54 dBFS) are treated as silence: no view gain. */
+/** Peaks at/below this (−54 dBFS) are treated as silence: no view gain —
+ * room hiss must still read as silence, not amplified-to-full noise. */
 export const WAVEFORM_SILENCE_FLOOR = 0.002;
 
 /** View gain never exceeds ×24 (+27.6 dB) — quiet stays visibly quiet. */

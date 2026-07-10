@@ -1,9 +1,6 @@
-// W8-A desk-access sharing (auth mode only), now a SECTION of the "+"
-// invite popover (operator ask: one affordance for everything session-
-// entry). Owner-only management: add/list/revoke emails against the
-// owner-gated shares API; sharees see the honest read-only line. The mic
-// capability (QR/link) lives in the section above it — the copy in both
-// keeps the capability split legible.
+// Desk-access section of the invite popover (auth mode only). Owner-only
+// management: add/list/revoke emails against the owner-gated shares API;
+// sharees see a read-only line. The mic capability (QR/link) lives above.
 
 import { useCallback, useEffect, useState } from "react";
 import { SectionLabel } from "../../components";
@@ -61,10 +58,10 @@ export function DeskAccessSection({ sessionId }: { sessionId: string }) {
       if (res.ok) {
         setDraft("");
         await refresh();
-      } else {
-        const body = (await res.json().catch(() => null)) as { error?: string } | null;
-        setAddError(body?.error ?? "couldn't share — try again");
+        return;
       }
+      const body = (await res.json().catch(() => null)) as { error?: string } | null;
+      setAddError(body?.error ?? "couldn't share — try again");
     } catch {
       setAddError("couldn't share — server unreachable?");
     } finally {

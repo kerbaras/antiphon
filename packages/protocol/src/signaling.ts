@@ -1,15 +1,6 @@
 // Control-plane messages (RFC §5): JSON over WSS. These Zod schemas are the
-// normative message shapes — a change here is a compile error in every
-// consumer. Unknown `type` MUST be ignored by receivers (forward compat):
-// parse with `parseSignalingMessage`, which returns `null` for unknown
-// types instead of throwing.
-//
-// Extensions beyond the RFC's informative table (proposed as amendments):
-// - `stream-announce` (recorder→all): maps a stream id to a peer before any
-//   data-plane bytes arrive — pure UI affordance.
-// - `stream-final` (recorder→all): tells sinks the final seq of a stream so
-//   completeness is decidable at the sink (§7 only drives the recorder off
-//   ACKs; sinks otherwise cannot distinguish "done" from "disconnected").
+// normative message shapes. Receivers MUST ignore unknown `type`s (forward
+// compat): parse with `parseSignalingMessage`, which returns null for them.
 
 import { z } from "zod";
 import { DeviceInfo, PeerId, PeerRole, SessionState, StreamId, TakeId } from "./session.ts";
@@ -31,15 +22,9 @@ export const HelloMessage = z.object({
   role: PeerRole,
   deviceInfo: DeviceInfo,
   protocolVersions: z.array(z.number().int().positive()).min(1),
-  /**
-   * Desk authentication (proposed amendment A15, the RFC §12 "desk-
-   * authenticated session creation" v2 step): a Clerk session JWT carried
-   * in the hello because browsers cannot set WS headers. Servers running
-   * with auth enabled MUST judge a desk hello by it BEFORE attaching any
-   * session state; recorder hellos ignore it (mic join stays a public
-   * bearer capability). Absent in keyless mode — old servers strip it
-   * (zod object schemas are non-strict), old desks never send it.
-   */
+  /** Desk auth (A15, RFC §12): Clerk session JWT carried in the hello because
+   * browsers cannot set WS headers. Recorder hellos ignore it (mic join stays
+   * a public bearer capability); absent in keyless mode (schemas non-strict). */
   authToken: z.string().min(1).max(8_192).optional(),
 });
 export type HelloMessage = z.infer<typeof HelloMessage>;
@@ -49,13 +34,9 @@ export type ByeMessage = z.infer<typeof ByeMessage>;
 
 // ---- peer identity (A13) ---------------------------------------------------
 
-/**
- * Live nickname change (proposed amendment A13). A recorder may rename
- * ITSELF; the desk (session authority) may rename ANY peer. The server
- * validates authority, updates its session state, persists, and fans the
- * same message out to all peers. An empty (or whitespace-only) `label`
- * clears the nickname back to the device-derived fallback.
- */
+/** Live nickname change (A13): a recorder may rename itself; the desk may
+ * rename any peer. The server validates authority, persists, and fans out.
+ * An empty/whitespace `label` clears back to the device-derived fallback. */
 export const PeerUpdateMessage = z.object({
   ...base,
   type: z.literal("peer-update"),
@@ -120,6 +101,7 @@ export type TakeStopMessage = z.infer<typeof TakeStopMessage>;
 
 // ---- stream metadata (recorder → server → all) -----------------------------
 
+/** Maps a stream id to a peer before any data-plane bytes arrive (amendment). */
 export const StreamAnnounceMessage = z.object({
   ...base,
   type: z.literal("stream-announce"),
@@ -129,6 +111,7 @@ export const StreamAnnounceMessage = z.object({
 });
 export type StreamAnnounceMessage = z.infer<typeof StreamAnnounceMessage>;
 
+/** Final seq of a stream, so completeness is decidable at the sink (§7). */
 export const StreamFinalMessage = z.object({
   ...base,
   type: z.literal("stream-final"),
@@ -140,10 +123,9 @@ export const StreamFinalMessage = z.object({
 export type StreamFinalMessage = z.infer<typeof StreamFinalMessage>;
 
 // ---- stream deletion (desk → server; server → all) --------------------------
-// Deletion is a control-plane decision by the desk (the session authority).
-// The server is the source of truth: it deletes durably FIRST, then fans out
-// `streams-deleted` — desks drop their local copies only on that confirm, so
-// a failed delete never leaves sinks disagreeing with the archive.
+// The server deletes durably FIRST, then fans out `streams-deleted`; desks
+// drop local copies only on that confirm, so a failed delete never leaves
+// sinks disagreeing with the archive.
 
 export const StreamRef = z.object({ takeId: TakeId, streamId: StreamId });
 export type StreamRef = z.infer<typeof StreamRef>;
@@ -246,11 +228,8 @@ export const SignalingMessage = z.discriminatedUnion("type", [
 ]);
 export type SignalingMessage = z.infer<typeof SignalingMessage>;
 
-/**
- * Parse a wire string. Returns the message, `null` for messages that must
- * be ignored (unknown type / future version — forward compatibility), or
- * throws on malformed JSON/shape of a KNOWN type.
- */
+/** Parse a wire string: the message, `null` when it must be ignored (unknown
+ * type / future version), or a throw on malformed JSON/shape of a known type. */
 export function parseSignalingMessage(raw: string): SignalingMessage | null {
   const envelope = z.object({ v: z.number(), type: z.string() }).loose().parse(JSON.parse(raw));
   const known = SignalingMessage.options.some((o) => o.shape.type.value === envelope.type);

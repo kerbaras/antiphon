@@ -27,9 +27,8 @@ export const DeviceInfo = z.object({
    * across reconnects (A12). Optional so pre-A12 peers stay valid. */
   deviceId: z.uuid().optional(),
   /** Account profile picture (A16) — display-only denorm, self-reported by
-   * signed-in endpoints (Clerk imageUrl). https only: the desk renders it
-   * in an <img>, and COEP require-corp already refuses hosts without CORP
-   * headers, but a hostile scheme must die at the schema. */
+   * signed-in endpoints (Clerk imageUrl). https only: the desk renders it in
+   * an <img>, so a hostile scheme must die at the schema. */
   avatarUrl: z
     .url({ protocol: /^https$/ })
     .max(512)

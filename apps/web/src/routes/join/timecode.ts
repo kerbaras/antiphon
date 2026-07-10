@@ -1,7 +1,5 @@
-// Phone timecode formatting (QA #16). The old `MM:SS:CC` read as
-// `HH:MM:SS` — three colon-separated pairs is universally hours. Centi-
-// seconds ride behind a decimal point instead ("01:23.81"), and minutes
-// widen naturally past 99 rather than wrapping or padding into nonsense.
+// Phone timecode: "mm:ss.cc" — centiseconds behind a decimal point (three
+// colon-separated pairs reads as HH:MM:SS), minutes widening past 99.
 
 export function formatClock(seconds: number): string {
   const safe = Number.isFinite(seconds) && seconds > 0 ? seconds : 0;

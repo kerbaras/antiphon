@@ -28,14 +28,14 @@ const throwingStore = {
   },
 };
 
-describe("mic preference persistence (W4-F)", () => {
+describe("mic preference persistence", () => {
   it("round-trips a preference", () => {
     const store = fakeStore();
     saveMicPreference({ deviceId: "abc123", label: "Headset Mic" }, store);
     expect(loadMicPreference(store)).toEqual({ deviceId: "abc123", label: "Headset Mic" });
   });
 
-  it("re-persisting overwrites a dead preference (F3: no doomed exact-id gUM forever)", () => {
+  it("re-persisting overwrites a dead preference", () => {
     const store = fakeStore();
     saveMicPreference({ deviceId: "rotated-away", label: "Ghost Mic" }, store);
     saveMicPreference({ deviceId: "live-default", label: "Built-in Microphone" }, store);

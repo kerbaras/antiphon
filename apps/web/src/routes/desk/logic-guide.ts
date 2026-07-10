@@ -1,8 +1,6 @@
-// IMPORT-GUIDE.md for the Logic / generic stems package (W3-B). Logic Pro
-// has no documented project file format, so Antiphon does not fake a
-// .logicx — it ships the honest package (aligned stems + master +
-// project.json) with exact import steps instead. Plain markdown, written
-// for the person doing the import, not for marketing.
+// IMPORT-GUIDE.md for the Logic / generic stems package. Logic Pro has no
+// documented project file format, so Antiphon does not fake a .logicx —
+// it ships the honest package with exact import steps instead.
 
 import { formatAt } from "./format";
 import type { ProjectManifest } from "./project-manifest";

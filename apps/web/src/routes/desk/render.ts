@@ -1,18 +1,11 @@
-// Offline master/stems render (W2-A): the take through an
-// OfflineAudioContext instead of the speakers. Playback parity is
-// structural, not re-derived: the player hands over its decoded buffers
-// plus the exact TrackTiming it schedules live sources with, and sources
-// are planned through the same timeline-math.planSource — chirp head-trim,
-// drift ratio as AudioBufferSourceNode.playbackRate (honored offline), and
-// clip delays behave identically in both paths. Stored audio is never
-// mutated (RFC §13): buffers are only ever read by source nodes.
+// Offline master/stems render. Playback parity is structural: sources are
+// planned through the same timeline-math planners live playback uses, on
+// the player's own buffers (read-only — stored audio is never mutated).
 //
-// Output rate is a fixed 48 kHz: capture records 48 kHz FLAC (the take's
-// native rate). The player's buffers carry whatever rate the desk's output
-// device runs at (decodeAudioData resamples to the AudioContext rate) — a
-// device artifact, not a property of the take. The offline context
-// resamples sources to 48 kHz exactly like live playback resamples to the
-// device rate, so exports are device-independent.
+// Output is fixed 48 kHz (capture's native rate): the player's buffers
+// carry the output device's rate — a device artifact — and the offline
+// context resamples exactly like live playback, so exports are
+// device-independent.
 
 import { createEqChain, type EqState } from "./eq";
 import {
@@ -34,9 +27,8 @@ export interface RenderTrackModel {
   buffer: AudioBuffer;
   /** Alignment/drift/arrangement timing, straight from the player. */
   timing: TrackTiming;
-  /** Split regions (W7-B), rebased to the model's take-local timeline by
-   * the player. Absent = never split (the whole-stream schedule path —
-   * zero-split renders stay byte-identical to pre-region output). */
+  /** Split regions, rebased to the model's take-local timeline by the
+   * player. Absent = never split (the whole-stream schedule path). */
   regions?: RegionSpan[];
   /** Resolved audible strip gain (linear; mute/solo already folded to 0). */
   gain: number;
@@ -65,10 +57,9 @@ export interface Stem {
   buffer: AudioBuffer;
 }
 
-/** Master mixdown: 48 kHz stereo, exactly what monitoring plays — per-track
- * EQ/gain/pan/mute/solo, master EQ/gain/pan, alignment and drift correction
- * all applied. `range` selects a slice of the take's room timeline (the
- * player.position() domain) for W2-B marker renders; omitted = whole take. */
+/** Master mixdown: 48 kHz stereo, exactly what monitoring plays — strip and
+ * master EQ/gain/pan, mute/solo, alignment and drift correction all applied.
+ * `range` selects a slice of the take's room timeline; omitted = whole take. */
 export async function renderMaster(model: RenderModel, range?: RenderRange): Promise<AudioBuffer> {
   const { startSec, endSec } = resolveRange(model.durationSec, range);
   const ctx = new OfflineAudioContext(
@@ -77,11 +68,8 @@ export async function renderMaster(model: RenderModel, range?: RenderRange): Pro
     RENDER_SAMPLE_RATE,
   );
   // Mirror the playback graph: track EQ → gain → pan → master EQ → master
-  // gain → master pan. Bypassed EQs are omitted outright — the render of a
-  // bypassed strip must equal the render of a strip with no EQ at all,
-  // exactly like the player's true-bypass edge swap. (The player's unity
-  // input/bus nodes and analysers are wiring/metering conveniences —
-  // acoustically transparent, so they have no offline counterpart.)
+  // gain → master pan. Bypassed EQs are omitted outright, matching the
+  // player's true-bypass edge swap; unity/analyser nodes have no counterpart.
   const master = ctx.createGain();
   master.gain.value = model.masterGain;
   const masterPanner = ctx.createStereoPanner();
@@ -112,20 +100,11 @@ export async function renderMaster(model: RenderModel, range?: RenderRange): Pro
   return ctx.startRendering();
 }
 
-/** One mono stem per track, all exactly the range's length so lanes line
- * up at 0 when imported into a DAW. Deliberately PRE-mix: only the
- * room-clock mapping (chirp alignment + drift correction + clip delay) is
- * baked — that is what makes lanes line up and cannot be reproduced
- * downstream. Strip gain/pan/mute/solo/EQ are NOT baked: stems are source
- * material, and mixer moves (EQ included) stay editable in the importing
- * DAW (the mix itself ships as the master WAV).
- *
- * SPLIT REGIONS (W7-B) ARE NOT BAKED EITHER, by the same pre-mix
- * philosophy: a split is an arrangement/mix decision, and cutting the
- * stem would destroy source material the importing DAW could still use
- * (the trimmed-away take intro, the breath before the cut). Stems stay
- * WHOLE-STREAM — the full capture at the stream's clip position (its
- * first region's placement) — while the master mix carries the splits. */
+/** One mono stem per track, all exactly the range's length so lanes line up
+ * at 0 in a DAW. Deliberately PRE-mix: only the room-clock mapping
+ * (alignment + drift + clip delay) is baked — strip gain/pan/mute/solo/EQ
+ * and split regions are NOT (stems stay whole-stream source material; the
+ * mix and the splits ship in the master WAV). */
 export async function renderStems(model: RenderModel, range?: RenderRange): Promise<Stem[]> {
   const { startSec, endSec } = resolveRange(model.durationSec, range);
   const length = Math.max(1, Math.round((endSec - startSec) * RENDER_SAMPLE_RATE));
@@ -133,7 +112,7 @@ export async function renderStems(model: RenderModel, range?: RenderRange): Prom
   for (const track of model.tracks) {
     // OfflineAudioContext.startRendering is one-shot: one context per stem.
     const ctx = new OfflineAudioContext(1, length, RENDER_SAMPLE_RATE);
-    // Whole-stream on purpose (regions dropped) — see the docstring.
+    // Whole-stream on purpose (regions dropped — see the docstring).
     const { regions: _dropped, ...whole } = track;
     startSource(ctx, whole, startSec, ctx.destination);
     stems.push({
@@ -145,14 +124,10 @@ export async function renderStems(model: RenderModel, range?: RenderRange): Prom
   return stems;
 }
 
-// ---- session master render (W6-B) ------------------------------------------------
-// The operator's ask: "master render should render the entire session, not
-// the take you are in." Sequential per-take renderMaster passes — the SAME
-// planSource math as playback and every per-take export — mixed into one
-// session-length stereo buffer at each take's room offset. Gaps are zeros.
-// Memory bounds like playback: one take's decoded audio lives at a time
-// (modelOf decodes on demand; renderMaster's output is the only long-lived
-// PCM, and it IS the deliverable).
+// ---- session master render ---------------------------------------------------------
+// Sequential per-take renderMaster passes mixed into one session-length
+// stereo buffer at each take's room offset; gaps are zeros. Memory bounds
+// like playback: one take's decoded audio lives at a time.
 
 /** One take's slot in the session render, from player.sessionRenderPlan(). */
 export interface SessionRenderSegment {
@@ -178,11 +153,9 @@ export function estimateSessionWavBytes(spanSec: number): number {
 }
 
 /** Render the whole session: every take mixed at its room offset, silence
- * between. The output timeline starts at the FIRST clip's start (the
- * arrangement's leading second is desk furniture, not recorded silence) —
- * so a single-take session renders exactly what the per-take master
- * renders. Takes render sequentially through `modelOf`; a take that can't
- * build a model throws — a master with a silent hole would be a lie. */
+ * between. The output starts at the FIRST clip's start (leading arrangement
+ * space is desk furniture, not recorded silence). Takes render sequentially
+ * through `modelOf`; an unbuildable model throws — no silent holes. */
 export async function renderSessionMaster(
   segments: readonly SessionRenderSegment[],
   modelOf: (takeId: string) => Promise<RenderModel | null>,
@@ -216,11 +189,9 @@ export async function renderSessionMaster(
       endSample = Math.max(endSample, offset + n);
     }
   }
-  // subarray, not slice (QA M-4): slice would transiently DOUBLE the
-  // session-length float pair just to drop the ≤1 s drift slack. Aliasing
-  // is safe here — encodeWav only READS the channels into its own fresh
-  // ArrayBuffer, and the SessionMix (with its slack-sized backing) is
-  // transient export state either way.
+  // subarray, not slice: slice would transiently DOUBLE the session-length
+  // float pair just to drop the ≤1 s drift slack. Aliasing is safe —
+  // encodeWav only READS the channels, and the SessionMix is transient.
   return {
     channelData: [
       (out[0] as Float32Array).subarray(0, endSample),
@@ -232,10 +203,8 @@ export async function renderSessionMaster(
 }
 
 /** Schedule one track into an offline graph — the same plan live playback
- * uses, with the context origin standing in for `currentTime + lead`.
- * Split tracks (W7-B) fan out one source per region through the shared
- * planRegionSource, each stopped at its region's end by the duration arg —
- * playback/render parity by construction, exactly like planSource. */
+ * uses, the context origin standing in for `currentTime + lead`. Split
+ * tracks fan out one source per region, each stopped by the duration arg. */
 function startSource(
   ctx: OfflineAudioContext,
   track: RenderTrackModel,

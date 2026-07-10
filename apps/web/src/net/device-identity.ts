@@ -1,8 +1,6 @@
-// Stable device identity (A12) + nickname (A13), persisted in localStorage
-// so a reloading/reconnecting phone resumes its peer instead of forking a
-// new anonymous lane. Storage is injectable for tests and guarded against
-// environments where localStorage throws (private mode): identity then
-// degrades to per-page-load, exactly the pre-A12 behavior.
+// Stable per-browser device id + nickname, persisted in localStorage so a
+// reloading phone resumes its peer instead of forking a new anonymous lane.
+// Where localStorage throws (private mode), identity degrades to per-page-load.
 
 export const DEVICE_ID_KEY = "antiphon:device-id";
 export const NICKNAME_KEY = "antiphon:nickname";
@@ -60,16 +58,14 @@ function remove(key: string, store: KVStore | null): void {
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-/** UI-wide nickname cap. The wire bound is 256 (A13, packages/protocol);
- * 48 is the product norm every nickname input advertises via maxLength —
- * and maxLength alone is decorative: paste and programmatic writes walk
- * straight past it, so the cap is enforced HERE, at commit time. */
+/** UI-wide nickname cap (wire bound is 256, packages/protocol). Input
+ * maxLength alone is decorative — paste and programmatic writes walk past
+ * it — so the cap is enforced here, at commit time. */
 export const NICKNAME_MAX_LENGTH = 48;
 
-/** Commit-time normalization: trim, then hard-cap at NICKNAME_MAX_LENGTH
- * UTF-16 units. A cut that would split a surrogate pair drops the whole
- * pair instead (a lone surrogate renders as U+FFFD — QA #14's failure
- * mode), and whitespace exposed by the cut is re-trimmed. */
+/** Trim, then hard-cap at NICKNAME_MAX_LENGTH UTF-16 units. A cut that
+ * would split a surrogate pair drops the whole pair (a lone surrogate
+ * renders as U+FFFD); whitespace exposed by the cut is re-trimmed. */
 export function normalizeNickname(raw: string): string {
   let name = raw.trim().slice(0, NICKNAME_MAX_LENGTH);
   const last = name.charCodeAt(name.length - 1);
@@ -77,7 +73,8 @@ export function normalizeNickname(raw: string): string {
   return name.trim();
 }
 
-/** UUID generated once per browser and persisted (A12). */
+/** UUID generated once per browser and persisted, so the server resumes
+ * the same peer across reconnects. */
 export function getDeviceId(store: KVStore | null = defaultStore()): string {
   const existing = read(DEVICE_ID_KEY, store);
   if (existing && UUID_RE.test(existing)) return existing;

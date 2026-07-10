@@ -1,11 +1,6 @@
-// STREAMINFO finalization for locally-exported rehearse FLACs (QA #27).
-//
-// The streaming encoder's codec bootstrap (packages/codec codec_header())
-// necessarily writes total-samples = 0 ("unknown" per the FLAC spec) — no
-// frame exists yet when it is emitted. Chunk payloads are immutable protocol
-// bytes, but the local .flac EXPORT is assembled client-side, so the header
-// copy can be finalized once the take's sample count is known. Players then
-// report a real duration instead of N/A.
+// STREAMINFO finalization for locally-exported rehearse FLACs. The streaming
+// codec bootstrap writes total-samples = 0 ("unknown"); the local export is
+// assembled client-side, so its header copy can carry the real count.
 
 /** `fLaC` magic (4) + metadata block header (4) + STREAMINFO body (34). */
 const STREAMINFO_HEADER_BYTES = 42;

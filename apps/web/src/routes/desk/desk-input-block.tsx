@@ -1,16 +1,14 @@
-// The desk's own hardware input card (W2-D), hosted by the performers panel.
+// The desk's own hardware input card, hosted by the performers panel.
 
 import { useState } from "react";
 import { Avatar, SectionLabel, StatusPill, VUMeter } from "../../components";
 import { initialsOf } from "./track-model";
 import { type DeskInputState, getDeskInput } from "./use-desk-input";
 
-/** The desk's own hardware input (W2-D): pick an interface/mic and run it
- * as an embedded recorder lane — the ARCHITECTURE §2.2 room reference mic.
- * Device labels are blank until permission grants, so the picker opens
- * through a one-off probe; the live card shows the real capture level and
- * the same EC/NS/AGC honesty as the phone page. Enable/disable sit out
- * rolling takes: a lane must never appear or vanish mid-take. */
+/** Pick an interface/mic and run it as an embedded recorder lane (the room
+ * reference mic). Device labels are blank until permission grants, so the
+ * picker opens through a one-off probe. Enable/disable sit out rolling
+ * takes: a lane must never appear or vanish mid-take. */
 export function DeskInputBlock({
   sessionId,
   input,
@@ -128,9 +126,8 @@ export function DeskInputBlock({
             {input.sampleRate ? ` · ${(input.sampleRate / 1000).toFixed(1)} kHz` : ""}
           </div>
         </div>
-        {/* The chip tells the hardware truth: an unplugged input is never
-            "ready" (QA low) — and while a take rolls it records silence,
-            which the warning line below spells out. */}
+        {/* An unplugged input is never "ready" — while a take rolls it
+            records silence, which the warning line below spells out. */}
         <StatusPill tone={input.unplugged ? "warn" : input.recording ? "rec" : "ok"}>
           {input.unplugged ? "unplugged" : input.recording ? "recording" : "ready"}
         </StatusPill>

@@ -1,23 +1,6 @@
-// Take comments (W2-F) — pure model + interim persistence.
-//
-// A comment is a timestamped note on the loaded take ("alto flat at 2:31"):
-// `atSec` lives on the take's room timeline — the exact domain of
-// player.position()/seek(), same as markers.atSec — and `streamId` optionally
-// pins it to one lane's stream within the take (null = take-wide). Resolving
-// is a field update (`resolvedAtMs`), never a delete: the note and its
-// resolution history stay addressable.
-//
-// PERSISTENCE BOUNDARY (W3-A landed): the source of truth is the shared
-// project doc — a Y.Array of plain TakeComment objects per takeId
-// (net/collab-doc.ts, wired in use-desk.ts). Exactly as documented, ONLY
-// the load/save layer changed: the pure model above this line is
-// untouched. Resolve/unresolve/edit replace the array element with the
-// same uuid — simple and convergent at this scale (concurrent edits of the
-// SAME comment can briefly duplicate the stored element; the doc read path
-// dedupes and opportunistically heals — F16, see collab-doc.ts; adds/
-// removes/edits of different comments merge cleanly). loadComments/
-// saveComments remain as the doc's localStorage SHADOW — seed source,
-// offline display fallback, and cheap insurance on every change.
+// Take comments: timestamped notes on the take's room timeline (the
+// player.position() domain), optionally pinned to one stream. Source of
+// truth is the shared doc; loadComments/saveComments are its local shadow.
 
 import { dedupeById } from "../../net/collab-doc";
 
@@ -109,7 +92,7 @@ export function openCommentCount(comments: readonly TakeComment[]): number {
   return comments.filter((c) => c.resolvedAtMs === null).length;
 }
 
-// ---- persistence (doc shadow — see the W3-A boundary note up top) -------------
+// ---- persistence (localStorage shadow of the shared doc) -----------------------
 
 const SCHEMA_VERSION = 1;
 
@@ -168,9 +151,8 @@ export function loadComments(
         (c.resolvedAtMs === null ||
           (typeof c.resolvedAtMs === "number" && Number.isFinite(c.resolvedAtMs))),
     );
-    // Same-id entries (an F16-era shadow snapshot) collapse to the last
-    // occurrence — the same winner rule as the doc read path, and this
-    // list may seed the doc.
+    // Same-id entries collapse to the last occurrence — the same winner
+    // rule as the doc read path, and this list may seed the doc.
     return sortComments(
       dedupeById(valid).map((c) => ({
         id: c.id,

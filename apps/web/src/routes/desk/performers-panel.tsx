@@ -46,9 +46,8 @@ export function PerformersPanel({
         const color = row?.color ?? (TRACK_COLORS[i % TRACK_COLORS.length] as string);
         const nickname = peer.deviceInfo.label?.trim();
         const model = deviceName(peer.deviceInfo.userAgent);
-        // Unnamed performers title as their lane ("iPhone 2") — the device
-        // is already in the title, so the subtitle keeps just the id. Named
-        // ones keep the device provenance ("Maria" / "iPhone · a1b2c3d4").
+        // Unnamed performers title as their lane ("iPhone 2"), subtitle just
+        // the id; named ones keep the device provenance in the subtitle.
         const title = nickname || row?.name || model;
         const subtitle = nickname
           ? `${model} · ${peer.peerId.slice(0, 8)}`
@@ -99,10 +98,7 @@ export function PerformersPanel({
         color={midiColor}
       />
 
-      {/* No QR here: the top-bar "+" popover is THE invite surface (W4-D).
-          This tab used to keep a wall-poster copy, which W5-B then had to
-          dim whenever the popover opened — chrome whose whole job was
-          apologizing for its twin. The operator called it: gone (W6-A). */}
+      {/* No QR here: the top-bar "+" popover is THE invite surface. */}
       <p className="mt-auto px-1 pt-1 font-mono text-[9px] text-text-faint">
         sync {session.snapshot().serverSync}
       </p>

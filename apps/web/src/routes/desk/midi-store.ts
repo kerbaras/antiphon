@@ -1,54 +1,26 @@
-// MIDI event storage seam (W5-D): captured events move from localStorage
-// (50k cap, W3-C interim) into OPFS — the home the persistence-boundary
-// note in midi.ts always named. One interface, two implementations:
-//
-//   OpfsMidiStore        — navigator.storage.getDirectory(), one file per
-//                          take at antiphon-midi/<sessionId>/<takeId>.jsonl.
-//                          NO event cap; a load-time size guard (below) is
-//                          the only limit.
-//   LocalStorageMidiStore — the existing W3-C behavior, cap included, kept
-//                          verbatim as the fallback when OPFS is missing
-//                          (feature-detected once, capability-gate.tsx
-//                          honesty: state what's missing, degrade clearly).
-//
-// FILE FORMAT — JSONL, schema-versioned by the first line:
-//   line 1   {"antiphonMidiJsonl":1,"overflow":false}
-//   line 2…  one MidiEvent per line, e.g. {"atSec":1.25,"status":144,…}
-// JSONL over length-prefixed JSON because tolerance falls out per line — a
-// truncated or corrupted tail costs exactly the bad lines, and the file
-// stays human-inspectable. Every event line passes decodeMidiEventEntry
-// (the same gate the localStorage decoder uses); junk lines are skipped.
-//
-// MAIN-THREAD createWritable IS DELIBERATE (no worker, no
-// createSyncAccessHandle): MIDI event rates are tiny next to audio — a
-// dense performance is hundreds of events/s, ~60 bytes each, rewritten as
-// a whole file at most every ~2 s (the debounce in use-desk-midi.ts). The
-// debounce + flush points (visibilitychange/pagehide/take-stop) bound the
-// loss window; audio-grade sync I/O would buy nothing here.
+// MidiStore seam: OpfsMidiStore (one JSONL file per take, no event cap)
+// with LocalStorageMidiStore as the fallback, plus one-shot migration.
+// Main-thread createWritable is deliberate: MIDI rates are tiny vs audio.
 
 import {
   decodeMidiDoc,
-  decodeMidiEventEntry,
   defaultMidiKV,
   type KVStore,
   loadMidi,
-  type MidiEvent,
   midiKey,
   removeMidi,
   saveMidi,
-  sortMidiEvents,
   type TakeMidi,
 } from "./midi";
+import { decodeMidiJsonl, encodeMidiJsonl } from "./midi-jsonl";
+
+export { decodeMidiJsonl, encodeMidiJsonl, MIDI_JSONL_VERSION } from "./midi-jsonl";
 
 export const OPFS_MIDI_DIR = "antiphon-midi";
 
-/**
- * Load-time sanity guard for the uncapped OPFS path: a well-formed capture
- * can't plausibly reach this (64 MiB ≈ a million events an hour at ~60
- * bytes/line — no take is that), so anything larger is corrupt or hostile
- * and reading it risks OOMing the tab. Refused with a console warning and
- * `oversize: true` so the UI can say so.
- */
+/** Load-time sanity guard for the uncapped OPFS path: no honest capture
+ * reaches 64 MiB (~a million events an hour), so anything larger is
+ * corrupt or hostile and reading it risks OOMing the tab. */
 export const MIDI_FILE_MAX_BYTES = 64 * 1024 * 1024;
 
 export interface MidiLoad {
@@ -73,60 +45,6 @@ export interface MidiStore {
   remove(sessionId: string, takeId: string): Promise<void>;
 }
 
-// ---- JSONL codec ---------------------------------------------------------------
-
-export const MIDI_JSONL_VERSION = 1;
-
-interface JsonlHeader {
-  antiphonMidiJsonl: number;
-  overflow: boolean;
-}
-
-export function encodeMidiJsonl(midi: TakeMidi): string {
-  const header: JsonlHeader = {
-    antiphonMidiJsonl: MIDI_JSONL_VERSION,
-    overflow: midi.overflow,
-  };
-  const lines = [JSON.stringify(header)];
-  for (const e of sortMidiEvents(midi.events)) lines.push(JSON.stringify(e));
-  return `${lines.join("\n")}\n`;
-}
-
-/** Decode a JSONL document. `null` = no usable header (wrong shape or an
- * unknown future version — don't guess at semantics we don't know). With a
- * good header: keep what parses, line by line. */
-export function decodeMidiJsonl(text: string): TakeMidi | null {
-  const lines = text.split("\n");
-  let header: JsonlHeader | null = null;
-  try {
-    const parsed: unknown = JSON.parse(lines[0] ?? "");
-    if (
-      typeof parsed === "object" &&
-      parsed !== null &&
-      (parsed as Record<string, unknown>).antiphonMidiJsonl === MIDI_JSONL_VERSION
-    ) {
-      header = {
-        antiphonMidiJsonl: MIDI_JSONL_VERSION,
-        overflow: (parsed as Record<string, unknown>).overflow === true,
-      };
-    }
-  } catch {
-    // fall through to null
-  }
-  if (!header) return null;
-  const events: MidiEvent[] = [];
-  for (const line of lines.slice(1)) {
-    if (line.trim() === "") continue;
-    try {
-      const e = decodeMidiEventEntry(JSON.parse(line));
-      if (e) events.push(e);
-    } catch {
-      // one bad line loses one event, not the take
-    }
-  }
-  return { events: sortMidiEvents(events), overflow: header.overflow };
-}
-
 // ---- OPFS implementation ---------------------------------------------------------
 
 export class OpfsMidiStore implements MidiStore {
@@ -149,12 +67,9 @@ export class OpfsMidiStore implements MidiStore {
       return null; // NotFound (no capture yet) and real faults look alike here — both mean "no stored document"
     }
     if (file.size === 0) {
-      // A committed document always has a header line (createWritable's
-      // swap-commit can't tear a file), so zero bytes is only ever the
-      // husk getFileHandle(create:true) materializes when the save fails
-      // after it (quota fails at write/close, not at handle creation —
-      // QA F1). Absent, not empty: migration must still consult the
-      // legacy localStorage document.
+      // A committed document always has a header line (swap-commit can't
+      // tear a file); zero bytes is only the husk a failed save leaves.
+      // Absent, not empty: migration must still consult localStorage.
       return null;
     }
     if (file.size > MIDI_FILE_MAX_BYTES) {
@@ -184,8 +99,7 @@ export class OpfsMidiStore implements MidiStore {
     const name = `${takeId}.jsonl`;
     // getFileHandle(create:true) materializes an EMPTY entry before a
     // single byte lands; everything after it can still fail (quota bites
-    // at write/close). Without cleanup that husk would read as an empty
-    // document forever and shadow the legacy localStorage copy (QA F1).
+    // at write/close) — see the husk cleanup below.
     const handle = await dir.getFileHandle(name, { create: true });
     try {
       // createWritable stages into a swap file until close() — a crash
@@ -201,8 +115,7 @@ export class OpfsMidiStore implements MidiStore {
     } catch (e) {
       // Best-effort husk removal — ONLY the zero-byte artifact. A failed
       // rewrite of a real document keeps its previous bytes (swap-file
-      // semantics), and deleting those would trade a save failure for
-      // data loss. load()'s size-0-is-absent guard backstops this path.
+      // semantics); deleting those would turn a save failure into data loss.
       try {
         if ((await handle.getFile()).size === 0) await dir.removeEntry(name);
       } catch {
@@ -222,7 +135,7 @@ export class OpfsMidiStore implements MidiStore {
   }
 }
 
-// ---- localStorage fallback (the W3-C behavior, unchanged) ---------------------------
+// ---- localStorage fallback -------------------------------------------------------
 
 export class LocalStorageMidiStore implements MidiStore {
   readonly kind = "local" as const;
@@ -275,13 +188,9 @@ export function defaultMidiStore(): Promise<MidiStore> {
   return defaultStorePromise;
 }
 
-/**
- * Load a take's MIDI through the store, migrating any legacy localStorage
+/** Load a take's MIDI through the store, migrating any legacy localStorage
  * document into OPFS on first touch: read → write OPFS → only then delete
- * the key (a failed write must not orphan the data). Corrupt legacy docs
- * keep what parses, warned once — "once" because the key is gone after
- * migration, so this path can't re-run for the take.
- */
+ * the key (a failed write must not orphan the data). */
 export async function loadTakeMidi(
   store: MidiStore,
   sessionId: string,

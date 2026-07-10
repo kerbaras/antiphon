@@ -1,10 +1,8 @@
-// FLAC download naming (F14 + wave-2 follow-up). The server's
-// Content-Disposition beats the desk's `a.download` in Chromium, so the
-// header must speak the same naming contract as every other export (W1-D):
-// `<fileSafe(nickname)>-<streamId8>`. Unlabeled peers fall back to the
-// device family the desk titles their lane with (`iPhone-3f2a1b8c.flac`);
-// only a stream with no peer attribution at all keeps the historical
-// full-uuid name.
+// FLAC download naming. The server's Content-Disposition beats the desk's
+// `a.download` in Chromium, so it must match the export naming contract:
+// `<fileSafe(nickname)>-<streamId8>`; unlabeled peers fall back to the
+// device family (`iPhone-3f2a1b8c.flac`); only a stream with no peer
+// attribution keeps the historical full-uuid name.
 
 /** Byte-for-byte mirror of the desk's fileSafe
  * (apps/web/src/routes/desk/track-model.ts): runs of anything that is not a
@@ -40,17 +38,9 @@ function rfc5987Encode(value: string): string {
   );
 }
 
-/** Content-Disposition for GET /api/streams/:streamId/flac.
- *
- * - Labeled peer: `attachment; filename="<fileSafe(label)>-<streamId8>.flac"`,
- *   matching the desk's exportFlacAll / stems naming. fileSafe output is only
- *   letters/numbers/hyphens, so the quoted-string needs no escaping.
- * - Non-ASCII label: RFC 6266/5987 — the true name travels in
- *   `filename*=UTF-8''…` and `filename` degrades to the ASCII-stripped form
- *   (or the bare short id when nothing printable survives).
- * - Unlabeled peer: `<deviceName(userAgent)>-<streamId8>.flac`, the desk's
- *   lane-title fallback (always ASCII, so it always takes the plain path).
- * - No peer row: the historical `<streamId>.flac` (full uuid). */
+/** Content-Disposition for GET /api/streams/:streamId/flac. fileSafe
+ * output needs no quoted-string escaping; non-ASCII names travel per RFC
+ * 6266/5987 in `filename*=UTF-8''…` with an ASCII-stripped `filename`. */
 export function flacContentDisposition(streamId: string, peer: StreamPeerIdentity | null): string {
   if (!peer) return `attachment; filename="${streamId}.flac"`;
   const nickname = peer.label?.trim();

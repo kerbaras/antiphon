@@ -1,10 +1,6 @@
-// F1 — cold-desk attribution rebuild. Live stream-announces exist only in
-// the memory of desks that were present when a take rolled; everything
-// they carry (stream→peer mapping, take chronology, peer identity) is
-// ALSO persisted server-side. This module turns the session-summary
-// payload (GET /api/sessions/:sessionId) into the lookups the desk uses to
-// rebuild lanes, take ordering/numbering, and its status-polling set after
-// a reload — or on a second desk that never saw the announces.
+// Cold-desk attribution rebuild: turns the session-summary payload
+// (GET /api/sessions/:sessionId) into the lookups a desk that never saw
+// the live stream-announces needs (lanes, take order, polling set).
 
 /** Wire shape of the attribution extension of GET /api/sessions/:id. */
 export interface SessionSummaryPayload {
@@ -22,7 +18,7 @@ export interface SessionSummaryPayload {
     userAgent: string;
     label: string | null;
     deviceId: string | null;
-    /** Account profile picture (A16); absent from pre-A16 servers. */
+    /** Account profile picture; absent from older servers. */
     avatarUrl?: string | null;
     joinedAt: string;
   }>;
@@ -34,9 +30,8 @@ export interface ArchivedPeer {
   userAgent: string;
   label: string | null;
   deviceId: string | null;
-  /** Account profile picture (A16). */
   avatarUrl: string | null;
-  /** Join time (epoch ms) — the F8 canonical lane-order key; null when the
+  /** Join time (epoch ms) — the canonical lane-order key; null when the
    * archive's timestamp doesn't parse. */
   joinedAtMs: number | null;
 }

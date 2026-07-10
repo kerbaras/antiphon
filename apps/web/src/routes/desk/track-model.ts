@@ -27,8 +27,7 @@ export interface TrackRow {
   name: string;
   color: string;
   peerInitials: string;
-  /** Account profile picture (A16): live roster first, archive fallback —
-   * covers the initials disc wherever the lane shows a face. */
+  /** Account profile picture: live roster first, archive fallback. */
   avatarUrl: string | null;
   peerLabel: string | null;
   streams: DeskStreamStatus[];
@@ -64,11 +63,9 @@ export function deviceName(userAgent: string): string {
   return m ? m[0] : "Browser";
 }
 
-/** Grapheme-aware first "letter" (QA #14): `word[0]` is a bare UTF-16 code
- * unit and cuts surrogate pairs in half — "🎤 Zoë" became "\uD83CZ",
- * rendered as U+FFFD in every avatar. Intl.Segmenter (all target browsers,
- * Node ≥ 16) yields whole graphemes incl. ZWJ sequences; the fallback
- * takes a whole code point, which still can never split a pair. */
+/** Grapheme-aware first "letter": `word[0]` is a bare UTF-16 code unit and
+ * cuts surrogate pairs in half. Intl.Segmenter yields whole graphemes incl.
+ * ZWJ sequences; the fallback takes a whole code point (never splits a pair). */
 const graphemeSegmenter: Intl.Segmenter | null =
   typeof Intl !== "undefined" && typeof Intl.Segmenter === "function"
     ? new Intl.Segmenter(undefined, { granularity: "grapheme" })
@@ -108,26 +105,19 @@ export function useTick(active: boolean, ms: number): void {
   }, [active, ms]);
 }
 
-// ---- F8 — stable lane order ---------------------------------------------------
-// Rows (and the mixer strips that mirror them) used to render in the sink
-// worker's status order — a Rust HashMap iteration that can shuffle between
-// polls, so a console lane could jump mid-session (QA-1 #19). The canonical
-// rule: a lane's position is assigned ONCE per desk session and FROZEN.
-// New lanes append after every existing lane, ordered among themselves by
-// the peer's joinedAt (live roster or F1 archive attribution — identical on
-// every desk, so a cold reload rebuilds the same order), unknown joins
-// keeping their observed order. The rank map lives in a ref for the page's
-// lifetime: nothing that happens later — renames, reconnects, status-order
-// churn, late attribution — may move a lane that is already on screen.
+// ---- stable lane order ----------------------------------------------------------
+// A lane's position is assigned ONCE per desk session and FROZEN: new lanes
+// append after existing ones, ordered by the peer's joinedAt (identical on
+// every desk), unknown joins keeping observed order. Nothing that happens
+// later (renames, reconnects, status churn, late attribution) moves a lane.
 
 export interface LaneCandidate {
   /** Lane key: peerId when attributed, else the streamId fallback. */
   key: string;
   /** Join time (epoch ms) when known — the canonical ordering key. */
   joinedAtMs: number | null;
-  /** Former keys this lane subsumes (streamId-keyed fallback lanes that
-   * late attribution re-keyed onto a peer): the lane inherits the earliest
-   * frozen rank instead of jumping to the end. */
+  /** Former keys this lane subsumes (streamId fallbacks re-keyed by late
+   * attribution): the lane inherits the earliest frozen rank. */
   aliases?: readonly string[];
 }
 
@@ -162,20 +152,14 @@ export function stableLaneOrder(ranks: Map<string, number>, candidates: LaneCand
     .sort((a, b) => (ranks.get(a) as number) - (ranks.get(b) as number));
 }
 
-// ---- W4-E — deliberate lane moves -----------------------------------------------
-// F8 froze the SPONTANEOUS reorder sources (status churn, late attribution,
-// reconnects); the context menu's Move up/down is the one sanctioned
-// mutation — an explicit operator action. Moves live in the shared doc
-// (collab-doc.ts 'laneOrder': laneKey → display ordinal, full-map writes,
-// LWW per key), so they persist across reloads and sync across desks like
-// the rest of the lane state. Ranks stay frozen underneath: colors and
-// default names key off the rank, so a moved lane keeps its identity.
+// ---- deliberate lane moves --------------------------------------------------------
+// Move up/down is the one sanctioned reorder; ordinals live in the shared
+// doc ('laneOrder'). Ranks stay frozen underneath: colors and default names
+// key off the rank, so a moved lane keeps its identity.
 
-/** Layer deliberate move ordinals over the frozen-rank order. Lanes the
- * ordinal source doesn't know (joined after the last move) follow F8's
- * append rule — after every moved lane, frozen order among themselves.
- * Ties (two desks moving concurrently can LWW-merge into equal ordinals)
- * fall back to the frozen order too, so every desk resolves them alike. */
+/** Layer deliberate move ordinals over the frozen-rank order. Unknown lanes
+ * append after every moved lane, frozen order among themselves; ordinal
+ * ties (concurrent LWW merges) fall back to frozen order alike on every desk. */
 export function applyLaneMoves(
   frozenOrder: readonly string[],
   ordinalOf: (key: string) => number | undefined,
@@ -192,17 +176,11 @@ export function applyLaneMoves(
     .map((entry) => entry.key);
 }
 
-// ---- F9 — orphaned mid-take-reload streams -------------------------------------
-// A6: a phone reloading mid-take arms a FRESH stream; the truncated
-// original never receives a stream-final, so completeness is
-// undecidable-by-design — finalSeq stays null at BOTH sinks forever and
-// the take never settles. Presentation used to read that as "syncing"
-// forever. The candidate test: the take is no longer rolling, yet neither
-// sink ever saw a final seq. Because a normally-stopped stream ALSO looks
-// like this for the second or two before its stream-final lands, the
-// verdict only turns terminal after the condition has held for
-// ORPHAN_HOLD_MS — the same debounce idea as useReceiving, pointed at the
-// opposite edge.
+// ---- orphaned mid-take-reload streams ---------------------------------------------
+// A phone reloading mid-take arms a FRESH stream; the truncated original
+// never gets a stream-final, so finalSeq stays null at both sinks forever.
+// A normally-stopped stream looks identical for a second or two, so the
+// verdict only turns terminal after the condition holds for ORPHAN_HOLD_MS.
 
 export const ORPHAN_HOLD_MS = 5_000;
 
@@ -251,11 +229,9 @@ export function useOrphanedStreams(
   return orphaned;
 }
 
-// ---- W4-C — click-to-seek take resolution ----------------------------------------
-// A plain click on bare timeline surface is a transport seek; when it lands
-// inside a take's recorded audio, the transport retargets onto that take
-// (see index.tsx seekTimeline). This is the pure "which take is under
-// arrangement-second `sec`?" half of that gesture.
+// ---- click-to-seek take resolution -------------------------------------------------
+// The pure "which take is under arrangement-second `sec`?" half of a
+// timeline-click seek (index.tsx seekTimeline retargets onto that take).
 
 export interface ClipSpan {
   takeId: string;
@@ -265,12 +241,9 @@ export interface ClipSpan {
   live: boolean;
 }
 
-/** The take whose clip audio lies under arrangement-second `sec`, matched
- * on x ONLY: the timeline is one time axis, so a click on bare lane below
- * (or above) a clip still means that clip's take-time. Overlaps from
- * dragged arrangements prefer `selectedTakeId` (a seek inside the loaded
- * take must never switch it), then the first clip in row order. The live
- * take is transport-owned while recording and never matches. */
+/** The take under arrangement-second `sec`, matched on x ONLY (a click on
+ * bare lane still means that clip's take-time). Overlaps prefer
+ * `selectedTakeId`, then row order; the live take never matches. */
 export function takeAtSec(
   clips: readonly ClipSpan[],
   sec: number,
@@ -286,13 +259,9 @@ export function takeAtSec(
 }
 
 // ---- song display names --------------------------------------------------------
-// QA low: default song names don't renumber — delete "Song 1" and the
-// panel reads "01 Song 2". Auto-assigned names (the `Song N` pattern from
-// addMarker) are a display DEFAULT, not user data, so they are renumbered
-// by timeline position at render time; anything a user typed (even
-// "Song 7 (reprise)") is untouched. Display-level by design: the stored
-// marker model (W2-B, shared-doc synced) never mutates under a viewer, and
-// two desks always derive the same display names from the same doc.
+// Auto-assigned `Song N` names are a display DEFAULT, renumbered by timeline
+// position at render time; user-typed names are untouched. Display-level by
+// design: the stored marker model never mutates under a viewer.
 
 const AUTO_SONG_NAME = /^Song \d+$/;
 

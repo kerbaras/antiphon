@@ -2,89 +2,25 @@
 // The server relays ICE between peers, answers offers addressed to its own
 // well-known sink peer id, and is the fallback control authority.
 
-import {
-  type DeviceInfo,
-  negotiateVersion,
-  type PeerInfo,
-  type PeerRole,
-  parseSignalingMessage,
-  SERVER_PEER_ID,
-  type SessionState,
-  type SignalingMessage,
-  type TakeInfo,
-} from "@antiphon/protocol";
+import { parseSignalingMessage, type SignalingMessage } from "@antiphon/protocol";
 import type { WSContext } from "hono/ws";
 import type { Archive } from "../archive/index.ts";
-import { SessionIngest } from "../ingest/index.ts";
 import { createLogger } from "../logger.ts";
 import { TokenBucket } from "../ratelimit.ts";
+import { dispatchMessage } from "./handlers.ts";
+import { type HelloHost, handleHello } from "./hello.ts";
+import {
+  type ConnState,
+  createRoom,
+  DEFAULT_LIMITS,
+  type DeskHelloAuth,
+  leave,
+  type Room,
+  type SignalingLimits,
+  send,
+} from "./room.ts";
 
-interface RoomPeer {
-  peerId: string;
-  role: PeerRole;
-  deviceInfo: DeviceInfo;
-  joinedAt: string;
-  /** Connection generation: leave() from a superseded socket must not
-   * evict the peer that adopted a newer one (A12 zombie replacement). */
-  epoch: number;
-  ws: WSContext;
-}
-
-/** Resumable identity (A12): what survives a peer's disconnect. */
-interface DeviceRecord {
-  peerId: string;
-  label: string | undefined;
-  avatarUrl: string | undefined;
-  joinedAt: string;
-}
-
-interface Room {
-  sessionId: string;
-  peers: Map<string, RoomPeer>;
-  /** `role:deviceId` → identity, for peerId resume across reconnects. */
-  devices: Map<string, DeviceRecord>;
-  ingest: SessionIngest;
-  activeTake: TakeInfo | null;
-}
-
-/** Per-connection state carried by the WS handler. */
-export interface ConnState {
-  sessionId: string;
-  pathRole: PeerRole;
-  peerId: string | null;
-  epoch: number;
-  /** Message flood guard (RFC §12), created lazily on first message. */
-  msgBucket?: TokenBucket;
-}
-
-/** Abuse/capacity limits enforced on the control plane (RFC §12). */
-export interface SignalingLimits {
-  msgRatePerSec: number;
-  msgBurst: number;
-  maxPeersPerSession: number;
-  maxActiveSessions: number;
-}
-
-/**
- * Desk hello gate (W8-A). The hello/welcome handshake is the auth seam for
- * the signaling socket: the browser cannot set WS headers, so the desk
- * carries its Clerk session token IN the hello (protocol amendment A15)
- * and the server judges it here — BEFORE the room is even created, so a
- * refused desk attaches zero session state (no room, no ingest, no peer).
- * Recorder hellos never pass through this gate: mic join is a public
- * bearer capability (RFC §12) in both auth modes. null = keyless mode.
- */
-export type DeskHelloAuth = (
-  sessionId: string,
-  authToken: string | undefined,
-) => Promise<{ ok: true } | { ok: false; message: string }>;
-
-const DEFAULT_LIMITS: SignalingLimits = {
-  msgRatePerSec: 100,
-  msgBurst: 200,
-  maxPeersPerSession: 32,
-  maxActiveSessions: 200,
-};
+export type { ConnState, DeskHelloAuth, SignalingLimits } from "./room.ts";
 
 export class Signaling {
   private readonly rooms = new Map<string, Promise<Room>>();
@@ -94,6 +30,7 @@ export class Signaling {
   private readonly limits: SignalingLimits;
   private readonly deskHelloAuth: DeskHelloAuth | null;
   private readonly log = createLogger({ module: "signaling" });
+  private readonly helloHost: HelloHost;
   private epochs = 0;
 
   constructor(
@@ -104,51 +41,22 @@ export class Signaling {
     this.archive = archive;
     this.limits = { ...DEFAULT_LIMITS, ...limits };
     this.deskHelloAuth = deskHelloAuth;
+    this.helloHost = {
+      archive: this.archive,
+      limits: this.limits,
+      log: this.log,
+      nextEpoch: () => ++this.epochs,
+      activeSessionCount: () => this.activeSessionCount(),
+    };
   }
 
   private async getRoom(sessionId: string): Promise<Room> {
     let pending = this.rooms.get(sessionId);
     if (!pending) {
-      pending = (async () => {
-        const room: Room = {
-          sessionId,
-          peers: new Map(),
-          devices: new Map(),
-          activeTake: null,
-          ingest: new SessionIngest(sessionId, this.archive, {
-            onLocalCandidate: (peerId, candidate, mid) => {
-              this.sendTo(room, peerId, {
-                v: 1,
-                type: "ice-candidate",
-                targetPeerId: peerId,
-                fromPeerId: SERVER_PEER_ID,
-                candidate: { candidate, sdpMid: mid },
-              });
-            },
-            onFatal: (peerId, code, message) => {
-              const msg: SignalingMessage = { v: 1, type: "error", code, message, fatal: true };
-              this.sendTo(room, peerId, msg);
-              for (const peer of room.peers.values()) {
-                if (peer.role === "desk") this.sendTo(room, peer.peerId, msg);
-              }
-            },
-          }),
-        };
-        await room.ingest.init();
-        // Rebuild the device→peer index so identity resume (A12) survives
-        // a server restart the same way archive state does.
-        for (const row of await this.archive.loadPeers(sessionId)) {
-          if (!row.deviceId) continue;
-          room.devices.set(`${row.role}:${row.deviceId}`, {
-            peerId: row.id,
-            label: row.label ?? undefined,
-            avatarUrl: row.avatarUrl ?? undefined,
-            joinedAt: row.joinedAt.toISOString(),
-          });
-        }
+      pending = createRoom(sessionId, this.archive).then((room) => {
         this.live.set(sessionId, room);
         return room;
-      })();
+      });
       this.rooms.set(sessionId, pending);
     }
     return await pending;
@@ -165,7 +73,7 @@ export class Signaling {
         sessionId: conn.sessionId,
         peerId: conn.peerId,
       });
-      this.send(ws, {
+      send(ws, {
         v: 1,
         type: "error",
         code: "rate-limited",
@@ -184,21 +92,20 @@ export class Signaling {
         peerId: conn.peerId,
         error,
       });
-      this.send(ws, { v: 1, type: "error", code: "malformed", message: "unparseable message" });
+      send(ws, { v: 1, type: "error", code: "malformed", message: "unparseable message" });
       return;
     }
     if (msg === null) return; // unknown type / future version: ignore (§5)
 
     if (msg.type === "hello") {
-      // W8-A auth seam: a desk hello is judged BEFORE the room exists —
-      // an unauthorized desk must attach zero session state (no room, no
-      // ingest init, no peer entry, no doc). Fatal by contract: the client
-      // halts its reconnect loop (F3) instead of hammering the gate.
+      // A desk hello is judged BEFORE the room exists: an unauthorized desk
+      // must attach zero session state (no room, no ingest, no peer).
+      // Fatal by contract — the client halts its reconnect loop.
       if (conn.pathRole === "desk" && this.deskHelloAuth) {
         const verdict = await this.deskHelloAuth(conn.sessionId, msg.authToken);
         if (!verdict.ok) {
           this.log.warn("desk hello refused: unauthorized", { sessionId: conn.sessionId });
-          this.send(ws, {
+          send(ws, {
             v: 1,
             type: "error",
             code: "unauthorized",
@@ -209,380 +116,25 @@ export class Signaling {
           return;
         }
       }
-      await this.handleHello(conn, ws, await this.getRoom(conn.sessionId), msg);
+      await handleHello(this.helloHost, conn, ws, await this.getRoom(conn.sessionId), msg);
       return;
     }
     if (!conn.peerId) {
       // Checked before getRoom on purpose: a socket that never said hello
       // (authorized or not) must not conjure a room into existence.
-      this.send(ws, { v: 1, type: "error", code: "no-hello", message: "hello first" });
+      send(ws, { v: 1, type: "error", code: "no-hello", message: "hello first" });
       return;
     }
     const room = await this.getRoom(conn.sessionId);
     const from = room.peers.get(conn.peerId);
     if (!from) return;
-
-    switch (msg.type) {
-      case "ice-offer": {
-        if (msg.targetPeerId === SERVER_PEER_ID) {
-          try {
-            const answer = await room.ingest.handleOffer(from.peerId, msg.sdp);
-            this.sendTo(room, from.peerId, {
-              v: 1,
-              type: "ice-answer",
-              targetPeerId: from.peerId,
-              fromPeerId: SERVER_PEER_ID,
-              sdp: answer.sdp,
-            });
-          } catch (e) {
-            this.log.warn("ingest offer failed", {
-              sessionId: room.sessionId,
-              peerId: from.peerId,
-              error: e,
-            });
-            this.send(ws, {
-              v: 1,
-              type: "error",
-              code: "ingest-offer-failed",
-              message: String(e),
-            });
-          }
-        } else {
-          this.relay(room, from.peerId, msg);
-        }
-        break;
-      }
-      case "ice-answer": {
-        if (msg.targetPeerId !== SERVER_PEER_ID) this.relay(room, from.peerId, msg);
-        break;
-      }
-      case "ice-candidate": {
-        if (msg.targetPeerId === SERVER_PEER_ID) {
-          if (msg.candidate) {
-            room.ingest.addRemoteCandidate(
-              from.peerId,
-              msg.candidate.candidate,
-              msg.candidate.sdpMid ?? "0",
-            );
-          }
-        } else {
-          this.relay(room, from.peerId, msg);
-        }
-        break;
-      }
-      case "take-start": {
-        if (from.role !== "desk") {
-          this.send(ws, { v: 1, type: "error", code: "not-desk", message: "desk only" });
-          return;
-        }
-        room.activeTake = {
-          takeId: msg.takeId,
-          startedAt: new Date().toISOString(),
-          stoppedAt: null,
-          ...(msg.disarmedPeerIds?.length ? { disarmedPeerIds: msg.disarmedPeerIds } : {}),
-        };
-        room.ingest.noteTake(msg.takeId, msg.wallClockHint);
-        await this.archive.touchSession(room.sessionId);
-        this.fanout(room, msg);
-        break;
-      }
-      case "take-stop": {
-        if (from.role !== "desk") {
-          this.send(ws, { v: 1, type: "error", code: "not-desk", message: "desk only" });
-          return;
-        }
-        if (room.activeTake?.takeId === msg.takeId) room.activeTake = null;
-        room.ingest.noteTakeStop(msg.takeId);
-        await this.archive.touchSession(room.sessionId);
-        this.fanout(room, msg);
-        break;
-      }
-      case "stream-announce": {
-        room.ingest.noteStream(msg.takeId, msg.streamId, from.peerId);
-        this.fanout(room, { ...msg, fromPeerId: from.peerId });
-        break;
-      }
-      case "stream-final": {
-        room.ingest.setFinalSeq(msg.takeId, msg.streamId, msg.finalSeq);
-        this.fanout(room, { ...msg, fromPeerId: from.peerId });
-        break;
-      }
-      case "streams-delete": {
-        // Deletion is a desk decision; the archive deletes durably FIRST,
-        // then every sink drops its copy on the streams-deleted confirm.
-        if (from.role !== "desk") {
-          this.send(ws, { v: 1, type: "error", code: "not-desk", message: "desk only" });
-          return;
-        }
-        // Never delete under a live take: inbound chunks would recreate
-        // receiver state mid-delete and resurrect half a stream.
-        if (msg.streams.some((s) => s.takeId === room.activeTake?.takeId)) {
-          this.send(ws, {
-            v: 1,
-            type: "error",
-            code: "take-active",
-            message: "cannot delete streams of the active take",
-          });
-          return;
-        }
-        try {
-          const deletedTakeIds = await room.ingest.deleteStreams(msg.streams);
-          this.fanout(room, {
-            v: 1,
-            type: "streams-deleted",
-            streams: msg.streams,
-            deletedTakeIds,
-          });
-        } catch (e) {
-          this.log.error("stream deletion failed", {
-            sessionId: room.sessionId,
-            peerId: from.peerId,
-            error: e,
-          });
-          this.send(ws, { v: 1, type: "error", code: "delete-failed", message: String(e) });
-        }
-        break;
-      }
-      case "calibration-chirp": {
-        if (from.role !== "desk") {
-          this.send(ws, { v: 1, type: "error", code: "not-desk", message: "desk only" });
-          return;
-        }
-        await this.archive.recordChirp(room.sessionId, msg.chirpId, msg.emitTsDeskUs, msg.spec);
-        this.fanout(room, msg);
-        break;
-      }
-      case "peer-update": {
-        // A13 authority: a recorder renames only itself; the desk (session
-        // authority) renames anyone.
-        if (from.role !== "desk" && msg.peerId !== from.peerId) {
-          this.send(ws, {
-            v: 1,
-            type: "error",
-            code: "not-authorized",
-            message: "only the desk may rename other peers",
-          });
-          return;
-        }
-        const label = msg.label.trim() || undefined; // empty clears
-        const target = room.peers.get(msg.peerId);
-        const device = [...room.devices.values()].find((d) => d.peerId === msg.peerId);
-        if (!target && !device) {
-          this.send(ws, { v: 1, type: "error", code: "unknown-peer", message: "no such peer" });
-          return;
-        }
-        if (target) {
-          const { label: _drop, ...rest } = target.deviceInfo;
-          target.deviceInfo = { ...rest, ...(label ? { label } : {}) };
-        }
-        if (device) device.label = label;
-        await this.archive.updatePeerLabel(msg.peerId, label ?? null);
-        this.fanout(room, { v: 1, type: "peer-update", peerId: msg.peerId, label: label ?? "" });
-        this.fanoutPeerStatus(room);
-        break;
-      }
-      case "bye": {
-        this.leave(conn, room);
-        break;
-      }
-      default:
-        break;
-    }
-  }
-
-  private async handleHello(
-    conn: ConnState,
-    ws: WSContext,
-    room: Room,
-    msg: Extract<SignalingMessage, { type: "hello" }>,
-  ): Promise<void> {
-    const version = negotiateVersion(msg.protocolVersions);
-    if (version === null) {
-      this.send(ws, {
-        v: 1,
-        type: "error",
-        code: "version-mismatch",
-        message: "no common protocol version",
-        fatal: true,
-      });
-      ws.close();
-      return;
-    }
-    if (msg.role !== conn.pathRole) {
-      this.send(ws, {
-        v: 1,
-        type: "error",
-        code: "role-mismatch",
-        message: `role ${msg.role} on a ${conn.pathRole} endpoint`,
-        fatal: true,
-      });
-      ws.close();
-      return;
-    }
-    // Caps (RFC §12), checked before any identity/room state changes. An A12
-    // deviceId resume that supersedes its own zombie socket does not raise
-    // occupancy, so it is exempt from the peer cap.
-    const resumedPeerId = msg.deviceInfo.deviceId
-      ? room.devices.get(`${msg.role}:${msg.deviceInfo.deviceId}`)?.peerId
-      : undefined;
-    const supersedesZombie = resumedPeerId !== undefined && room.peers.has(resumedPeerId);
-    const occupancy = room.peers.size - (supersedesZombie ? 1 : 0);
-    if (occupancy >= this.limits.maxPeersPerSession) {
-      this.log.warn("session peer cap reached; rejecting join", {
-        sessionId: room.sessionId,
-        cap: this.limits.maxPeersPerSession,
-      });
-      this.send(ws, {
-        v: 1,
-        type: "error",
-        code: "session-full",
-        message: `session peer cap (${this.limits.maxPeersPerSession}) reached`,
-        fatal: true,
-      });
-      ws.close();
-      return;
-    }
-    if (room.peers.size === 0 && this.activeSessionCount() >= this.limits.maxActiveSessions) {
-      this.log.warn("active session cap reached; rejecting join", {
-        sessionId: room.sessionId,
-        cap: this.limits.maxActiveSessions,
-      });
-      this.send(ws, {
-        v: 1,
-        type: "error",
-        code: "server-full",
-        message: `active session cap (${this.limits.maxActiveSessions}) reached`,
-        fatal: true,
-      });
-      ws.close();
-      return;
-    }
-    await this.archive.ensureSession(conn.sessionId);
-    // Identity resume (A12): the same device rejoining with the same role
-    // gets its previous peerId back — the desk keeps the lane, the mixer
-    // mapping, and the name. No deviceId = anonymous fresh peer, as before.
-    const deviceId = msg.deviceInfo.deviceId ?? null;
-    const known = deviceId ? room.devices.get(`${msg.role}:${deviceId}`) : undefined;
-    const peerId = known?.peerId ?? crypto.randomUUID();
-    // Zombie replacement: the previous socket for this identity is still
-    // open (the network lost it before we did) — error it out, newest wins.
-    const zombie = room.peers.get(peerId);
-    if (zombie) {
-      this.send(zombie.ws, {
-        v: 1,
-        type: "error",
-        code: "superseded",
-        message: "device reconnected on a new connection",
-        fatal: true,
-      });
-      try {
-        zombie.ws.close();
-      } catch {
-        // already gone
-      }
-      room.peers.delete(peerId);
-    }
-    // A non-empty hello label wins (the device speaks for itself); a silent
-    // reconnect keeps the stored nickname (possibly desk-given). The A16
-    // avatar follows the same rule — a signed-out reconnect keeps the face
-    // it introduced itself with, exactly like the nickname.
-    const label = msg.deviceInfo.label?.trim() || known?.label;
-    const avatarUrl = msg.deviceInfo.avatarUrl?.trim() || known?.avatarUrl;
-    const joinedAt = known?.joinedAt ?? new Date().toISOString();
-    const epoch = ++this.epochs;
-    conn.peerId = peerId;
-    conn.epoch = epoch;
-    const deviceInfo: DeviceInfo = {
-      userAgent: msg.deviceInfo.userAgent,
-      ...(label ? { label } : {}),
-      ...(deviceId ? { deviceId } : {}),
-      ...(avatarUrl ? { avatarUrl } : {}),
-    };
-    room.peers.set(peerId, { peerId, role: msg.role, deviceInfo, joinedAt, epoch, ws });
-    if (deviceId) {
-      room.devices.set(`${msg.role}:${deviceId}`, { peerId, label, avatarUrl, joinedAt });
-    }
-    await this.archive.upsertPeer({
-      peerId,
-      sessionId: conn.sessionId,
-      role: msg.role,
-      userAgent: msg.deviceInfo.userAgent,
-      label: label ?? null,
-      deviceId,
-      avatarUrl: avatarUrl ?? null,
-      joinedAt: new Date(joinedAt),
-    });
-    await this.archive.touchSession(room.sessionId);
-    this.log.info("peer joined", { sessionId: room.sessionId, peerId, role: msg.role });
-    this.send(ws, {
-      v: 1,
-      type: "welcome",
-      peerId,
-      protocolVersion: version,
-      session: this.sessionState(room),
-    });
-    this.fanoutPeerStatus(room);
+    await dispatchMessage({ archive: this.archive, log: this.log }, room, conn, ws, from, msg);
   }
 
   handleClose(conn: ConnState): void {
     const pending = this.rooms.get(conn.sessionId);
     if (!pending) return;
-    void pending.then((room) => this.leave(conn, room));
-  }
-
-  private leave(conn: ConnState, room: Room): void {
-    if (!conn.peerId) return;
-    // A superseded socket (A12) must not evict its successor: only the
-    // connection generation that owns the peer entry removes it.
-    const peer = room.peers.get(conn.peerId);
-    if (peer && peer.epoch === conn.epoch) {
-      room.peers.delete(conn.peerId);
-      room.ingest.closePeer(conn.peerId);
-      this.fanoutPeerStatus(room);
-    }
-    conn.peerId = null;
-  }
-
-  private sessionState(room: Room): SessionState {
-    const peers: PeerInfo[] = [...room.peers.values()].map((p) => ({
-      peerId: p.peerId,
-      role: p.role,
-      deviceInfo: p.deviceInfo,
-      joinedAt: p.joinedAt,
-    }));
-    return { sessionId: room.sessionId, peers, activeTake: room.activeTake };
-  }
-
-  private relay(
-    room: Room,
-    fromPeerId: string,
-    msg: Extract<SignalingMessage, { type: "ice-offer" | "ice-answer" | "ice-candidate" }>,
-  ): void {
-    this.sendTo(room, msg.targetPeerId, { ...msg, fromPeerId });
-  }
-
-  private fanout(room: Room, msg: SignalingMessage): void {
-    for (const peer of room.peers.values()) {
-      this.send(peer.ws, msg);
-    }
-  }
-
-  private fanoutPeerStatus(room: Room): void {
-    this.fanout(room, { v: 1, type: "peer-status", session: this.sessionState(room) });
-  }
-
-  private sendTo(room: Room, peerId: string, msg: SignalingMessage): void {
-    const peer = room.peers.get(peerId);
-    if (peer) this.send(peer.ws, msg);
-  }
-
-  private send(ws: WSContext, msg: SignalingMessage): void {
-    try {
-      ws.send(JSON.stringify(msg));
-    } catch (error) {
-      // Peer went away mid-send; close handling reconciles.
-      this.log.debug("ws send failed; peer gone", { msgType: msg.type, error });
-    }
+    void pending.then((room) => leave(conn, room));
   }
 
   // ---- retention hooks (RFC §12: expiry + hard deletion) -----------------
@@ -608,7 +160,7 @@ export class Signaling {
     const room = await pending.catch(() => null);
     if (!room) return;
     for (const peer of room.peers.values()) {
-      this.send(peer.ws, {
+      send(peer.ws, {
         v: 1,
         type: "error",
         code: "session-deleted",

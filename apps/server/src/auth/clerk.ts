@@ -1,5 +1,5 @@
-// Clerk identity plumbing (W8-A). Exactly two operations leave this file,
-// both engineered to keep Clerk OFF the hot paths:
+// Clerk identity plumbing. Exactly two operations leave this file, both
+// engineered to keep Clerk OFF the hot paths:
 //
 // - verifyToken: NETWORKLESS session-token verification. @clerk/backend
 //   verifies the JWT locally against the instance JWKS, which it fetches

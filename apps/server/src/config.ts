@@ -32,12 +32,10 @@ export interface ServerConfig {
      * Postgres first) after this idle grace. */
     idleEvictMs: number;
   };
-  /** W8-A auth-optional mode (PM decision): Clerk auth is enforced on the
-   * desk surface iff CLERK_SECRET_KEY is set (empty string = unset, so the
-   * e2e harness can pin keyless deterministically over an ambient .env).
-   * null = keyless — today's single-user behavior byte-for-byte. The
-   * mic-join surface is public-by-link in BOTH modes (RFC §12).
-   * Production MUST set the keys (docs/deploy.md). */
+  /** Clerk auth is enforced on the desk surface iff CLERK_SECRET_KEY is
+   * set (empty string = unset, so the e2e harness can pin keyless over an
+   * ambient .env). null = keyless, all surfaces open; mic join is
+   * public-by-link in BOTH modes (RFC §12). Production MUST set the keys. */
   auth: {
     clerkSecretKey: string;
     /** Served to the SPA via GET /api/auth/config so a single web build

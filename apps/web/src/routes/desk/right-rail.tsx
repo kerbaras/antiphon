@@ -36,7 +36,6 @@ export function RailTabs({
               {songCount}
             </span>
           )}
-          {/* Open-count badge: amber while notes await resolution. */}
           {t === "comments" && openCommentCount > 0 && (
             <span className="ml-1.5 rounded-lg bg-edge px-1.5 py-px font-mono text-[9px] text-pin">
               {openCommentCount}

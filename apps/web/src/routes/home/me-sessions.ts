@@ -1,7 +1,6 @@
-// W8-A landing lists: GET /api/me/sessions → "Your sessions" + "Shared
-// with me". Hostile-data boundary for the landing (same stance as
-// readRegions): a malformed payload reads as empty lists, never a crash —
-// the landing must render even against a confused server.
+// Landing lists: GET /api/me/sessions → "Your sessions" + "Shared with me".
+// Hostile-data boundary: a malformed payload reads as empty lists, never a
+// crash — the landing must render even against a confused server.
 
 import { authFetch } from "../../net/auth-token";
 

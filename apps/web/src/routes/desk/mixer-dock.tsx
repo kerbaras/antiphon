@@ -26,14 +26,10 @@ export function MixerDock({
   /** Recording-time master bus estimate (sum of live track peaks). */
   liveMasterLevel: number;
   levelFor: (row: TrackRow) => number;
-  /** Lanes another desk is touching right now (W3-A presence), by
-   * channel key — the strip gets a faint ring in that desk's color. */
+  /** Lanes another desk is touching right now, by channel key. */
   remoteEditing: Map<string, { name: string; color: string }>;
-  /** Selected lane (W4-E): desk-local UI state shared with the sidebar —
-   * highlighted here, target of the S/M keyboard shortcuts. */
   selectedLaneKey: string | null;
   onSelectLane: (key: string) => void;
-  /** Right-click a strip: the lane context menu at the cursor (W4-E). */
   onLaneMenu: (key: string, x: number, y: number) => void;
 }) {
   return (
@@ -74,12 +70,11 @@ export function MixerDock({
   );
 }
 
-/** Mixer strip bound to a track row (performer lane). Gain/mute/solo edit
- * the lane's persistent channel strip — independent of which take is
- * selected, loaded, or whether anything is loaded at all. Meters show the
- * phone's LIVE capture level while recording (METER telemetry) and the
- * playback analyser otherwise. Renames (W4-E) ride the SAME peer-update
- * path as the sidebar title — server-persisted, fanned out, echoed back. */
+/** Strip bound to a performer lane. Gain/mute/solo edit the lane's
+ * persistent channel strip — independent of which take is loaded. Meters
+ * show the phone's live capture level while recording, the playback
+ * analyser otherwise. Renames ride the same peer-update path as the
+ * sidebar title. */
 function RowMixerStrip({
   sessionId,
   row,

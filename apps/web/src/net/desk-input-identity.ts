@@ -1,9 +1,6 @@
-// Identity + preferences for the desk's embedded recorder (W2-D). The desk
-// input joins the session as an ordinary recorder peer, so it needs its own
-// stable deviceId (A12) — derived deterministically from the desk's browser
-// deviceId rather than stored separately, so the pair can never diverge.
-// Input preferences (which device, lane nickname) persist alongside it for
-// one-click resume after a reload.
+// Identity + preferences for the desk's embedded recorder. The desk input
+// joins as an ordinary recorder peer, so it needs its own stable deviceId —
+// derived from the desk's browser deviceId so the pair can never diverge.
 
 export const DESK_INPUT_PREFS_KEY = "antiphon:desk-input";
 
@@ -20,12 +17,9 @@ function defaultStore(): KVStore | null {
 /** Fixed 16-byte pad ("antiphon-input.1") XORed into the desk deviceId. */
 const DERIVE_PAD = new TextEncoder().encode("antiphon-input.1");
 
-/**
- * The embedded recorder's deviceId (A12): the desk's browser deviceId XORed
- * with a fixed pad, re-stamped as UUIDv4. Deterministic (the same desk always
- * resumes the same input lane), a valid UUID (the protocol schema requires
- * one), and guaranteed distinct from the desk's own id (byte 0 always flips).
- */
+/** The embedded recorder's deviceId: the desk's browser deviceId XORed with
+ * a fixed pad, re-stamped as UUIDv4. Deterministic (the same desk resumes
+ * the same input lane) and distinct from the desk's id (byte 0 always flips). */
 export function deriveDeskInputDeviceId(deskDeviceId: string): string {
   const hex = deskDeviceId.replaceAll("-", "").toLowerCase();
   if (hex.length !== 32 || /[^0-9a-f]/.test(hex)) {

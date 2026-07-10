@@ -1,4 +1,4 @@
-// QA low — the drift readout tooltip decodes "±ppm · c confidence · off".
+// The drift readout tooltip decodes "±ppm · c confidence · off".
 
 import { describe, expect, it } from "vitest";
 import type { DriftResult } from "./player";

@@ -11,11 +11,8 @@ let controller: CaptureController | null = null;
 let latest: CaptureSnapshot | null = null;
 let session: RecorderSession | null = null;
 let sessionState: RecorderSessionState | null = null;
-/** React subscribers to the session store. Registered unconditionally (even
- * while `session` is null) so a session created AFTER a component mounted
- * still notifies it — the F10 bug was a memoized no-op unsubscribe that
- * never re-subscribed once joinSession created the session, leaving
- * dropout/outage UI frozen. */
+/** React subscribers to the session store. Module-level (not on the session
+ * object) so a session created AFTER a component mounted still notifies it. */
 const sessionListeners = new Set<() => void>();
 
 function notifySessionListeners(): void {
@@ -23,7 +20,7 @@ function notifySessionListeners(): void {
 }
 /** Last stream-final reported, keyed `takeId:streamId:finalSeq` — a bare
  * seq number would swallow the final of an equal-length follow-up take.
- * A2: stream-final is idempotent (max wins), so err on re-sending. */
+ * Stream-final is idempotent (max wins), so err on re-sending. */
 let lastReportedFinal: string | null = null;
 
 export function getCaptureController(): CaptureController {
@@ -52,10 +49,10 @@ export function getCaptureController(): CaptureController {
   return controller;
 }
 
-/** Start the pipeline on the persisted mic (W4-F), falling back to the
- * default input when the saved device is gone — deviceIds rotate on iOS
- * Safari, and a stale preference must never cost a take. Must run inside
- * the user gesture (iOS). */
+/** Start the pipeline on the persisted mic, falling back to the default
+ * input when the saved device is gone — deviceIds rotate on iOS Safari, and
+ * a stale preference must never cost a take. Must run inside the user
+ * gesture (iOS). */
 export async function startCapture(): Promise<void> {
   const ctl = getCaptureController();
   const pref = loadMicPreference();
@@ -86,15 +83,15 @@ export function joinSession(sessionId: string): RecorderSession {
   return session;
 }
 
-/** Deliberate re-join after a fatal supersede (F3): the caller restarts the
+/** Deliberate re-join after a fatal supersede: the caller restarts the
  * capture pipeline (user gesture), then this reopens signaling — which
- * supersedes the tab that superseded us. Honest, explicit semantics. */
+ * supersedes the tab that superseded us. */
 export function takeOverSession(): void {
   session?.takeOver();
 }
 
 /** Set the performer nickname: persisted locally always; announced to the
- * room (peer-update, A13) when a session is live. */
+ * room when a session is live. */
 export function renameSelf(label: string): void {
   if (session) session.rename(label);
   else setNickname(label);
@@ -123,8 +120,7 @@ export function useCaptureSnapshot(): CaptureSnapshot {
 export function useRecorderSessionState(): RecorderSessionState | null {
   // Subscribe to the module-level listener set, NOT to the session object:
   // the set outlives (and predates) the session, so a session created after
-  // mount — joinSession runs from the "enable microphone" click — reaches
-  // every already-mounted component (F10).
+  // mount still reaches every already-mounted component.
   const subscribe = useCallback((onChange: () => void) => {
     sessionListeners.add(onChange);
     return () => sessionListeners.delete(onChange);

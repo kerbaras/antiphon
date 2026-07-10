@@ -54,9 +54,9 @@ export class CaptureRingReader {
 
   /**
    * Zero the worklet's overflow counter (called on arm: each take starts
-   * with a clean fault ledger, F4). The worklet only `Atomics.add`s this
-   * slot while the ring is FULL — which the idle drain prevents — so a
-   * plain store cannot race away a meaningful count.
+   * with a clean fault ledger). The worklet only `Atomics.add`s this slot
+   * while the ring is FULL — which the idle drain prevents — so a plain
+   * store cannot race away a meaningful count.
    */
   resetDropped(): void {
     Atomics.store(this.header, DROPPED, 0);
@@ -88,9 +88,9 @@ export class CaptureRingReader {
 }
 
 /**
- * VU ballistics shared by the armed and idle drain paths (F4: the meter is
- * live whenever the mic is, not only while a take rolls): fast attack to
- * the slab's absolute peak, exponential release at 0.6/pump.
+ * VU ballistics shared by the armed and idle drain paths (the meter is live
+ * whenever the mic is, not only while a take rolls): fast attack to the
+ * slab's absolute peak, exponential release at 0.6/pump.
  */
 export function decayedPeak(previous: number, slab: Float32Array): number {
   let slabPeak = 0;

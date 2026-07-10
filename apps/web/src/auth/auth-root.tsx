@@ -1,8 +1,6 @@
-// W8-A app-root auth mount. Keyless mode renders children with NOTHING
-// added — no provider, no context churn, no Clerk bytes on the wire (the
-// Clerk shell is a lazy chunk only fetched in clerk mode). Auth mode wraps
-// the app in ClerkProvider at the root, per the React SPA pattern
-// (.agents/skills/clerk-react-patterns).
+// App-root auth mount. Keyless mode renders children with nothing added —
+// no provider, no Clerk bytes on the wire (the Clerk shell is a lazy chunk
+// only fetched in clerk mode). Auth mode wraps the app in ClerkProvider.
 
 import {
   createContext,

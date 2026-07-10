@@ -1,10 +1,6 @@
-// Dependency-free XML writer (W3-B): a tiny element tree + serializer for
-// the Ableton .als export. Deliberately a builder rather than string
-// concatenation at call sites — every attribute value passes through ONE
-// escaping function, so a lane named `Alto & "Friends" <3` can never
-// corrupt the document. Output cosmetics follow what Live itself emits
-// (tab indentation, `<Tag Value="x" />` self-closing with a space) so a
-// generated set diffs cleanly against a real one when debugging.
+// Dependency-free XML writer for the .als export. A builder, not string
+// concatenation: every attribute value passes through ONE escaping
+// function. Output cosmetics match what Live emits (tabs, `<Tag ... />`).
 
 export interface XmlElement {
   tag: string;

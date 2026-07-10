@@ -1,34 +1,6 @@
-// MIDI capture (W3-C) — pure model + interim persistence.
-//
-// The desk (and only the desk — the wire protocol is audio-only, MIDI stays
-// desk-local in v1) timestamps Web MIDI channel messages against the rolling
-// take. Events live on the take's room timeline — the exact domain of
-// player.position()/seek(): 0 = take head — so lane drawing and seeks need
-// no conversion beyond the arrangement offset, like markers.
-//
-// TIMESTAMP MAPPING & PRECISION (the honest version):
-// MIDIMessageEvent.timeStamp is a DOMHighResTimeStamp on the SAME clock as
-// performance.now() (Web MIDI spec), so `atSec = (timeStamp − anchor)/1000`
-// with `anchor = performance.now()` sampled when the desk observes
-// take-start. Event-to-event timing is therefore as good as the platform
-// MIDI stack (~1 ms USB-MIDI jitter; the clock itself resolves to ≤5 µs
-// under the cross-origin isolation this app already requires). The ANCHOR,
-// however, is the desk's receipt of its own take-start echo — one WS round
-// trip after the authoritative start, and recorders arm on their own
-// schedule with audio re-aligned later by chirp correlation while MIDI is
-// not. Net: intra-take MIDI timing ≈ 1 ms; MIDI-to-audio placement is good
-// to a few tens of ms worst case. Right for keeping the performance data;
-// not sample-accurate audio alignment. A future chirp-style anchor could
-// close the gap.
-//
-// PERSISTENCE BOUNDARY (deliberately NOT the W3-A shared doc): markers and
-// comments moved into the Yjs project doc; MIDI event lists must not. They
-// are big (up to ~3.2 MB of JSON per take at the cap, see below) and
-// append-only — every CRDT update would replicate and persist the whole
-// history to every desk forever. The right home is the OPFS/blob path next
-// to the audio (parked follow-up); until then: localStorage per take, the
-// markers.ts pattern (schema-versioned, tolerant load, injectable store),
-// plus a hard event cap.
+// MIDI capture — pure model + persistence codecs. Deliberately NOT in the
+// shared Yjs doc: event lists are big and append-only — every CRDT update
+// would replicate the whole history to every desk forever.
 
 export interface MidiEvent {
   /** Seconds on the take's room timeline (player.position() domain). */
@@ -50,23 +22,15 @@ export function midiDataBytes(status: number): 1 | 2 {
   return (status & 0xf0) === 0xc0 ? 1 : 2;
 }
 
-/**
- * Per-take event cap FOR THE LOCALSTORAGE PATH. Measured: one serialized
- * event is ~55–65 bytes of JSON ("{"atSec":123.456789,…}"), so 50k events
- * ≈ 3.2 MB — inside the usual 5 MB/origin localStorage budget with headroom
- * for markers/comments/prefs, but too close to gamble higher. On overflow
- * the EARLIEST events are kept (the take's head is the performance; a
- * tail-biased buffer would silently rewrite history) and the UI warns.
- * The OPFS store (midi-store.ts, W5-D) has no cap — captures there pass
- * Infinity to appendMidiEvent.
- */
+/** Per-take event cap FOR THE LOCALSTORAGE PATH (~3.2 MB of JSON — inside
+ * the usual 5 MB/origin budget). On overflow the EARLIEST events are kept
+ * (a tail-biased buffer would silently rewrite the performance's head).
+ * The OPFS store has no cap — captures there pass Infinity. */
 export const MIDI_EVENT_CAP = 50_000;
 
-/**
- * Validate + normalize one Web MIDI message. Returns null for anything
- * outside the captured kinds (sysex, realtime, aftertouch…) or malformed
- * lengths/values — a hostile or glitchy device must not corrupt the take.
- */
+/** Validate + normalize one Web MIDI message. Null for anything outside
+ * the captured kinds or with malformed lengths/values — a hostile or
+ * glitchy device must not corrupt the take. */
 export function normalizeMidiMessage(
   data: Uint8Array | readonly number[] | null,
 ): Pick<MidiEvent, "status" | "data1" | "data2"> | null {
@@ -81,15 +45,15 @@ export function normalizeMidiMessage(
   return { status, data1, data2 };
 }
 
-/** MIDIMessageEvent.timeStamp → take-relative seconds. Events the stack
- * delivers from just before the desk's anchor clamp to the take head. */
+/** MIDIMessageEvent.timeStamp → take-relative seconds. timeStamp shares
+ * performance.now()'s clock (Web MIDI spec); the anchor is sampled at the
+ * desk's take-start observation. Pre-anchor events clamp to the head. */
 export function takeRelativeSeconds(timeStampMs: number, anchorMs: number): number {
   return Math.max(0, (timeStampMs - anchorMs) / 1_000);
 }
 
 /** Append in place (event lists are big — no copying per event) honoring
- * the cap (Infinity on the OPFS path — no cap there). Returns false when
- * the event was dropped (cap reached). */
+ * the cap. Returns false when the event was dropped (cap reached). */
 export function appendMidiEvent(
   events: MidiEvent[],
   event: MidiEvent,
@@ -266,7 +230,7 @@ export function removeMidi(
   }
 }
 
-// ---- input preferences (A12 continuity, the desk-input-identity pattern) -------
+// ---- input preferences (one-click resume after a reload) -----------------------
 
 export const MIDI_PREFS_KEY = "antiphon:midi-input";
 

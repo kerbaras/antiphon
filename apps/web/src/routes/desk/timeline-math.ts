@@ -1,8 +1,6 @@
 // Pure room-timeline math shared by live playback (player.ts) and the
-// offline render (render.ts). Playback-parity for exports is guaranteed by
-// construction: both paths plan their AudioBufferSourceNodes through the
-// SAME functions, so any change to the alignment/drift scheduling model
-// lands in exactly one place.
+// offline render (render.ts): both plan their AudioBufferSourceNodes
+// through the SAME functions, so export parity holds by construction.
 
 /** Per-track schedule parameters. All values are seconds; `headSec`,
  * `bufferDurationSec` and the planned offset live in the track's own
@@ -50,23 +48,10 @@ export function trackEndSec(t: TrackTiming): number {
   return t.clipDelaySec + (t.bufferDurationSec - t.headSec) / t.ratio;
 }
 
-// ---- clip regions (W7-B) -----------------------------------------------------------
-// A split stream plays as a list of REGIONS: windows of its source buffer,
-// each placed on the arrangement. The mapping rule is the whole-stream one
-// TRANSLATED per region — buffer time b plays at room time
-//   t = (startSec − sourceOffsetSec) + (b − headSec)/ratio
-// so a fresh split (regions abutting in both domains, startSec −
-// sourceOffsetSec identical on both pieces) reproduces the uncut stream's
-// mapping EXACTLY: playback across the fresh boundary is seamless by
-// construction, and alignment head-trims / drift ratios keep their one
-// meaning (they are properties of the capture, not of a piece). A dragged
-// region just translates its own copy of that mapping.
-//
-// Shared by live playback (player.schedule) and the offline render
-// (render.startSource) exactly like planSource — the parity contract.
-// UNSPLIT streams do not come through here at all: they keep the verbatim
-// planSource path, so a zero-split session schedules byte-identically to
-// the pre-region engine.
+// ---- clip regions ------------------------------------------------------------------
+// Buffer time b plays at t = (startSec − sourceOffsetSec) + (b − headSec)/ratio:
+// the whole-stream rule translated per region, so abutting fresh-split pieces
+// reproduce the uncut mapping exactly. Unsplit streams keep planSource verbatim.
 
 /** One region as the schedule math consumes it (the doc's ClipRegion minus
  * identity — net/collab-doc.ts owns the wire shape). */
@@ -149,10 +134,9 @@ export function regionsEndSec(t: RegionStreamTiming, regions: readonly RegionSpa
   return end;
 }
 
-/** How a track's alignment lag was measured (W4-B): `chirp` = the §10
- * calibration sweep located in the stream; `content` = cross-correlation
- * of the recorded content itself against a reference stream, expressed in
- * the same virtual lag domain (reference lag + signed pre-roll offset). */
+/** How a track's alignment lag was measured: `chirp` = calibration sweep
+ * located in the stream; `content` = cross-correlation against a reference
+ * stream, expressed in the same virtual lag domain (reference lag + offset). */
 export type AlignMethod = "chirp" | "content";
 
 export interface AlignLag {
@@ -170,15 +154,10 @@ export function wrapLag(raw: number, intervalSamples: number): number {
   return raw - Math.round(raw / intervalSamples) * intervalSamples;
 }
 
-/** Samples to trim from each track's head so all aligned tracks share the
- * room clock. Chirp lags may lock onto different repeats of the sweep
- * (the §10 schedule emits it twice), so their deltas are normalized
- * modulo the repeat interval — safe while true inter-device offsets stay
- * under half the interval (1 s — arming spread is hundreds of ms at
- * worst). Content lags carry no repeat ambiguity (there is exactly one
- * performance) and pass through unwrapped, so offsets beyond the chirp
- * interval stay honest. Fewer than two lags yields no deltas: there is
- * nothing to align against. */
+/** Samples to trim from each track's head so aligned tracks share the room
+ * clock. Chirp lags may lock onto different sweep repeats, so their deltas
+ * normalize modulo the repeat interval; content lags have no repeat
+ * ambiguity and pass through unwrapped. Fewer than two lags: no deltas. */
 export function normalizeAlignDeltas(
   lags: AlignLag[],
   repeatIntervalSec: number,
@@ -202,21 +181,16 @@ export function normalizeAlignDeltas(
   return out;
 }
 
-/** Visual composition of the applied head-trims (W6-C). Alignment is
- * schedule-time only — stored audio and arrangement positions never move —
- * but the desk must SHOW it: each clip box shifts right by how much later
- * its stream started capturing, so aligned waveforms line up on screen.
- * `shiftSec` is that per-stream box shift (0 for the earliest starter, the
- * one with the maximal head-trim); `anchorSec` is where room-time zero
- * lands relative to the take's arrangement base — the playhead (and every
- * other room-timeline drawing) moves right with it, and it doubles as the
- * shift for streams WITHOUT an applied lag (their audio starts exactly at
- * room zero, unaligned). Both derive from the SAME normalized deltas the
- * schedule trims with, so what is drawn is what plays by construction. */
+/** Visual composition of the applied head-trims. Alignment is schedule-time
+ * only (stored audio and arrangement positions never move); these shifts are
+ * pure DRAWING transforms derived from the same deltas the schedule trims
+ * with, so what is drawn is what plays. */
 export interface AlignShifts {
   /** streamId → seconds the clip box sits right of its arrangement position. */
   shiftSec: Map<string, number>;
-  /** Arrangement offset of room-time zero (max head-trim, seconds ≥ 0). */
+  /** Arrangement offset of room-time zero (max head-trim, seconds ≥ 0) —
+   * the playhead's drawing shift, doubling as the shift for streams
+   * without an applied lag. */
   anchorSec: number;
 }
 
@@ -235,12 +209,9 @@ export function alignShifts(lags: AlignLag[], repeatIntervalSec: number): AlignS
   return { shiftSec, anchorSec };
 }
 
-// ---- W7-A — every take draws aligned (fold-in of the parked W6 follow-up) --------
-// The loaded take composes its shifts from LIVE player state; every other
-// take composes them from its PERSISTED verdict (alignment-persist.ts).
-// These are the pure conversions: stored entries → the same AlignShifts
-// the live path produces, and "which take's anchor is the playhead
-// inside?" for the per-take playhead mapping.
+// ---- every take draws aligned -----------------------------------------------------
+// The loaded take composes shifts from LIVE player state; every other take
+// from its PERSISTED verdict — stored entries yield the same AlignShifts.
 
 /** One stream's persisted verdict as the drawing layer consumes it — the
  * alignment-persist entry shape, structurally (no import cycle with
@@ -249,13 +220,9 @@ export interface PersistedAlignmentLag {
   alignment: { lagSamples: number; applied: boolean; method?: AlignMethod };
 }
 
-/** AlignShifts of a take that is NOT loaded, from its persisted verdict:
- * the exact alignShifts composition the loaded take gets from live track
- * state, fed by stored lags at `sampleRate` (the capture rate every other
- * drawn duration on the timeline already uses). Unapplied/absent entries
- * contribute nothing — their clips fall to the anchor at draw time,
- * exactly like live unmeasured streams. A declined take yields the empty
- * shifts (anchor 0): it draws unshifted, honestly. */
+/** AlignShifts of a take that is NOT loaded, from its persisted verdict —
+ * the exact alignShifts composition the live path produces. Unapplied/absent
+ * entries contribute nothing; a declined take draws unshifted (anchor 0). */
 export function persistedAlignShifts(
   entries: Readonly<Record<string, PersistedAlignmentLag>>,
   sampleRate: number,
@@ -281,13 +248,9 @@ export interface TakeAnchorSpan {
 }
 
 /** The drawing anchor in force at an arrangement position: the containing
- * take's anchor, 0 in the gaps and beyond the session. The playhead rides
- * the drawn (shifted) waveforms of WHATEVER take its audio comes from and
- * never lies by another take's anchor over a gap — the W7-A promotion of
- * the W6-C per-take rule from "selected take only" to every take with a
- * verdict. Takes never overlap on the room clock by construction (the
- * desk lays them out sequentially); first match wins as the defensive
- * tie-break should a dragged arrangement overlap two spans. */
+ * take's anchor, 0 in gaps and beyond the session — the playhead rides the
+ * drawn waveforms of whatever take its audio comes from. First match wins
+ * as the defensive tie-break should a dragged arrangement overlap spans. */
 export function anchorAtSec(spans: readonly TakeAnchorSpan[], posSec: number): number {
   for (const span of spans) {
     if (posSec >= span.startSec && posSec <= span.endSec) return span.anchorSec;
@@ -295,14 +258,11 @@ export function anchorAtSec(spans: readonly TakeAnchorSpan[], posSec: number): n
   return 0;
 }
 
-// ---- W6-B — session spans and the look-ahead scheduler ---------------------------
-// The transport runs the whole SESSION timeline now: takes at their room
-// offsets, silence in the gaps. These helpers are the pure half of the
-// engine's memory-bounded decode: which takes must be mounted for the next
-// stretch of playback, and which mounted takes are safely behind us. Takes
-// never overlap on the room clock by construction (the desk lays them out
-// sequentially), so at most one take is audible at any instant — the whole
-// reason a rolling mount window is enough.
+// ---- session spans and the look-ahead scheduler -----------------------------------
+// The pure half of the engine's memory-bounded decode: which takes must be
+// mounted for the next stretch of playback, and which are safely behind.
+// Takes never overlap on the room clock (the desk lays them out
+// sequentially), so a rolling mount window is enough.
 
 /** One take's extent on the session (arrangement) timeline. `endSec` is the
  * best current estimate: the aligned end for a mounted take, the declared
@@ -367,8 +327,8 @@ export function takesToRelease(
 }
 
 /** Optional export range on the take's room timeline — the same domain as
- * player positions/seeks (0 = take head after alignment). W2-B song
- * markers render ranges through this; omitted bounds mean whole-take. */
+ * player positions/seeks (0 = take head after alignment). Omitted bounds
+ * mean whole-take. */
 export interface RenderRange {
   startSec?: number;
   endSec?: number;

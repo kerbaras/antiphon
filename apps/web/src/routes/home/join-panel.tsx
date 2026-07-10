@@ -1,6 +1,5 @@
-// Join-by-code panel, shared by every landing variant (keyless + both
-// auth states). Joining is the MIC capability: public by link (RFC §12),
-// deliberately accountless — `micCopy` (auth mode only) says so out loud.
+// Join-by-code panel, shared by every landing variant. Joining is the MIC
+// capability: public by link, deliberately accountless — `micCopy` says so.
 
 import { useState } from "react";
 import { Button, Panel, SectionLabel } from "../../components";
@@ -17,8 +16,8 @@ export function JoinByCode({
 }) {
   const [code, setCode] = useState("");
   const sessionId = extractSessionId(code);
-  // F19: probe the pasted id inline — a heads-up, never a gate (the join
-  // page carries the full honest state and keeps rechecking).
+  // Probe the pasted id inline — a heads-up, never a gate (the join page
+  // carries the full honest state and keeps rechecking).
   const existence = useSessionExistence(sessionId);
 
   function submit() {

@@ -1,16 +1,6 @@
-// W8-A clerk-backed desk gate (lazy; see access-gate.tsx). Verdicts:
-//
-// - signed out            → sign-in screen (modal flows), with the honest
-//                           escape hatch: the MIC join needs no account.
-// - 200 (owner/sharee)    → mount the DAW. This same probe is the claim
-//                           point for legacy ownerless sessions (server).
-// - 404 (no session yet)  → mount: opening a fresh desk link CREATES the
-//                           session (the WS hello claims ownership).
-// - 401/403               → "no desk access" screen.
-// - network failure       → mount. Offline-first: with no server there is
-//                           nothing reachable to protect, and the
-//                           signaling `unauthorized` fatal is the backstop
-//                           once the server returns.
+// Clerk-backed desk gate (lazy; see access-gate.tsx). Signed out → sign-in;
+// 401/403 → "no desk access"; everything else mounts the DAW — 404 included
+// (a fresh desk link CREATES the session) and network failure (offline-first).
 
 import { UserButton, useAuth, useClerk, useUser } from "@clerk/react";
 import { type ReactNode, useEffect, useState } from "react";
