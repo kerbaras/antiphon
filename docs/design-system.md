@@ -1,15 +1,7 @@
 # Antiphon Design System
 
-**Normative references** (all UI must visibly derive from these):
-
-1. `docs/image.png` — full-DAW screenshot, the target end state.
-2. `docs/Antiphone DAW.dc.html` — interactive prototype; its inline styles
-   are the design spec (exact colors, fonts, spacing, radii, animations).
-
 Direction: **dark, dense, pro-audio instrument panel.** Confidence over
 decoration; every pixel earns its place the way it does on a mixing console.
-(The prototype wordmark reads "ANTIPHONE"; the product name is Antiphon —
-real UI says ANTIPHON.)
 
 ## Where the tokens live
 
@@ -68,6 +60,5 @@ yellow `#d9c94b`, comment amber `#f2b84b`. Track palette (8): `#4fb8a8
 
 ## Process rule
 
-Before ANY UI work, read `~/.agents/skills/frontend-design/SKILL.md`, this
-document, and the two references. Enforced by
-[.cursor/rules/frontend-design.mdc](../.cursor/rules/frontend-design.mdc).
+Before ANY UI work, read this document and derive from the tokens and
+patterns above — never ad-hoc styles.

@@ -2,8 +2,8 @@
 // static landing; auth mode loads authed-home.tsx lazily so keyless visitors
 // never download Clerk bytes. Join-by-code stays accountless in every variant.
 
+import { useNavigate } from "@tanstack/react-router";
 import { lazy, Suspense, useState } from "react";
-import { useNavigate } from "react-router";
 import { useAuthMode } from "../../auth/auth-root";
 import { Button, SectionLabel, Wordmark } from "../../components";
 import { JoinByCode } from "./join-panel";
@@ -39,12 +39,12 @@ function KeylessHome() {
         <Button
           variant="accent"
           className="w-full"
-          onClick={() => navigate(`/session/${crypto.randomUUID()}`)}
+          onClick={() => navigate({ to: "/session/$uuid", params: { uuid: crypto.randomUUID() } })}
         >
           Create session
         </Button>
 
-        <JoinByCode onJoin={(id) => navigate(`/join/${id}`)} />
+        <JoinByCode onJoin={(id) => navigate({ to: "/join/$uuid", params: { uuid: id } })} />
 
         {recents.length > 0 && (
           <div className="flex w-full flex-col gap-1.5">
@@ -53,7 +53,7 @@ function KeylessHome() {
               <button
                 key={s.id}
                 type="button"
-                onClick={() => navigate(`/session/${s.id}`)}
+                onClick={() => navigate({ to: "/session/$uuid", params: { uuid: s.id } })}
                 title={`Reopen desk ${s.id}`}
                 className="flex items-baseline justify-between gap-3 rounded-md border border-edge-card bg-card px-3 py-2 text-left hover:bg-card-hi"
               >

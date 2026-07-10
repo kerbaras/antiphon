@@ -3,8 +3,8 @@
 // (a fresh desk link CREATES the session) and network failure (offline-first).
 
 import { UserButton, useAuth, useClerk, useUser } from "@clerk/react";
+import { Link, useParams } from "@tanstack/react-router";
 import { type ReactNode, useEffect, useState } from "react";
-import { Link, useParams } from "react-router";
 import { Button, Panel, SectionLabel, Wordmark } from "../../components";
 import { authFetch } from "../../net/auth-token";
 
@@ -12,7 +12,7 @@ type Verdict = "checking" | "allowed" | "forbidden";
 
 export default function ClerkAccessGate({ children }: { children: ReactNode }) {
   const { isLoaded, isSignedIn } = useAuth();
-  const { uuid } = useParams<{ uuid: string }>();
+  const { uuid } = useParams({ strict: false });
   const [verdict, setVerdict] = useState<Verdict>("checking");
 
   useEffect(() => {
@@ -70,7 +70,7 @@ function SignInScreen({ sessionId }: { sessionId: string }) {
       </Panel>
       <p className="text-center font-mono text-[9px] leading-relaxed text-text-faint">
         here to sing? the microphone join needs no account —{" "}
-        <Link to={`/join/${sessionId}`} className="text-accent hover:underline">
+        <Link to="/join/$uuid" params={{ uuid: sessionId }} className="text-accent hover:underline">
           join as a mic
         </Link>
       </p>
@@ -102,7 +102,7 @@ function ForbiddenScreen({ sessionId }: { sessionId: string }) {
       </Panel>
       <p className="text-center font-mono text-[9px] leading-relaxed text-text-faint">
         singers don't need access — the invite link{" "}
-        <Link to={`/join/${sessionId}`} className="text-accent hover:underline">
+        <Link to="/join/$uuid" params={{ uuid: sessionId }} className="text-accent hover:underline">
           joins as a mic
         </Link>{" "}
         without an account

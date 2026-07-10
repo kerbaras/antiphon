@@ -3,8 +3,8 @@
 // session needs an owner. Signed in: session lists, create, UserButton.
 
 import { UserButton, useAuth, useClerk } from "@clerk/react";
+import { useNavigate } from "@tanstack/react-router";
 import { useEffect, useState } from "react";
-import { useNavigate } from "react-router";
 import { Button, SectionLabel, Wordmark } from "../../components";
 import { authFetch } from "../../net/auth-token";
 import { JoinByCode } from "./join-panel";
@@ -27,7 +27,8 @@ export default function AuthedHome() {
       </main>
     );
   }
-  if (!isSignedIn) return <SignedOutHome onJoin={(id) => navigate(`/join/${id}`)} />;
+  if (!isSignedIn)
+    return <SignedOutHome onJoin={(id) => navigate({ to: "/join/$uuid", params: { uuid: id } })} />;
   return <SignedInHome />;
 }
 
@@ -86,7 +87,7 @@ function SignedInHome() {
       const res = await authFetch("/api/sessions", { method: "POST" });
       if (!res.ok) throw new Error(String(res.status));
       const { sessionId } = (await res.json()) as { sessionId: string };
-      navigate(`/session/${sessionId}`);
+      navigate({ to: "/session/$uuid", params: { uuid: sessionId } });
     } catch {
       setCreateFailed(true);
     }
@@ -111,7 +112,10 @@ function SignedInHome() {
           )}
         </div>
 
-        <JoinByCode onJoin={(id) => navigate(`/join/${id}`)} micCopy />
+        <JoinByCode
+          onJoin={(id) => navigate({ to: "/join/$uuid", params: { uuid: id } })}
+          micCopy
+        />
 
         {lists === "loading" ? (
           <p className="px-1 font-mono text-[9px] text-text-faint">loading your sessions…</p>
@@ -125,13 +129,13 @@ function SignedInHome() {
               label="Your sessions"
               sessions={lists.own}
               empty="none yet — create one above"
-              onOpen={(id) => navigate(`/session/${id}`)}
+              onOpen={(id) => navigate({ to: "/session/$uuid", params: { uuid: id } })}
             />
             <SessionList
               label="Shared with me"
               sessions={lists.shared}
               empty="nothing shared to your email yet"
-              onOpen={(id) => navigate(`/session/${id}`)}
+              onOpen={(id) => navigate({ to: "/session/$uuid", params: { uuid: id } })}
               showOwner
             />
           </>

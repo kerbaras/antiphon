@@ -33,3 +33,10 @@ data/
 
 # parallel workstream worktrees
 .worktrees/
+
+# local notes / agent workspaces
+TODO.md
+CLAUDE.md
+.cursor/
+.claude/
+.devin/

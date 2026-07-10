@@ -1,8 +1,8 @@
 // Phone recorder — /join/:uuid. A performer-facing instrument panel;
 // also works session-less as a local rehearsal recorder.
 
+import { useParams } from "@tanstack/react-router";
 import { useState } from "react";
-import { useParams } from "react-router";
 import { CapturePanel } from "./capture-panel";
 import { DiagnosticsPanel } from "./diagnostics-panel";
 import { FatalScreen } from "./fatal-screen";
@@ -22,7 +22,7 @@ import {
 } from "./use-capture";
 
 export function JoinRoute() {
-  const { uuid } = useParams();
+  const { uuid } = useParams({ strict: false });
   const snap = useCaptureSnapshot();
   const sessionState = useRecorderSessionState();
   const [busy, setBusy] = useState(false);

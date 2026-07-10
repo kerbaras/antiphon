@@ -11,8 +11,8 @@
 // renders from the sibling modules (top-bar, toolbar, timeline, right-rail
 // panels, mixer-dock).
 
+import { useParams } from "@tanstack/react-router";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
-import { useParams } from "react-router";
 import { useAuthUser } from "../../auth/use-auth-user";
 import { recordRecentSession } from "../home/recent-sessions";
 import { loadAuthorPref, saveAuthorPref } from "./comments";
@@ -69,7 +69,7 @@ import { useExportActions } from "./use-export-actions";
 import { useTimelineEditing } from "./use-timeline-editing";
 
 export function DeskRoute() {
-  const { uuid } = useParams();
+  const { uuid } = useParams({ strict: false });
   if (!uuid) return null;
   return <Desk sessionId={uuid} />;
 }
