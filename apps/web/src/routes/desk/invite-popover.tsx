@@ -10,7 +10,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useAuthMode } from "../../auth/auth-root";
-import { SectionLabel, StyledQr } from "../../ui/kit";
+import { SectionLabel, StyledQr } from "../../components";
 import { DeskAccessSection } from "./desk-access-section";
 
 export function InvitePopover({

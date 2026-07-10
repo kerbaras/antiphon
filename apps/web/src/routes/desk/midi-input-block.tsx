@@ -2,7 +2,7 @@
 // the desk audio input — same enable/resume UX, no audio path behind it.
 
 import { useState } from "react";
-import { Avatar, SectionLabel, StatusPill } from "../../ui/kit";
+import { Avatar, SectionLabel, StatusPill } from "../../components";
 import { MIDI_EVENT_CAP } from "./midi";
 import { initialsOf } from "./track-model";
 import { type DeskMidiState, getDeskMidi } from "./use-desk-midi";

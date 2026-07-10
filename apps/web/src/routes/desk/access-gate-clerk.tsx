@@ -15,8 +15,8 @@
 import { UserButton, useAuth, useClerk, useUser } from "@clerk/react";
 import { type ReactNode, useEffect, useState } from "react";
 import { Link, useParams } from "react-router";
+import { Button, Panel, SectionLabel, Wordmark } from "../../components";
 import { authFetch } from "../../net/auth-token";
-import { Button, Panel, SectionLabel, Wordmark } from "../../ui/kit";
 
 type Verdict = "checking" | "allowed" | "forbidden";
 

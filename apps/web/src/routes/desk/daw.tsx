@@ -4,8 +4,8 @@
 // Anything not yet functional is visibly inert (aria-disabled), never fake.
 
 import { type ReactNode, type Ref, useEffect, useRef, useState } from "react";
+import { AvatarImg } from "../../components";
 import { NICKNAME_MAX_LENGTH } from "../../net/device-identity";
-import { AvatarImg } from "../../ui/kit";
 import {
   EQ_DB_RANGE,
   EQ_MID_HZ_DEFAULT,

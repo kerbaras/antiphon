@@ -1,7 +1,7 @@
 // The desk's own hardware input card (W2-D), hosted by the performers panel.
 
 import { useState } from "react";
-import { Avatar, SectionLabel, StatusPill, VUMeter } from "../../ui/kit";
+import { Avatar, SectionLabel, StatusPill, VUMeter } from "../../components";
 import { initialsOf } from "./track-model";
 import { type DeskInputState, getDeskInput } from "./use-desk-input";
 

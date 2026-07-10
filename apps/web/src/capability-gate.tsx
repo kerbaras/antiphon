@@ -5,7 +5,7 @@
 // State exactly what is missing and why instead. No polyfills.
 
 import type { ReactNode } from "react";
-import { MonoReadout, Panel, SectionLabel, Wordmark } from "./ui/kit";
+import { MonoReadout, Panel, SectionLabel, Wordmark } from "./components";
 
 interface Capability {
   name: string;

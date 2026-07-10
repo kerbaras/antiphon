@@ -1,7 +1,7 @@
 // Right-rail Comments panel (W2-F): timestamped notes with a resolve flow.
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { SectionLabel } from "../../ui/kit";
+import { SectionLabel } from "../../components";
 import { MAX_COMMENT_AUTHOR, MAX_COMMENT_TEXT, type TakeComment } from "./comments";
 import { formatAt } from "./format";
 

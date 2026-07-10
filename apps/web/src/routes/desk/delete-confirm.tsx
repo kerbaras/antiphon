@@ -9,7 +9,7 @@
 // clips from the ARRANGEMENT only (doc write, Ctrl+Z restores).
 
 import { useEffect, useRef } from "react";
-import { Button, MonoReadout, Panel, SectionLabel } from "../../ui/kit";
+import { Button, MonoReadout, Panel, SectionLabel } from "../../components";
 
 export interface DeleteSummaryTake {
   /** Timeline name of the take ("Take 3"). */

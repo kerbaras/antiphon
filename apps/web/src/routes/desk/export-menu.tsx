@@ -1,7 +1,7 @@
 // Top-bar "Export ▾" dropdown (the prototype's decorative button, live).
 
 import { useState } from "react";
-import { SectionLabel } from "../../ui/kit";
+import { SectionLabel } from "../../components";
 import { formatSpan } from "./format";
 import type { Song } from "./markers";
 import type { StemFormat } from "./use-desk";

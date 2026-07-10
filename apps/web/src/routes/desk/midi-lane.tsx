@@ -5,7 +5,7 @@
 // like everywhere else. Deliberately silent on playback: the room mics
 // carried the instrument; this lane is the data, the .mid export the payoff.
 
-import { Badge } from "../../ui/kit";
+import { Badge } from "../../components";
 import { hexA, laneGridStyle, TRACK_HEADER_W } from "./daw";
 import type { NoteSpan } from "./midi";
 

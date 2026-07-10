@@ -10,7 +10,7 @@
 // are honestly disabled with the reason on hover.
 
 import { useLayoutEffect, useRef, useState } from "react";
-import { SectionLabel } from "../../ui/kit";
+import { SectionLabel } from "../../components";
 
 /** Where and for which lane the menu is open (index.tsx owns the state). */
 export interface LaneMenuState {

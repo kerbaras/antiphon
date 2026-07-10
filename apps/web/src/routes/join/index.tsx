@@ -7,7 +7,6 @@ import { useEffect, useState } from "react";
 import { useParams } from "react-router";
 import { randomId } from "../../audio/capture-controller";
 import { useAuthUser } from "../../auth/use-auth-user";
-import { getNickname, NICKNAME_MAX_LENGTH, normalizeNickname } from "../../net/device-identity";
 import {
   Avatar,
   Badge,
@@ -20,7 +19,8 @@ import {
   StatusPill,
   VUMeter,
   Wordmark,
-} from "../../ui/kit";
+} from "../../components";
+import { getNickname, NICKNAME_MAX_LENGTH, normalizeNickname } from "../../net/device-identity";
 import { MicPicker } from "./mic-picker";
 import { useSessionExistence } from "./session-existence";
 import { formatClock } from "./timecode";

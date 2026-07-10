@@ -14,7 +14,7 @@
 import { lazy, Suspense, useState } from "react";
 import { useNavigate } from "react-router";
 import { useAuthMode } from "../../auth/auth-root";
-import { Button, SectionLabel, Wordmark } from "../../ui/kit";
+import { Button, SectionLabel, Wordmark } from "../../components";
 import { JoinByCode } from "./join-panel";
 import { listRecentSessions, relativeTime } from "./recent-sessions";
 

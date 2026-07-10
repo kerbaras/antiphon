@@ -5,7 +5,7 @@
 
 import type { RefObject } from "react";
 import { useLayoutEffect, useRef, useState } from "react";
-import { AvatarImg, Badge, SectionLabel } from "../../ui/kit";
+import { AvatarImg, Badge, SectionLabel } from "../../components";
 import type { TakeComment } from "./comments";
 import {
   ClipCard,

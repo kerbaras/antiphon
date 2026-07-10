@@ -1,7 +1,7 @@
 // Right-rail Performers panel: connected phones, the desk input.
 
 import type { PeerInfo } from "@antiphon/protocol";
-import { Avatar, StatusPill, VUMeter } from "../../ui/kit";
+import { Avatar, StatusPill, VUMeter } from "../../components";
 import { DeskInputBlock } from "./desk-input-block";
 import { MidiInputBlock } from "./midi-input-block";
 import { deviceName, initialsOf, TRACK_COLORS, type TrackRow } from "./track-model";

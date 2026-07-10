@@ -1,9 +1,9 @@
 // Right-rail Sinks panel: per-stream desk↔server convergence diagnostics.
 
 import type { DeskStreamStatus } from "../../audio/sink-worker-protocol";
+import { MonoReadout, StatusPill } from "../../components";
 import { authActive } from "../../net/auth-token";
 import { downloadStreamFlac } from "../../net/stream-download";
-import { MonoReadout, StatusPill } from "../../ui/kit";
 import type { DriftResult } from "./player";
 import type { ServerStreamStatus } from "./use-desk";
 

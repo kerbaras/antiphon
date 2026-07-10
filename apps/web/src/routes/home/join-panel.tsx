@@ -3,7 +3,7 @@
 // deliberately accountless — `micCopy` (auth mode only) says so out loud.
 
 import { useState } from "react";
-import { Button, Panel, SectionLabel } from "../../ui/kit";
+import { Button, Panel, SectionLabel } from "../../components";
 import { useSessionExistence } from "../join/session-existence";
 import { extractSessionId } from "./join-code";
 

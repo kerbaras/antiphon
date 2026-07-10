@@ -6,8 +6,8 @@
 // keeps the capability split legible.
 
 import { useCallback, useEffect, useState } from "react";
+import { SectionLabel } from "../../components";
 import { authFetch } from "../../net/auth-token";
-import { SectionLabel } from "../../ui/kit";
 
 interface ShareEntry {
   email: string;

@@ -3,8 +3,8 @@
 // terminal panel (F3) — rendered by index.tsx over everything when the
 // control plane halts for good.
 
+import { Button, MonoReadout, Panel, SectionLabel, StatusPill } from "../../components";
 import type { FatalSignalingError } from "../../net/signaling-client";
-import { Button, MonoReadout, Panel, SectionLabel, StatusPill } from "../../ui/kit";
 import { type DeskTool, SnapGrid, ToolGroup, ViewTabs, ZoomControl } from "./daw";
 import type { PlayerSnapshot } from "./player";
 

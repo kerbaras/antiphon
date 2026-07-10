@@ -10,8 +10,8 @@
 import { UserButton, useAuth, useClerk } from "@clerk/react";
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router";
+import { Button, SectionLabel, Wordmark } from "../../components";
 import { authFetch } from "../../net/auth-token";
-import { Button, SectionLabel, Wordmark } from "../../ui/kit";
 import { JoinByCode } from "./join-panel";
 import { fetchMeSessions, type MeSession, type MeSessions } from "./me-sessions";
 import { relativeTime } from "./recent-sessions";
