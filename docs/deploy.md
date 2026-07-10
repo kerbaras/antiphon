@@ -100,6 +100,8 @@ $EDITOR deploy/Caddyfile                # set your domain + Pages hostname
 | `SESSION_TTL_HOURS` | `720` (30 days; idle sessions hard-deleted, blobs + rows) | |
 | `SESSION_SWEEP_INTERVAL_MS` | `600000` | |
 | `COLLAB_IDLE_EVICT_MS` | `900000` (15 min; zero-desk Yjs rooms flushed to Postgres, then dropped from memory — rejoins rebuild transparently) | |
+| `CLERK_SECRET_KEY` | **REQUIRED in production** (W8-A). Auth is enforced iff this is set: without it the desk surface is open to anyone with a link (keyless dev mode). `sk_live_…` from the Clerk dashboard | ✦ |
+| `CLERK_PUBLISHABLE_KEY` | `pk_live_…` — served to the SPA via `/api/auth/config` (public by definition; also bake it into the web build as `VITE_CLERK_PUBLISHABLE_KEY`) | |
 
 ### 2.3 Run
 
@@ -204,6 +206,16 @@ ship a fly.toml; deploy to a VM.
 
 ## 7 · Production checklist
 
+- [ ] **`CLERK_SECRET_KEY` + `CLERK_PUBLISHABLE_KEY` set (HARD REQUIREMENT,
+      W8-A).** Auth is enforced iff the secret key is present; a keyless
+      production server hands the desk surface — takes, exports, deletion,
+      sharing — to anyone holding a session link. The boot log states the
+      active mode (`auth mode: clerk …` / `auth mode: disabled (keyless)`);
+      verify it says `clerk` after every deploy. The web build should also
+      carry `VITE_CLERK_PUBLISHABLE_KEY` (the server serves the key via
+      `/api/auth/config` as a fallback, so a keyless-built dist still works).
+      Mic join links stay public by design (RFC §12) — that is the product,
+      not a leak.
 - [ ] `CORS_ORIGINS` set to the exact app origin(s) — never unset in prod
       (unset = allow all; the server logs a startup warning).
 - [ ] `TRUST_PROXY=1` (behind Caddy) so rate limits key on real client IPs.

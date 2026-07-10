@@ -48,6 +48,32 @@ export class Archive {
     await this.db.insert(schema.sessions).values({ id: sessionId }).onConflictDoNothing();
   }
 
+  /** Row-existence probe (F19 / the public /exists endpoint): the join
+   * page's typo warning needs "does this session exist", nothing more —
+   * deliberately cheaper AND less revealing than sessionSummary now that
+   * the summary sits behind desk auth (W8-A). */
+  async sessionExists(sessionId: string): Promise<boolean> {
+    const rows = await this.db
+      .select({ id: schema.sessions.id })
+      .from(schema.sessions)
+      .where(eq(schema.sessions.id, sessionId))
+      .limit(1);
+    return rows.length > 0;
+  }
+
+  /** Session id owning a stream (stream → take → session), for the desk
+   * FLAC route's authorization (W8-A): stream ids stop being pure bearer
+   * capabilities once auth is on. Null = unknown stream. */
+  async streamSessionId(streamId: string): Promise<string | null> {
+    const rows = await this.db
+      .select({ sessionId: schema.takes.sessionId })
+      .from(schema.streams)
+      .innerJoin(schema.takes, eq(schema.streams.takeId, schema.takes.id))
+      .where(eq(schema.streams.id, streamId))
+      .limit(1);
+    return rows[0]?.sessionId ?? null;
+  }
+
   /** Bump the expiry-sweep clock. Signaling-level events only (join,
    * take start/stop) — never per-chunk. */
   async touchSession(sessionId: string): Promise<void> {

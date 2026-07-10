@@ -32,6 +32,18 @@ export interface ServerConfig {
      * Postgres first) after this idle grace. */
     idleEvictMs: number;
   };
+  /** W8-A auth-optional mode (PM decision): Clerk auth is enforced on the
+   * desk surface iff CLERK_SECRET_KEY is set (empty string = unset, so the
+   * e2e harness can pin keyless deterministically over an ambient .env).
+   * null = keyless — today's single-user behavior byte-for-byte. The
+   * mic-join surface is public-by-link in BOTH modes (RFC §12).
+   * Production MUST set the keys (docs/deploy.md). */
+  auth: {
+    clerkSecretKey: string;
+    /** Served to the SPA via GET /api/auth/config so a single web build
+     * works in both modes (publishable keys are public by definition). */
+    clerkPublishableKey: string | null;
+  } | null;
   /** Read for honesty, not for function: node-datachannel (libdatachannel/
    * libjuice underneath) exposes no external-address / 1:1-NAT hint, so the
    * server cannot advertise this IP as an ICE candidate. Setting it only
@@ -81,6 +93,7 @@ export function loadConfig(): ServerConfig {
     collab: {
       idleEvictMs: envPositiveNumber("COLLAB_IDLE_EVICT_MS", 900_000, MAX_TIMER_MS), // 15 min
     },
+    auth: envAuth(),
     webrtcPublicIp: process.env.WEBRTC_PUBLIC_IP?.trim() || null,
   };
 }
@@ -103,6 +116,21 @@ function envLogLevel(): LogLevel {
   const level = parseLogLevel(raw);
   if (!level) throw new Error(`LOG_LEVEL must be debug|info|warn|error, got "${raw}"`);
   return level;
+}
+
+/** Auth mode flips on the SECRET key alone (it is what verification needs);
+ * a publishable key without a secret key cannot enforce anything and is
+ * ignored with a loud warning at boot (see createServer). Empty strings
+ * read as unset ON PURPOSE: `node --env-file-if-exists=.env` lets a real
+ * .env leak keys into dev/e2e, and explicit CLERK_SECRET_KEY="" overrides
+ * (environment beats env-file in Node) are the harness's keyless pin. */
+function envAuth(): ServerConfig["auth"] {
+  const clerkSecretKey = process.env.CLERK_SECRET_KEY?.trim() || "";
+  if (!clerkSecretKey) return null;
+  return {
+    clerkSecretKey,
+    clerkPublishableKey: process.env.CLERK_PUBLISHABLE_KEY?.trim() || null,
+  };
 }
 
 function envCorsOrigins(): string[] | null {

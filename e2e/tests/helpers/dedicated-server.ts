@@ -20,8 +20,12 @@ export const DATABASE_URL =
   process.env.DATABASE_URL ?? "postgres://antiphon:antiphon@localhost:5433/antiphon";
 
 /** Paths the vite preview proxies to the server (vite.config.ts), plus
- * /health for liveness probes. Everything else is the web app. */
-const SERVER_PATHS = /^\/(?:api(?:\/|$)|health$)|^\/(?:session|join)\/[^/]+\/ws$/;
+ * /health for liveness probes. Everything else is the web app. Mirrors
+ * the vite proxy exactly: /api, signaling WS, AND the collab WS (W8-A —
+ * the live-clerk journey asserts collab authorization end-to-end, so the
+ * doc socket must reach the dedicated server too). Query strings ride
+ * along (the collab token does); match up to `?`. */
+const SERVER_PATHS = /^\/(?:api(?:\/|$)|health$)|^\/(?:session|join)\/[^/]+\/(?:ws|collab)(?:\?|$)/;
 
 /** OS-assigned ephemeral port (listen on 0). Ephemeral ranges start at
  * 32768 (Linux) / 49152 (macOS), so these can never collide with the
@@ -49,10 +53,15 @@ export interface ServerProcess {
 }
 
 /** Spawn `node src/index.ts` in apps/server (the same entrypoint the
- * playwright webServer uses) and wait until /health answers. */
+ * playwright webServer uses) and wait until /health answers. `env` lets a
+ * spec opt into extra server config (W8-A live-clerk passes the real
+ * CLERK_* keys — the ONLY suite path where auth turns on); the keyless
+ * pin defaults keep every other dedicated server deterministic against an
+ * ambient apps/server/.env. */
 export async function startDedicatedServer(opts: {
   port: number;
   blobRoot: string;
+  env?: Record<string, string>;
 }): Promise<ServerProcess> {
   const child = spawn(process.execPath, ["src/index.ts"], {
     cwd: path.join(repoRoot, "apps", "server"),
@@ -66,6 +75,11 @@ export async function startDedicatedServer(opts: {
       // per-IP join limits would starve the clients (see playwright.config).
       JOIN_RATE_PER_MIN: "6000",
       JOIN_RATE_BURST: "1000",
+      // Keyless by default even when apps/server/.env carries real keys
+      // (explicit env beats --env-file-if-exists; see playwright.config).
+      CLERK_SECRET_KEY: "",
+      CLERK_PUBLISHABLE_KEY: "",
+      ...opts.env,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });

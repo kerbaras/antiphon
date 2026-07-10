@@ -8,6 +8,7 @@ import {
   type SessionState,
   type SignalingMessage,
 } from "@antiphon/protocol";
+import { authToken } from "./auth-token";
 import { getDeviceId } from "./device-identity";
 
 type MessageListener = (msg: SignalingMessage) => void;
@@ -71,17 +72,27 @@ export class SignalingClient {
     ws.addEventListener("open", () => {
       this.attempts = 0;
       const label = this.label?.trim();
-      this.sendRaw({
-        v: 1,
-        type: "hello",
-        role: this.role,
-        deviceInfo: {
-          userAgent: navigator.userAgent.slice(0, 500),
-          // Stable per-browser id (A12): the server resumes our peerId.
-          deviceId: this.deviceId ?? getDeviceId(),
-          ...(label ? { label } : {}),
-        },
-        protocolVersions: [1],
+      // Desk hellos carry the Clerk session token (A15) — the browser
+      // cannot set WS headers, so auth rides the handshake message. The
+      // await is a no-op keyless (null, nothing attached) and recorders
+      // never send one: mic join stays accountless (RFC §12). Fetched per
+      // (re)connect so a long-lived desk always presents a fresh JWT.
+      const tokenPromise = this.role === "desk" ? authToken() : Promise.resolve(null);
+      void tokenPromise.then((token) => {
+        if (this.ws !== ws || ws.readyState !== WebSocket.OPEN) return;
+        this.sendRaw({
+          v: 1,
+          type: "hello",
+          role: this.role,
+          deviceInfo: {
+            userAgent: navigator.userAgent.slice(0, 500),
+            // Stable per-browser id (A12): the server resumes our peerId.
+            deviceId: this.deviceId ?? getDeviceId(),
+            ...(label ? { label } : {}),
+          },
+          protocolVersions: [1],
+          ...(token ? { authToken: token } : {}),
+        });
       });
     });
     ws.addEventListener("message", (ev) => {

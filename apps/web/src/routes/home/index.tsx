@@ -1,16 +1,39 @@
-// Landing — "/". Minimal and honest: wordmark, the one-line pitch, Create
-// session, join-by-code (paste a link or a raw uuid), and the desk sessions
-// this browser has visited. Same instrument-panel language as everything
-// else; no marketing surface.
+// Landing — "/". Two modes, one route (W8-A):
+//
+// - Keyless (no Clerk keys anywhere): today's landing byte-for-byte —
+//   wordmark, the one-line pitch, Create session, join-by-code (paste a
+//   link or a raw uuid), and the desk sessions this browser has visited.
+//   Pinned by e2e (auth-keyless.spec).
+// - Auth mode: authed-home.tsx (lazy — keyless visitors never download
+//   Clerk bytes): sign-in/up signed out; "Your sessions" / "Shared with
+//   me" / create / UserButton signed in. Join-by-code stays accountless
+//   in every variant (mic capability, RFC §12).
+//
+// Same instrument-panel language as everything else; no marketing surface.
 
-import { useState } from "react";
+import { lazy, Suspense, useState } from "react";
 import { useNavigate } from "react-router";
-import { Button, Panel, SectionLabel, Wordmark } from "../../ui/kit";
-import { useSessionExistence } from "../join/session-existence";
-import { extractSessionId } from "./join-code";
+import { useAuthMode } from "../../auth/auth-root";
+import { Button, SectionLabel, Wordmark } from "../../ui/kit";
+import { JoinByCode } from "./join-panel";
 import { listRecentSessions, relativeTime } from "./recent-sessions";
 
+const AuthedHome = lazy(() => import("./authed-home"));
+
 export function HomeRoute() {
+  // Branch once at the top: Clerk hooks exist only under the provider
+  // (auth mode), so the two variants are separate components.
+  if (useAuthMode() === "clerk") {
+    return (
+      <Suspense fallback={null}>
+        <AuthedHome />
+      </Suspense>
+    );
+  }
+  return <KeylessHome />;
+}
+
+function KeylessHome() {
   const navigate = useNavigate();
   // Read once per mount: the list only changes by visiting a desk.
   const [recents] = useState(() => listRecentSessions());
@@ -53,59 +76,5 @@ export function HomeRoute() {
         )}
       </div>
     </main>
-  );
-}
-
-/** Paste a join/desk link or a bare uuid → the phone join page. */
-function JoinByCode({ onJoin }: { onJoin: (sessionId: string) => void }) {
-  const [code, setCode] = useState("");
-  const sessionId = extractSessionId(code);
-  // F19: probe the pasted id inline — a heads-up, never a gate (the join
-  // page carries the full honest state and keeps rechecking).
-  const existence = useSessionExistence(sessionId);
-
-  function submit() {
-    if (sessionId) onJoin(sessionId);
-  }
-
-  return (
-    <Panel className="w-full p-3">
-      <SectionLabel>Join a session</SectionLabel>
-      <form
-        onSubmit={(e) => {
-          e.preventDefault();
-          submit();
-        }}
-        className="mt-2 flex items-stretch gap-2"
-      >
-        <input
-          value={code}
-          placeholder="Paste an invite link or session id"
-          aria-label="Session link or id"
-          onChange={(e) => setCode(e.target.value)}
-          onKeyDown={(e) => {
-            // Explicit: implicit form submission needs a submit button.
-            if (e.key === "Enter") {
-              e.preventDefault();
-              submit();
-            }
-          }}
-          className="min-w-0 flex-1 rounded-md border border-edge-inset bg-bg px-2.5 py-1.5 font-mono text-[11px] text-text outline-none placeholder:text-text-faint focus:border-accent"
-        />
-        <Button variant="outline" className="px-3 py-1.5" disabled={!sessionId} onClick={submit}>
-          Join
-        </Button>
-      </form>
-      {code.trim() && !sessionId && (
-        <p className="mt-1.5 px-0.5 font-mono text-[9px] text-warn">
-          no session id found — expected a uuid or an invite link containing one
-        </p>
-      )}
-      {sessionId && existence === "absent" && (
-        <p className="mt-1.5 px-0.5 font-mono text-[9px] text-warn">
-          no desk has opened this session yet — you can still join and wait for it
-        </p>
-      )}
-    </Panel>
   );
 }

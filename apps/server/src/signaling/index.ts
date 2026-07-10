@@ -64,6 +64,20 @@ export interface SignalingLimits {
   maxActiveSessions: number;
 }
 
+/**
+ * Desk hello gate (W8-A). The hello/welcome handshake is the auth seam for
+ * the signaling socket: the browser cannot set WS headers, so the desk
+ * carries its Clerk session token IN the hello (protocol amendment A15)
+ * and the server judges it here — BEFORE the room is even created, so a
+ * refused desk attaches zero session state (no room, no ingest, no peer).
+ * Recorder hellos never pass through this gate: mic join is a public
+ * bearer capability (RFC §12) in both auth modes. null = keyless mode.
+ */
+export type DeskHelloAuth = (
+  sessionId: string,
+  authToken: string | undefined,
+) => Promise<{ ok: true } | { ok: false; message: string }>;
+
 const DEFAULT_LIMITS: SignalingLimits = {
   msgRatePerSec: 100,
   msgBurst: 200,
@@ -77,12 +91,18 @@ export class Signaling {
   private readonly live = new Map<string, Room>();
   private readonly archive: Archive;
   private readonly limits: SignalingLimits;
+  private readonly deskHelloAuth: DeskHelloAuth | null;
   private readonly log = createLogger({ module: "signaling" });
   private epochs = 0;
 
-  constructor(archive: Archive, limits: Partial<SignalingLimits> = {}) {
+  constructor(
+    archive: Archive,
+    limits: Partial<SignalingLimits> = {},
+    deskHelloAuth: DeskHelloAuth | null = null,
+  ) {
     this.archive = archive;
     this.limits = { ...DEFAULT_LIMITS, ...limits };
+    this.deskHelloAuth = deskHelloAuth;
   }
 
   private async getRoom(sessionId: string): Promise<Room> {
@@ -167,16 +187,36 @@ export class Signaling {
     }
     if (msg === null) return; // unknown type / future version: ignore (§5)
 
-    const room = await this.getRoom(conn.sessionId);
-
     if (msg.type === "hello") {
-      await this.handleHello(conn, ws, room, msg);
+      // W8-A auth seam: a desk hello is judged BEFORE the room exists —
+      // an unauthorized desk must attach zero session state (no room, no
+      // ingest init, no peer entry, no doc). Fatal by contract: the client
+      // halts its reconnect loop (F3) instead of hammering the gate.
+      if (conn.pathRole === "desk" && this.deskHelloAuth) {
+        const verdict = await this.deskHelloAuth(conn.sessionId, msg.authToken);
+        if (!verdict.ok) {
+          this.log.warn("desk hello refused: unauthorized", { sessionId: conn.sessionId });
+          this.send(ws, {
+            v: 1,
+            type: "error",
+            code: "unauthorized",
+            message: verdict.message,
+            fatal: true,
+          });
+          ws.close();
+          return;
+        }
+      }
+      await this.handleHello(conn, ws, await this.getRoom(conn.sessionId), msg);
       return;
     }
     if (!conn.peerId) {
+      // Checked before getRoom on purpose: a socket that never said hello
+      // (authorized or not) must not conjure a room into existence.
       this.send(ws, { v: 1, type: "error", code: "no-hello", message: "hello first" });
       return;
     }
+    const room = await this.getRoom(conn.sessionId);
     const from = room.peers.get(conn.peerId);
     if (!from) return;
 

@@ -31,6 +31,16 @@ export const HelloMessage = z.object({
   role: PeerRole,
   deviceInfo: DeviceInfo,
   protocolVersions: z.array(z.number().int().positive()).min(1),
+  /**
+   * Desk authentication (proposed amendment A15, the RFC §12 "desk-
+   * authenticated session creation" v2 step): a Clerk session JWT carried
+   * in the hello because browsers cannot set WS headers. Servers running
+   * with auth enabled MUST judge a desk hello by it BEFORE attaching any
+   * session state; recorder hellos ignore it (mic join stays a public
+   * bearer capability). Absent in keyless mode — old servers strip it
+   * (zod object schemas are non-strict), old desks never send it.
+   */
+  authToken: z.string().min(1).max(8_192).optional(),
 });
 export type HelloMessage = z.infer<typeof HelloMessage>;
 

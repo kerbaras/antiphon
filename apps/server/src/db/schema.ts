@@ -27,7 +27,39 @@ export const sessions = pgTable("sessions", {
   /** Touched on join and take start/stop (signaling-level, never per-chunk);
    * the expiry sweep hard-deletes sessions idle past SESSION_TTL_HOURS. */
   lastActivityAt: timestamp("last_activity_at", { withTimezone: true }).notNull().defaultNow(),
+  /** Clerk user id of the session owner (W8-A). NULL in keyless mode and
+   * for legacy sessions; with auth ON, the first authenticated desk opener
+   * claims an ownerless session (atomic claim in auth/access.ts) — after
+   * that the desk surface is owner+sharee only. Never a foreign key: users
+   * live in Clerk, not in this database. */
+  ownerUserId: text("owner_user_id"),
+  /** Owner's primary email at claim/create time, normalized lowercase.
+   * Deliberate denormalization: the landing's "Shared with me" list shows
+   * who owns a session without a Clerk API call per row. Display-only —
+   * authorization always compares ownerUserId / session_shares. */
+  ownerEmail: text("owner_email"),
 });
+
+/** W8-A desk-access shares: (session, normalized-lowercase email). Grants
+ * the USE capability (desk surface) to any Clerk user holding a VERIFIED
+ * matching email — distinct from the mic-join capability, which stays a
+ * public bearer link (RFC §12). Rows are meaningful only when auth is ON;
+ * keyless mode never reads this table. */
+export const sessionShares = pgTable(
+  "session_shares",
+  {
+    sessionId: uuid("session_id")
+      .notNull()
+      .references(() => sessions.id, { onDelete: "cascade" }),
+    /** Always normalized (trim + lowercase) before write — matching is
+     * exact string equality against the user's verified emails. */
+    email: text("email").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    /** Clerk user id of the sharer (the owner; manage API is owner-only). */
+    createdBy: text("created_by").notNull(),
+  },
+  (t) => [primaryKey({ columns: [t.sessionId, t.email] }), index("shares_email_idx").on(t.email)],
+);
 
 export const peers = pgTable("peers", {
   id: uuid("id").primaryKey(),

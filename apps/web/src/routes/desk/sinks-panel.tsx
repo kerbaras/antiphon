@@ -1,6 +1,8 @@
 // Right-rail Sinks panel: per-stream desk↔server convergence diagnostics.
 
 import type { DeskStreamStatus } from "../../audio/sink-worker-protocol";
+import { authActive } from "../../net/auth-token";
+import { downloadStreamFlac } from "../../net/stream-download";
 import { MonoReadout, StatusPill } from "../../ui/kit";
 import type { DriftResult } from "./player";
 import type { ServerStreamStatus } from "./use-desk";
@@ -138,6 +140,15 @@ export function SinksPanel({
               <a
                 href={`/api/streams/${desk.streamId}/flac`}
                 download
+                onClick={(e) => {
+                  // Auth mode: the export route is desk-gated (W8-A) and
+                  // anchors can't carry the token — intercept and fetch.
+                  // Keyless: authActive() is false, plain anchor as always.
+                  if (authActive()) {
+                    e.preventDefault();
+                    void downloadStreamFlac(desk.streamId);
+                  }
+                }}
                 className="self-start font-mono text-[10px] text-accent hover:underline"
               >
                 ↓ download .flac

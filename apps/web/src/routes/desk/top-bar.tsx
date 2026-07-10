@@ -3,7 +3,8 @@
 // as in the prototype.
 
 import type { PeerInfo } from "@antiphon/protocol";
-import { useRef, useState } from "react";
+import { lazy, Suspense, useRef, useState } from "react";
+import { useAuthMode } from "../../auth/auth-root";
 import type { DeskSessionState } from "../../net/desk-session";
 import { Wordmark } from "../../ui/kit";
 import { AvatarStack, InfoChip, Timecode, TransportButton, TransportGroup } from "./daw";
@@ -12,6 +13,10 @@ import { InvitePopover } from "./invite-popover";
 import type { PlayerSnapshot } from "./player";
 import { deviceName, initialsOf, TRACK_COLORS } from "./track-model";
 import { getDeskSession, getPlayer } from "./use-desk";
+
+/** W8-A: Share (desk access by email) + UserButton — auth mode only, lazy
+ * so keyless desks never load Clerk chrome. */
+const AccountCluster = lazy(() => import("./account-cluster"));
 
 /** THE transport button's ▶-face gate, shared with the global Space
  * shortcut (W5-B): Space must be a no-op exactly when ▶ is disabled.
@@ -62,6 +67,10 @@ export function DeskTopBar({
   // this state living with the orchestrator). Nobody else cares: local.
   const [inviteOpen, setInviteOpen] = useState(false);
   const inviteAnchor = useRef<HTMLButtonElement>(null);
+  // W8-A: the "+" stays the MIC invite (public link); desk-access sharing
+  // and the operator's account render as their own cluster beside it,
+  // auth mode only — keyless top bars are unchanged.
+  const authMode = useAuthMode();
 
   return (
     // Left and right groups are equal flex shares (flex-1 basis-0), so at
@@ -206,6 +215,11 @@ export function DeskTopBar({
             />
           )}
         </div>
+        {authMode === "clerk" && (
+          <Suspense fallback={null}>
+            <AccountCluster sessionId={sessionId} />
+          </Suspense>
+        )}
         <ExportMenu {...exportMenu} />
       </div>
     </header>

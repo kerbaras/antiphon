@@ -2,14 +2,15 @@
 // landing's join-by-code.
 //
 // Server facts:
-// - GET /api/sessions/:id 404s when no session row exists (nano-batch —
-//   the exact signal this probe's first design note asked for) and 200s
-//   once the row does (a desk opening the invite, POST /api/sessions, or
-//   ingest). The verdict is therefore STATUS-based; the body no longer
-//   matters here. Accepted bound: a recorder joining a void creates the
-//   row too, so its own session reads "present" from then on — a session
-//   with a live recorder in it is real enough, and the typo-warning
-//   window that matters is before anyone joins.
+// - GET /api/sessions/:id/exists 404s when no session row exists (the
+//   dedicated PUBLIC probe: W8-A moved the full summary behind desk auth,
+//   and this mic-side typo check must stay accountless in both modes) and
+//   200s once the row does (a desk opening the invite, POST
+//   /api/sessions, or ingest). The verdict is therefore STATUS-based; the
+//   body never matters. Accepted bound: a recorder joining a void creates
+//   the row too, so its own session reads "present" from then on — a
+//   session with a live recorder in it is real enough, and the
+//   typo-warning window that matters is before anyone joins.
 // - Rate limiting sits on the WS upgrade paths (/…/ws, /…/collab) only,
 //   NOT on this GET (35 rapid probes → 35× 200), so a gentle poll is safe.
 //
@@ -65,7 +66,7 @@ export function useSessionExistence(sessionId: string | null, confirmed = false)
     const probe = async (): Promise<void> => {
       let next: SessionExistence = "unknown";
       try {
-        const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}`);
+        const res = await fetch(`/api/sessions/${encodeURIComponent(sessionId)}/exists`);
         next = interpretProbeStatus(res.status);
       } catch {
         // Offline / server unreachable: stay "unknown" — never a false warning.

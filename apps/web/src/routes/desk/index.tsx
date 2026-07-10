@@ -15,6 +15,7 @@ import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "r
 import { useParams } from "react-router";
 import type { DeskStreamStatus } from "../../audio/sink-worker-protocol";
 import { type ClipRegion, deleteArrangeKeys } from "../../net/collab-doc";
+import { downloadStreamFlac } from "../../net/stream-download";
 import { recordRecentSession } from "../home/recent-sessions";
 import { planAlignScopes, runAlignFlow } from "./align-flow";
 import { orderTakeIds } from "./attribution";
@@ -1717,11 +1718,13 @@ function Desk({ sessionId }: { sessionId: string }) {
     for (const desk of state.deskStatus) {
       const server = serverStatus.get(desk.streamId);
       if (desk.complete && server?.complete && desk.digest === server.digest) {
-        const a = document.createElement("a");
         const lane = laneOf.get(desk.streamId);
-        a.href = `/api/streams/${desk.streamId}/flac`;
-        a.download = `${lane ? `${fileSafe(lane)}-` : ""}${desk.streamId.slice(0, 8)}.flac`;
-        a.click();
+        // Keyless: plain anchor navigation as always; auth mode fetches
+        // with the session token (the export route is desk-gated, W8-A).
+        void downloadStreamFlac(
+          desk.streamId,
+          `${lane ? `${fileSafe(lane)}-` : ""}${desk.streamId.slice(0, 8)}.flac`,
+        );
       }
     }
   }

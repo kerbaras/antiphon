@@ -4,8 +4,15 @@ packages:
   - e2e
 
 allowBuilds:
+  # Clerk-dep postinstalls, all safely skipped: bufferutil/utf-8-validate
+  # are optional native ws accelerators (pure-JS fallback is fine for the
+  # control plane), core-js/browser-tabs-lock scripts are banners only.
+  browser-tabs-lock: false
+  bufferutil: false
+  core-js: false
   esbuild: true
   node-datachannel: true
+  utf-8-validate: false
 
 catalog:
   typescript: ^6.0.3

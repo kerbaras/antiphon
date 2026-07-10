@@ -9,7 +9,16 @@ import { sql } from "drizzle-orm";
 import type { Context } from "hono";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
+import { z } from "zod";
 import { Archive } from "./archive/index.ts";
+import {
+  AccessDeniedError,
+  DeskAccess,
+  type DeskRole,
+  isPlausibleEmail,
+  normalizeEmail,
+} from "./auth/access.ts";
+import { type ClerkAuth, createClerkAuth } from "./auth/clerk.ts";
 import { FsBlobStore, S3BlobStore } from "./blob/index.ts";
 import { CollabHub } from "./collab/index.ts";
 import { loadConfig, type ServerConfig } from "./config.ts";
@@ -22,7 +31,16 @@ import { Signaling } from "./signaling/index.ts";
 
 type Env = { Bindings: HttpBindings };
 
-export async function createServer(config: ServerConfig = loadConfig()) {
+/** Test seam (W8-A): the authz integration suite injects a fake ClerkAuth
+ * so the owner/sharee/public matrix runs without Clerk round-trips. */
+export interface ServerOptions {
+  clerkAuth?: ClerkAuth;
+}
+
+export async function createServer(
+  config: ServerConfig = loadConfig(),
+  options: ServerOptions = {},
+) {
   setLogLevel(config.logLevel);
   const log = createLogger({ module: "server" });
   const db = createDb(config.databaseUrl);
@@ -38,7 +56,64 @@ export async function createServer(config: ServerConfig = loadConfig()) {
     blobs = new FsBlobStore(config.blob.root);
   }
   const archive = new Archive(db, blobs);
-  const signaling = new Signaling(archive, config.limits);
+
+  // ---- auth mode (W8-A, PM decision: enforced iff keys present) -------------
+  // Two capability classes, distinct forever: USE a session (desk surface —
+  // owner/sharee only when auth is on) vs JOIN as mic (public by link, RFC
+  // §12, both modes). Keyless mode is today's single-user behavior
+  // byte-for-byte: every gate below checks `access` and no-ops when null.
+  const clerkAuth = config.auth
+    ? (options.clerkAuth ?? createClerkAuth(config.auth.clerkSecretKey))
+    : null;
+  const access = clerkAuth ? new DeskAccess(db, clerkAuth) : null;
+  if (config.auth) {
+    log.info(
+      "auth mode: clerk — desk surface (session WS/collab/REST) requires owner or sharee; mic join stays public-by-link",
+    );
+  } else {
+    log.info(
+      "auth mode: disabled (keyless) — all surfaces open, single-user behavior; production MUST set CLERK_SECRET_KEY (docs/deploy.md)",
+    );
+    if (process.env.CLERK_PUBLISHABLE_KEY?.trim()) {
+      log.warn(
+        "CLERK_PUBLISHABLE_KEY is set but CLERK_SECRET_KEY is not — a publishable key alone cannot enforce anything; auth stays OFF",
+      );
+    }
+  }
+
+  /** Signaling hello gate: desk-role connections must present a valid
+   * Clerk token for an owner/sharee BEFORE any session state attaches
+   * (room creation included). Recorder hellos never pass through here. */
+  const deskHelloAuth =
+    access && clerkAuth
+      ? async (sessionId: string, token: string | undefined) => {
+          if (!token) {
+            return { ok: false as const, message: "sign in required to open this session's desk" };
+          }
+          const user = await clerkAuth.verifyToken(token);
+          if (!user) {
+            return {
+              ok: false as const,
+              message: "session token invalid or expired — sign in again",
+            };
+          }
+          try {
+            // Or-create: the desk WS is a session-creating surface today
+            // (opening /session/<fresh-uuid> boots a session), so the
+            // authenticated opener becomes the owner (claim included).
+            const decision = await access.authorizeOrCreate(sessionId, user.userId);
+            if (decision.ok) return { ok: true as const };
+          } catch (error) {
+            if (!(error instanceof AccessDeniedError)) throw error;
+          }
+          return {
+            ok: false as const,
+            message: "no desk access to this session — ask the owner to share it with your email",
+          };
+        }
+      : null;
+
+  const signaling = new Signaling(archive, config.limits, deskHelloAuth);
   const collab = new CollabHub(db, {
     msgRatePerSec: config.limits.msgRatePerSec,
     msgBurst: config.limits.msgBurst,
@@ -123,24 +198,110 @@ export async function createServer(config: ServerConfig = loadConfig()) {
   });
   app.get("/ready", (c) => c.json({ ready }, ready ? 200 : 503));
 
+  // ---- auth plumbing (W8-A; every helper no-ops in keyless mode) ------------
+
+  // Hoisted above the gate that uses it (routes with raw URL params —
+  // typos included — must answer honest 404s, never uuid-cast 500s).
+  const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+  /** Web boot probe: which auth mode is this deployment running? Public in
+   * both modes — the SPA decides whether to mount Clerk from this, so one
+   * web build serves keyless AND authed servers deterministically (the
+   * publishable key is public by definition). */
+  app.get("/api/auth/config", (c) =>
+    c.json(
+      config.auth
+        ? { enabled: true, publishableKey: config.auth.clerkPublishableKey }
+        : { enabled: false, publishableKey: null },
+    ),
+  );
+
+  /** Bearer session-token → Clerk user id; null covers "auth off", "no
+   * header", and "invalid token" (callers that care distinguish via
+   * `access`). Verification is networkless (cached JWKS) — see auth/clerk. */
+  const bearerUser = async (c: Context<Env>): Promise<{ userId: string } | null> => {
+    if (!clerkAuth) return null;
+    const header = c.req.header("authorization");
+    if (!header?.startsWith("Bearer ")) return null;
+    return await clerkAuth.verifyToken(header.slice("Bearer ".length));
+  };
+
+  /** Desk-surface REST gate. Keyless: pass-through (role null) — today's
+   * behavior byte-for-byte. Authed: 401 without a valid user, 404 for
+   * sessions that don't exist (existence semantics predate auth and are
+   * public anyway via /exists), 403 for a valid user without desk access.
+   * A first authenticated toucher of an ownerless session claims it here
+   * (access.authorize → claim). */
+  type DeskGate =
+    | { ok: true; userId: string | null; role: DeskRole | null }
+    | { ok: false; res: Response };
+  const deskGate = async (c: Context<Env>, sessionId: string): Promise<DeskGate> => {
+    if (!access) return { ok: true, userId: null, role: null };
+    // Malformed ids can't exist (Postgres uuid) — the same honest 404 the
+    // summary route answers, instead of a 500 out of the uuid cast.
+    if (!UUID_SHAPE.test(sessionId)) {
+      return { ok: false, res: c.json({ error: "unknown session" }, 404) };
+    }
+    const user = await bearerUser(c);
+    if (!user) return { ok: false, res: c.json({ error: "authentication required" }, 401) };
+    try {
+      const decision = await access.authorize(sessionId, user.userId);
+      if (decision.ok) return { ok: true, userId: user.userId, role: decision.role };
+      if (decision.reason === "unknown-session") {
+        return { ok: false, res: c.json({ error: "unknown session" }, 404) };
+      }
+    } catch (error) {
+      if (!(error instanceof AccessDeniedError)) throw error;
+    }
+    return {
+      ok: false,
+      res: c.json({ error: "no desk access to this session — ask the owner to share it" }, 403),
+    };
+  };
+
   // ---- session CRUD -------------------------------------------------------
   app.post("/api/sessions", async (c) => {
     const sessionId = crypto.randomUUID();
+    if (access) {
+      // Authed mode: creating a session requires an account, and the
+      // creator IS the owner (RFC §12's "desk-authenticated session
+      // creation", the anticipated v2 step).
+      const user = await bearerUser(c);
+      if (!user) return c.json({ error: "authentication required" }, 401);
+      await access.createOwned(sessionId, user.userId);
+      log.info("session created", { sessionId, ownerUserId: user.userId });
+      return c.json({ sessionId }, 201);
+    }
     await archive.ensureSession(sessionId);
     return c.json({ sessionId }, 201);
   });
 
   // Unknown sessions are an honest 404 — the F19 existence probe reads the
   // status, not the body (a session that exists but holds nothing yet stays
-  // a 200 with empty arrays). The uuid-shape guard keeps a malformed id —
-  // this route is probed with raw URL params, typos included — an honest
-  // 404 too, instead of a 500 out of the Postgres uuid cast.
-  const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  // a 200 with empty arrays).
+
+  /** Public existence probe (F19), BOTH modes: the join page's typo
+   * warning and the landing's join-by-code need "does this session exist"
+   * without an account — mic join is public by link (RFC §12), so bare
+   * existence leaks nothing the link doesn't already grant. Split out of
+   * GET /api/sessions/:id because the full summary (takes/streams/peers)
+   * is desk data and sits behind the desk gate when auth is on. */
+  app.get("/api/sessions/:sessionId/exists", async (c) => {
+    const sessionId = c.req.param("sessionId");
+    const exists = UUID_SHAPE.test(sessionId) && (await archive.sessionExists(sessionId));
+    return exists ? c.json({ exists: true }) : c.json({ error: "unknown session" }, 404);
+  });
+
   app.get("/api/sessions/:sessionId", async (c) => {
     const sessionId = c.req.param("sessionId");
-    const summary = UUID_SHAPE.test(sessionId) ? await archive.sessionSummary(sessionId) : null;
+    if (!UUID_SHAPE.test(sessionId)) return c.json({ error: "unknown session" }, 404);
+    const gate = await deskGate(c, sessionId);
+    if (!gate.ok) return gate.res;
+    const summary = await archive.sessionSummary(sessionId);
     if (summary === null) return c.json({ error: "unknown session" }, 404);
-    return c.json(summary);
+    // `access` tells the desk UI whether share management is available
+    // (owner-only); absent in keyless mode — the pre-auth wire shape.
+    return c.json(gate.role ? { ...summary, access: gate.role } : summary);
   });
 
   /** Hard deletion (RFC §12 MUST). A9 ordering: disconnect live peers so
@@ -155,33 +316,56 @@ export async function createServer(config: ServerConfig = loadConfig()) {
   };
   app.delete("/api/sessions/:sessionId", async (c) => {
     const sessionId = c.req.param("sessionId");
+    // Session delete is a desk power — sharees included (v1: any
+    // authorized desk is the desk; per-role permissions are future work).
+    // Authed mode trades the keyless 204-on-unknown for an honest 404
+    // (deskGate) — idempotent retries land there harmlessly.
+    const gate = await deskGate(c, sessionId);
+    if (!gate.ok) return gate.res;
     await destroySession(sessionId);
-    log.info("session deleted", { sessionId });
+    log.info("session deleted", { sessionId, ...(gate.userId ? { userId: gate.userId } : {}) });
     return c.body(null, 204);
   });
 
   // ---- archive status / retrieval -----------------------------------------
   app.get("/api/sessions/:sessionId/takes/:takeId", async (c) => {
     const takeId = c.req.param("takeId");
+    const sessionId = c.req.param("sessionId");
+    const gate = await deskGate(c, sessionId);
+    if (!gate.ok) return gate.res;
     // Route params are never decorative: a take outside this session 404s.
-    const streams = await archive.takeSummary(c.req.param("sessionId"), takeId);
+    const streams = await archive.takeSummary(sessionId, takeId);
     if (streams === null) return c.json({ error: "unknown take" }, 404);
     return c.json({ takeId, streams });
   });
 
   app.get("/api/sessions/:sessionId/ingest", async (c) => {
-    const status = await signaling.ingestStatus(c.req.param("sessionId"));
+    const sessionId = c.req.param("sessionId");
+    const gate = await deskGate(c, sessionId);
+    if (!gate.ok) return gate.res;
+    const status = await signaling.ingestStatus(sessionId);
     return c.body(status, 200, { "content-type": "application/json" });
   });
 
   // Deliberately un-nested: streamId is a bearer capability (122-bit UUID,
   // RFC §12), and with no session param in the path there is nothing
-  // decorative to enforce. Session-scoping this would mean threading
-  // sessionId through every desk/e2e download path for zero access-control
-  // gain; revisit if v2 adds real authentication.
+  // decorative to enforce in KEYLESS mode. With auth on, "v2 adds real
+  // authentication" arrived (W8-A): the stream resolves to its session
+  // (stream → take → session) and the desk gate applies — exports are
+  // session audio, squarely the USE capability.
   app.get("/api/streams/:streamId/flac", async (c) => {
     const allowPartial = c.req.query("partial") === "1";
     const streamId = c.req.param("streamId");
+    if (access) {
+      // Authentication first (401 even for unknown streams — anonymous
+      // probers learn nothing), then resolution (honest 404), then
+      // authorization (403 via the desk gate).
+      if (!(await bearerUser(c))) return c.json({ error: "authentication required" }, 401);
+      const sessionId = UUID_SHAPE.test(streamId) ? await archive.streamSessionId(streamId) : null;
+      if (sessionId === null) return c.json({ error: "unknown stream" }, 404);
+      const gate = await deskGate(c, sessionId);
+      if (!gate.ok) return gate.res;
+    }
     const result = await archive.reconstructFlac(streamId, allowPartial);
     if (!result.ok) {
       // Honest status split: a stream the archive has never heard of (or
@@ -199,6 +383,65 @@ export async function createServer(config: ServerConfig = loadConfig()) {
       "content-disposition": flacContentDisposition(streamId, peer),
     });
   });
+
+  // ---- accounts surface (W8-A; mounted ONLY when auth is on) ----------------
+  // Keyless mode must stay byte-for-byte: these routes simply don't exist
+  // there (404 like any unknown path), so no keyless client can grow a
+  // dependency on them.
+  if (access && clerkAuth) {
+    const deskAccess = access;
+
+    /** Landing lists: sessions you own + sessions shared to any of your
+     * verified emails — one call, both buckets. */
+    app.get("/api/me/sessions", async (c) => {
+      const user = await bearerUser(c);
+      if (!user) return c.json({ error: "authentication required" }, 401);
+      const { own, shared } = await deskAccess.listUserSessions(user.userId);
+      return c.json({ own, shared });
+    });
+
+    /** Share management is OWNER-only — the one desk power sharees don't
+     * get (v1). The gate's claim path also means a legacy session's first
+     * authenticated opener can immediately manage shares. */
+    const ownerGate = async (c: Context<Env>, sessionId: string): Promise<DeskGate> => {
+      const gate = await deskGate(c, sessionId);
+      if (!gate.ok || gate.role === "owner") return gate;
+      return {
+        ok: false,
+        res: c.json({ error: "only the session owner can manage desk access" }, 403),
+      };
+    };
+
+    app.get("/api/sessions/:sessionId/shares", async (c) => {
+      const sessionId = c.req.param("sessionId");
+      const gate = await ownerGate(c, sessionId);
+      if (!gate.ok) return gate.res;
+      return c.json({ shares: await deskAccess.listShares(sessionId) });
+    });
+
+    const ShareBody = z.object({ email: z.string().min(3).max(320) });
+    app.post("/api/sessions/:sessionId/shares", async (c) => {
+      const sessionId = c.req.param("sessionId");
+      const gate = await ownerGate(c, sessionId);
+      if (!gate.ok) return gate.res;
+      const body = ShareBody.safeParse(await c.req.json().catch(() => null));
+      if (!body.success) return c.json({ error: "body must be { email }" }, 400);
+      const email = normalizeEmail(body.data.email);
+      if (!isPlausibleEmail(email)) return c.json({ error: "not a plausible email address" }, 400);
+      // gate.userId is non-null by construction here (authed mode).
+      const added = await deskAccess.addShare(sessionId, email, gate.userId ?? "");
+      if (!added) return c.json({ error: "share limit reached for this session" }, 409);
+      return c.json({ email }, 201);
+    });
+
+    app.delete("/api/sessions/:sessionId/shares/:email", async (c) => {
+      const sessionId = c.req.param("sessionId");
+      const gate = await ownerGate(c, sessionId);
+      if (!gate.ok) return gate.res;
+      await deskAccess.removeShare(sessionId, normalizeEmail(c.req.param("email")));
+      return c.body(null, 204);
+    });
+  }
 
   // ---- control plane (WSS) --------------------------------------------------
   // RFC §4.1: desk connects via /session/{uuid}, recorders via /join/{uuid}.
@@ -262,6 +505,42 @@ export async function createServer(config: ServerConfig = loadConfig()) {
   // binary Yjs sync + awareness frames, persisted per session. Transport
   // control stays on the signaling socket — see collab/index.ts header.
   app.use("/session/:sessionId/collab", joinRateLimit);
+  if (access && clerkAuth) {
+    const deskAccess = access;
+    const verify = clerkAuth;
+    // W8-A: collab is desk surface. The Yjs wire has no hello/welcome
+    // handshake to carry a token (binary sync frames from byte 0), and a
+    // browser WebSocket can't set headers — so the token rides a query
+    // param and the gate REJECTS THE UPGRADE, before the collab room (and
+    // its doc hydration from Postgres) can even be looked up. Query
+    // strings never reach the request log (c.req.path is pathname-only).
+    // Or-create like the signaling hello: collab may win the race with the
+    // desk's first hello on a fresh session — both claim, one wins, same
+    // owner either way (single-user opener).
+    app.use("/session/:sessionId/collab", async (c, next) => {
+      const token = c.req.query("auth_token");
+      const user = token ? await verify.verifyToken(token) : null;
+      if (!user) return c.json({ error: "authentication required" }, 401);
+      const sessionId = c.req.param("sessionId");
+      if (!UUID_SHAPE.test(sessionId)) return c.json({ error: "unknown session" }, 404);
+      const denied = await deskAccess
+        .authorizeOrCreate(sessionId, user.userId)
+        .then((d) => !d.ok)
+        .catch((error: unknown) => {
+          if (error instanceof AccessDeniedError) return true;
+          throw error;
+        });
+      if (denied) {
+        log.warn("collab connection refused: no desk access", {
+          sessionId,
+          userId: user.userId,
+        });
+        return c.json({ error: "no desk access to this session" }, 403);
+      }
+      await next();
+      return undefined;
+    });
+  }
   app.get(
     "/session/:sessionId/collab",
     upgradeWebSocket((c: { req: { param(name: "sessionId"): string } }) => {

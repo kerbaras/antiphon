@@ -58,7 +58,14 @@ export function InvitePopover({
         aria-label="Invite performers"
         className="absolute top-[calc(100%+6px)] right-0 z-[20] w-[236px] rounded-lg border border-edge-card bg-card p-3 shadow-[0_10px_28px_rgba(0,0,0,.55)]"
       >
-        <SectionLabel className="pb-2">Invite performers</SectionLabel>
+        <SectionLabel className="pb-1">Invite performers</SectionLabel>
+        {/* Capability copy (W8-A): this popover hands out the MIC side of
+            the session — deliberately distinct from desk-access sharing
+            (the Share button, accounts by email). True in both auth modes:
+            mic join is public by link (RFC §12). */}
+        <p className="pb-2 font-mono text-[9px] leading-relaxed text-text-faint">
+          joins as a microphone — anyone with this link can sing, no account needed
+        </p>
         <StyledQr value={joinUrl} className="w-full" />
         <p className="mt-2 break-all font-mono text-[9px] leading-relaxed text-text-dim">
           {joinUrl}

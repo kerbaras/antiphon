@@ -4,6 +4,7 @@
 import { encode_flac_mono, init as initWasm } from "@antiphon/core-wasm";
 import { DEFAULT_CHIRP_SPEC } from "@antiphon/protocol";
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { authFetch } from "../../net/auth-token";
 import { type CollabClient, getCollab } from "../../net/collab";
 import {
   type ClipRegion,
@@ -761,7 +762,9 @@ export function useSessionAttribution(
     let cancelled = false;
     const fetchAttribution = async () => {
       try {
-        const res = await fetch(`/api/sessions/${sessionId}`);
+        // authFetch: desk REST is owner/sharee-gated in auth mode (W8-A);
+        // keyless sends a bare fetch exactly as before.
+        const res = await authFetch(`/api/sessions/${sessionId}`);
         if (cancelled) return;
         if (res.ok) {
           const payload = (await res.json()) as SessionSummaryPayload;
@@ -1029,7 +1032,7 @@ export function useServerStatus(
       for (const takeId of pending) {
         if (signal.aborted) return; // stale generation: no further requests
         try {
-          const res = await fetch(`/api/sessions/${sessionId}/takes/${takeId}`, { signal });
+          const res = await authFetch(`/api/sessions/${sessionId}/takes/${takeId}`, { signal });
           if (!res.ok) continue; // not archived yet (or gone): retry next tick
           const body = (await res.json()) as { streams: ServerStreamStatus[] };
           for (const s of body.streams) updates.set(s.streamId, s);

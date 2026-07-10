@@ -22,6 +22,10 @@ export default defineConfig({
   projects: [
     {
       name: "chromium",
+      // live-clerk is env-gated and NOT part of the default suite: it
+      // boots its own auth-enabled server (real Clerk keys) and would be
+      // 100% skips here anyway.
+      testIgnore: /live-clerk\.spec\.ts/,
       use: {
         ...devices["Desktop Chrome"],
         // Fake mic (sine tone) so capture-path tests run headless in CI.
@@ -39,6 +43,22 @@ export default defineConfig({
       name: "mobile-safari",
       testMatch: /(smoke|qr)\.spec\.ts/,
       use: { ...devices["iPhone 15"] },
+    },
+    // W8-A live-Clerk journey against the real dev instance: run with
+    //   CLERK_SECRET_KEY=… CLERK_PUBLISHABLE_KEY=… \
+    //     pnpm exec playwright test --project=live-clerk
+    // Self-skips without keys (so a bare `playwright test` stays green in
+    // CI); never in --project=chromium runs. Fake mic: the journey proves
+    // an accountless phone can record into an auth-gated session.
+    {
+      name: "live-clerk",
+      testMatch: /live-clerk\.spec\.ts/,
+      use: {
+        ...devices["Desktop Chrome"],
+        launchOptions: {
+          args: ["--use-fake-device-for-media-stream", "--use-fake-ui-for-media-stream"],
+        },
+      },
     },
   ],
   webServer: [
@@ -73,6 +93,15 @@ export default defineConfig({
         // limiter has its own coverage in hardening.integration.test.ts.
         JOIN_RATE_PER_MIN: "6000",
         JOIN_RATE_BURST: "1000",
+        // KEYLESS PIN (W8-A): the server boots with --env-file-if-exists,
+        // and a developer worktree's apps/server/.env can carry REAL Clerk
+        // keys — which would flip auth ON and fail the whole keyless
+        // suite. Explicit empty strings win over the env file (Node:
+        // environment beats --env-file) and read as unset (config.ts), so
+        // this suite is deterministically keyless everywhere. Auth runs
+        // live in the separate env-gated live-clerk project only.
+        CLERK_SECRET_KEY: "",
+        CLERK_PUBLISHABLE_KEY: "",
       },
     },
   ],

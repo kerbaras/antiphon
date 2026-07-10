@@ -15,7 +15,8 @@
       "!**/.turbo",
       "!**/playwright-report",
       "!**/test-results",
-      "!docs"
+      "!docs",
+      "!.agents"
     ]
   },
   "css": {

@@ -12,7 +12,7 @@ import {
 import { serve } from "@hono/node-server";
 import nodeDataChannel from "node-datachannel";
 import type { ServerConfig } from "../src/config.ts";
-import { createServer } from "../src/index.ts";
+import { createServer, type ServerOptions } from "../src/index.ts";
 
 const { PeerConnection } = nodeDataChannel;
 
@@ -24,6 +24,12 @@ export interface TestServer {
   /** The live collab hub — lets suites assert on in-memory room residency
    * (idle eviction) without widening the HTTP surface. */
   collab: Awaited<ReturnType<typeof createServer>>["collab"];
+  /** The live archive — the authz suite seeds takes/streams through it
+   * (W8-A) rather than widening the HTTP surface. */
+  archive: Awaited<ReturnType<typeof createServer>>["archive"];
+  /** The live signaling hub — the authz suite asserts a refused desk
+   * attaches zero room state (sessionBusy stays false). */
+  signaling: Awaited<ReturnType<typeof createServer>>["signaling"];
   stop(): Promise<void>;
 }
 
@@ -41,6 +47,11 @@ export type TestConfigOverrides = {
   /** Full blob config override (e.g. the s3 driver against local MinIO);
    * defaults to the fs driver rooted at `blobRoot`. */
   blob?: ServerConfig["blob"];
+  /** W8-A: auth-mode config; default null = keyless (every existing suite
+   * keeps today's open surface). Pair with `clerkAuth` to mock Clerk. */
+  auth?: ServerConfig["auth"];
+  /** Injected token verifier / user directory (see ServerOptions). */
+  clerkAuth?: ServerOptions["clerkAuth"];
 };
 
 export async function startTestServer(
@@ -48,39 +59,45 @@ export async function startTestServer(
   blobRoot: string,
   overrides: TestConfigOverrides = {},
 ): Promise<TestServer> {
-  const { app, injectWebSocket, collab, close } = await createServer({
-    databaseUrl: dbUrl,
-    blob: overrides.blob ?? { driver: "fs", root: blobRoot },
-    port: 0,
-    logLevel: overrides.logLevel ?? "error",
-    corsOrigins: null,
-    trustProxy: false,
-    limits: {
-      joinRatePerMin: 6_000,
-      joinBurst: 1_000,
-      msgRatePerSec: 1_000,
-      msgBurst: 2_000,
-      maxPeersPerSession: 32,
-      maxActiveSessions: 200,
-      ...overrides.limits,
+  const { app, injectWebSocket, collab, archive, signaling, close } = await createServer(
+    {
+      databaseUrl: dbUrl,
+      blob: overrides.blob ?? { driver: "fs", root: blobRoot },
+      port: 0,
+      logLevel: overrides.logLevel ?? "error",
+      corsOrigins: null,
+      trustProxy: false,
+      limits: {
+        joinRatePerMin: 6_000,
+        joinBurst: 1_000,
+        msgRatePerSec: 1_000,
+        msgBurst: 2_000,
+        maxPeersPerSession: 32,
+        maxActiveSessions: 200,
+        ...overrides.limits,
+      },
+      retention: {
+        sessionTtlHours: 720,
+        sweepIntervalMs: 600_000,
+        ...overrides.retention,
+      },
+      collab: {
+        idleEvictMs: 900_000,
+        ...overrides.collab,
+      },
+      auth: overrides.auth ?? null,
+      webrtcPublicIp: overrides.webrtcPublicIp ?? null,
     },
-    retention: {
-      sessionTtlHours: 720,
-      sweepIntervalMs: 600_000,
-      ...overrides.retention,
-    },
-    collab: {
-      idleEvictMs: 900_000,
-      ...overrides.collab,
-    },
-    webrtcPublicIp: overrides.webrtcPublicIp ?? null,
-  });
+    overrides.clerkAuth ? { clerkAuth: overrides.clerkAuth } : {},
+  );
   return await new Promise((resolve) => {
     const server = serve({ fetch: app.fetch, port: 0 }, (info) => {
       resolve({
         port: info.port,
         baseUrl: `http://localhost:${info.port}`,
         collab,
+        archive,
+        signaling,
         stop: async () => {
           await close();
           // Sever WS upgrade sockets too, or close() waits forever.

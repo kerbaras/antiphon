@@ -1,14 +1,20 @@
 import { BrowserRouter, Route, Routes } from "react-router";
 import { CapabilityGate } from "./capability-gate";
 import { DeskRoute } from "./routes/desk";
+import { DeskAccessGate } from "./routes/desk/access-gate";
 import { HomeRoute } from "./routes/home";
 import { JoinRoute } from "./routes/join";
 
 // Audio-bearing routes sit behind the capability gate (COOP/COEP →
 // SharedArrayBuffer, AudioWorklet); the landing page renders anywhere.
+// The desk additionally sits behind the W8-A access gate (owner/sharee in
+// auth mode; pass-through keyless) — the join route NEVER does: mic join
+// is a public bearer capability (RFC §12).
 const desk = (
   <CapabilityGate>
-    <DeskRoute />
+    <DeskAccessGate>
+      <DeskRoute />
+    </DeskAccessGate>
   </CapabilityGate>
 );
 const join = (

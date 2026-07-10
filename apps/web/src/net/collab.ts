@@ -28,6 +28,7 @@
 
 import { Awareness, applyAwarenessUpdate, encodeAwarenessUpdate } from "y-protocols/awareness";
 import * as Y from "yjs";
+import { authToken } from "./auth-token";
 
 const MSG_SYNC_STEP1 = 0;
 const MSG_UPDATE = 1;
@@ -122,8 +123,22 @@ export class CollabClient {
 
   connect(): void {
     if (this.closed) return;
-    const proto = location.protocol === "https:" ? "wss" : "ws";
-    const ws = new WebSocket(`${proto}://${location.host}/session/${this.sessionId}/collab`);
+    // W8-A: collab is desk surface. The Yjs wire has no message-level
+    // handshake to carry a token, so it rides an `auth_token` query param
+    // and the server judges the UPGRADE. Keyless resolves null → today's
+    // bare URL byte-for-byte. A rejected upgrade lands in the ordinary
+    // close/backoff path: the desk shows "offline" while the signaling
+    // socket's fatal `unauthorized` carries the honest message.
+    void authToken().then((token) => {
+      if (this.closed) return;
+      const proto = location.protocol === "https:" ? "wss" : "ws";
+      const query = token ? `?auth_token=${encodeURIComponent(token)}` : "";
+      this.open(`${proto}://${location.host}/session/${this.sessionId}/collab${query}`);
+    });
+  }
+
+  private open(url: string): void {
+    const ws = new WebSocket(url);
     ws.binaryType = "arraybuffer";
     this.ws = ws;
     ws.addEventListener("open", () => {
