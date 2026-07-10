@@ -15,14 +15,19 @@
 //     lands in the shared doc's regions map;
 //   · everything — boxes and doc lists — survives a desk reload;
 //   · recording disables the tool (auto-revert + inert C + disabled button);
-//   · Delete on a piece stages the WHOLE stream and the confirm says so;
-//   · re-align over a selection holding a split PIECE (W7-A × W7-B, PM
-//     decision): the piece's whole stream enters the align scope, its
-//     region structure/positions AND its frozen pre-split arrange key
-//     survive untouched (the stream is dragged BEFORE splitting so the
-//     frozen key exists — QA seam hardening), only never-split clips'
-//     manual moves reset — and the chip note counts exactly those
-//     ("1 clip", never "2").
+//   · Delete is a PROJECTION edit (W9-F): no dialog, the clip leaves the
+//     arrangement while the raw audio stays archived (an emptied stream
+//     reads present-and-empty); Ctrl+Z / Ctrl+Shift+Z walk the ledger;
+//     Shift+Delete stays the durable rows+blobs path behind the F2 confirm;
+//   · re-align over a selection holding a split PIECE (W7-A × W7-B seam,
+//     REVISED by W9-E): the piece's whole stream enters the align scope;
+//     its CUTS (ids, source windows) survive untouched but its pieces
+//     snap back to source-true positions (take slot + source offset) —
+//     piece positions are manual moves like any drag, and that reset is
+//     exactly what lines the waveforms up. The frozen pre-split arrange
+//     key still survives (old desks' view must not move; the stream is
+//     dragged BEFORE splitting so the frozen key exists — QA seam
+//     hardening) and the chip note counts every clip that moved.
 //
 // The audible half — a fresh split playing seamlessly across its boundary,
 // and render parity — lives in split-playback.spec.ts (it needs the
@@ -33,7 +38,13 @@ import os from "node:os";
 import path from "node:path";
 import { expect, type Page, test } from "@playwright/test";
 import { clipLefts, sineWav } from "./helpers/align";
-import { expectTakeConverged, joinAsRecorder, startTake, stopTake } from "./helpers/session";
+import {
+  expectTakeConverged,
+  joinAsRecorder,
+  serverTakeStreams,
+  startTake,
+  stopTake,
+} from "./helpers/session";
 
 const PX_PER_SEC = 24; // default zoom
 const SAMPLE_RATE = 48_000;
@@ -371,18 +382,57 @@ test.describe("split tool — activation, geometry, persistence (W7-B)", () => {
       ).toBeLessThan(1);
     }
 
-    // --- Delete on a piece stages the WHOLE stream, and the copy says so ------
+    // --- Delete is a PROJECTION edit (W9-F): no dialog, Ctrl+Z restores -------
+    // Clips are windows onto the raw audio; plain Delete only removes the
+    // window. (The old durable-by-default rule read as a bug at the desk.)
+    const beforeDeleteRegions = await uiRegions(desk);
     await desk.locator(`[data-clip="${bTailId}"]`).click();
     await expect(desk.locator(`[data-clip="${bTailId}"]`)).toHaveAttribute("data-selected", "true");
     await desk.keyboard.press("Delete");
-    const dialog = desk.getByRole("alertdialog");
-    await expect(dialog).toBeVisible();
-    await expect(dialog.locator("[data-split-whole]")).toContainText(
-      "deletes the whole lane's audio for that take, not just the selected part",
-    );
-    await desk.keyboard.press("Escape"); // cancel — nothing destroyed
-    await expect(dialog).not.toBeVisible();
-    expect(await desk.locator("[data-clip]").count()).toBe(5);
+    // No confirm dialog — the piece leaves the arrangement immediately…
+    await expect(desk.getByRole("alertdialog")).toHaveCount(0);
+    await expect.poll(async () => await desk.locator("[data-clip]").count()).toBe(4);
+    const afterPieceDelete = await uiRegions(desk);
+    expect(afterPieceDelete[streamB]).toHaveLength(1);
+    expect((afterPieceDelete[streamB] as UiRegion[])[0]?.id).toBe(streamB);
+    expect(afterPieceDelete[streamA]).toHaveLength(3);
+    // …and the raw audio is untouched: the server still holds the stream.
+    expect(
+      (await serverTakeStreams(desk, sessionId, takeId)).some((s) => s.streamId === streamB),
+      "stream B still archived after a clip delete",
+    ).toBe(true);
+
+    // Ctrl/Cmd+Z walks the ledger back EXACTLY; Ctrl/Cmd+Shift+Z replays.
+    await desk.keyboard.press("ControlOrMeta+z");
+    await expect.poll(async () => await desk.locator("[data-clip]").count()).toBe(5);
+    expect(await uiRegions(desk)).toEqual(beforeDeleteRegions);
+    await desk.keyboard.press("ControlOrMeta+Shift+z");
+    await expect.poll(async () => await desk.locator("[data-clip]").count()).toBe(4);
+
+    // Deleting a stream's LAST clip leaves the honest empty projection —
+    // present-and-empty in the doc (never "absent", which would resurrect
+    // the whole clip), lane + archive stay, undo brings it back.
+    await desk.locator(`[data-clip="${streamB}"]`).click();
+    await desk.keyboard.press("Delete");
+    await expect.poll(async () => await desk.locator("[data-clip]").count()).toBe(3);
+    expect((await uiRegions(desk))[streamB]).toEqual([]);
+    expect(
+      (await serverTakeStreams(desk, sessionId, takeId)).some((s) => s.streamId === streamB),
+      "stream B still archived with zero clips",
+    ).toBe(true);
+    await desk.keyboard.press("ControlOrMeta+z");
+    await expect.poll(async () => await desk.locator("[data-clip]").count()).toBe(4);
+
+    // --- Shift+Delete stays the DURABLE path, behind the F2 confirm -----------
+    // (undo can't restore blobs, so THIS one keeps its dialog.)
+    await desk.locator(`[data-clip="${streamB}"]`).click();
+    await desk.keyboard.press("Shift+Delete");
+    const durableDialog = desk.getByRole("alertdialog");
+    await expect(durableDialog).toBeVisible();
+    await expect(durableDialog.getByText("server rows and blobs", { exact: false })).toBeVisible();
+    await desk.keyboard.press("Escape"); // cancel — keep the lane for the seam test
+    await expect(durableDialog).not.toBeVisible();
+    expect(await desk.locator("[data-clip]").count()).toBe(4);
 
     // --- recording disables the tool -------------------------------------------
     await desk.keyboard.press("c");
@@ -397,12 +447,15 @@ test.describe("split tool — activation, geometry, persistence (W7-B)", () => {
     await stopTake(desk);
     await expect(desk.locator('[data-tool="split"]')).toBeEnabled({ timeout: 15_000 });
 
-    // --- re-align preserves split regions (W7-A × W7-B, the PM decision) ------
-    // A split is deliberate arrangement work: a forced re-align must reset
-    // manual arrange moves on NEVER-SPLIT streams only — split streams keep
-    // their region structure and positions untouched (realignment still
-    // applies to them as schedule/drawing compositions, never region
-    // mutations) — and the chip note counts ONLY the clips actually reset.
+    // --- re-align resets split PIECES to source-true spots (W9-E) -------------
+    // The W7-A×W7-B "positions preserved" parking read as a bug at the
+    // desk (operator report: pieces never lined their waveforms up), so a
+    // forced re-align now treats piece positions like any manual move:
+    // every scoped piece returns to take slot + source offset — the same
+    // zero a never-split clip returns to — while the CUTS (ids, source
+    // windows) stay byte-identical and the frozen legacy arrange key
+    // survives (old desks' pre-split view must not move). The chip note
+    // counts every clip that actually moved.
     await expectTakeConverged(desk, sessionId, take2Id, 2, { timeoutMs: 90_000 });
     await expectTakeLoaded(desk, take2Id, 2); // latest complete auto-loads
     const alignButton = desk.getByRole("button", { name: "Auto-align" });
@@ -443,16 +496,34 @@ test.describe("split tool — activation, geometry, persistence (W7-B)", () => {
       }, tid);
     const take1RecordAtBefore = await recordAt(takeId);
     await alignButton.click();
-    // The chip note counts ONLY the reset clip — the split stream
-    // contributed nothing to the reset ("1 clip", never "2": stream A also
-    // holds an arrange key, the FROZEN pre-split one, and it is exempt).
-    await expect(desk.getByTestId("align-note")).toHaveText("manual offsets reset · 1 clip");
-    // The never-split clip's override cleared; the split stream's region
-    // structure and positions are byte-identical; A's frozen arrange key
-    // survives at its pre-split value (deleting it would move the clip on
-    // OLD desks' pre-split view — the PM decision's compat half).
+    // The chip note counts every clip that moved: the never-split take-2
+    // override (1) plus stream A's three pieces, all seeded off the
+    // pre-split +1 s drag and now snapped back by exactly that second.
+    await expect(desk.getByTestId("align-note")).toHaveText("manual offsets reset · 4 clips");
+    // The never-split clip's override cleared; stream A's pieces keep
+    // their CUTS (ids + source windows byte-identical) but sit at
+    // source-true positions; A's frozen arrange key survives at its
+    // pre-split value (deleting it would move the clip on OLD desks'
+    // pre-split view — the compat half of the old decision, kept);
+    // stream B was NOT in scope, so its region holds its spot.
+    const expectRealignedRegions = (regions: Record<string, UiRegion[]>) => {
+      const cutsOf = (list: UiRegion[] | undefined) =>
+        (list ?? []).map(({ id, sourceOffsetSec, durationSec }) => ({
+          id,
+          sourceOffsetSec,
+          durationSec,
+        }));
+      expect(cutsOf(regions[streamA])).toEqual(cutsOf(regionsBefore[streamA]));
+      for (const r of regions[streamA] ?? []) {
+        expect(r.startSec, `piece ${r.id} at source-true spot`).toBeCloseTo(
+          TAKE_BASE_SEC + r.sourceOffsetSec,
+          6,
+        );
+      }
+      expect(regions[streamB]).toEqual(regionsBefore[streamB]);
+    };
     await expect.poll(async () => await overrideOf(take2StreamId)).toBeNull();
-    expect(await uiRegions(desk)).toEqual(regionsBefore);
+    expectRealignedRegions(await uiRegions(desk));
     expect(await overrideOf(streamA)).toBeCloseTo(aBase, 6);
     // Selecting the PIECE put its whole take in the align scope: take 1's
     // persisted record re-measures (fresh `at` stamp) — the region→stream
@@ -461,9 +532,9 @@ test.describe("split tool — activation, geometry, persistence (W7-B)", () => {
       .poll(async () => (await recordAt(takeId)) > take1RecordAtBefore, { timeout: 120_000 })
       .toBe(true);
     // Let the two-take flow settle before teardown (button re-enables);
-    // regions AND the frozen key hold through the whole flow.
+    // the reset layout AND the frozen key hold through the whole flow.
     await expect(alignButton).toBeEnabled({ timeout: 120_000 });
-    expect(await uiRegions(desk)).toEqual(regionsBefore);
+    expectRealignedRegions(await uiRegions(desk));
     expect(await overrideOf(streamA)).toBeCloseTo(aBase, 6);
 
     await phoneA.close();

@@ -27,6 +27,9 @@ export interface TrackRow {
   name: string;
   color: string;
   peerInitials: string;
+  /** Account profile picture (A16): live roster first, archive fallback —
+   * covers the initials disc wherever the lane shows a face. */
+  avatarUrl: string | null;
   peerLabel: string | null;
   streams: DeskStreamStatus[];
   receiving: boolean;

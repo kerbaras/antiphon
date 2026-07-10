@@ -22,6 +22,8 @@ export interface SessionSummaryPayload {
     userAgent: string;
     label: string | null;
     deviceId: string | null;
+    /** Account profile picture (A16); absent from pre-A16 servers. */
+    avatarUrl?: string | null;
     joinedAt: string;
   }>;
 }
@@ -32,6 +34,8 @@ export interface ArchivedPeer {
   userAgent: string;
   label: string | null;
   deviceId: string | null;
+  /** Account profile picture (A16). */
+  avatarUrl: string | null;
   /** Join time (epoch ms) — the F8 canonical lane-order key; null when the
    * archive's timestamp doesn't parse. */
   joinedAtMs: number | null;
@@ -87,6 +91,7 @@ export function buildAttribution(payload: SessionSummaryPayload): SessionAttribu
       userAgent: p.userAgent,
       label: p.label,
       deviceId: p.deviceId,
+      avatarUrl: p.avatarUrl ?? null,
       joinedAtMs: Number.isFinite(joinedAtMs) ? joinedAtMs : null,
     });
   }

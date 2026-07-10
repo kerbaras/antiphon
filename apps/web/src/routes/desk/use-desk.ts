@@ -92,8 +92,8 @@ export interface DeskUiMirror {
   clipStarts: Record<string, number>;
   /** Split streams' doc-held region lists (W7-B); never-split absent. */
   regions: Record<string, ClipRegion[]>;
-  /** Active editing tool (W7-B). */
-  tool: "select" | "split";
+  /** Active editing tool (W7-B; trim W9-F). */
+  tool: "select" | "split" | "trim";
   playheadSec: number | null;
   selectedTakeId: string | null;
   /** Recording-time master bus estimate (sum of live track peaks). */
@@ -131,13 +131,15 @@ export function getDeskSession(sessionId: string): DeskSession {
     // Server-confirmed deletions: evict every local trace outside the
     // sink store (the session already told the worker), including the
     // shared doc's arrangement overrides and split regions (W7-B) for the
-    // removed clips.
+    // removed clips. systemOrigin: cleanup after a DURABLE delete must
+    // never enter the undo ledger (W9-F) — Ctrl+Z can't restore blobs, so
+    // it must not resurrect their doc keys either.
     session.onStreamsDeleted((streamIds) => {
       for (const id of streamIds) waveformCache.delete(id);
       getPlayer().removeTracks(streamIds);
       const collab = getDeskCollab(sessionId);
-      deleteArrangeKeys(collab.doc, streamIds, collab.origin);
-      deleteRegionKeys(collab.doc, streamIds, collab.origin);
+      deleteArrangeKeys(collab.doc, streamIds, collab.systemOrigin);
+      deleteRegionKeys(collab.doc, streamIds, collab.systemOrigin);
     });
     session.start();
     (globalThis as Record<string, unknown>).__antiphonDesk = {

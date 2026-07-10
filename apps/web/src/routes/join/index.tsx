@@ -6,8 +6,10 @@
 import { useEffect, useState } from "react";
 import { useParams } from "react-router";
 import { randomId } from "../../audio/capture-controller";
+import { useAuthUser } from "../../auth/use-auth-user";
 import { getNickname, NICKNAME_MAX_LENGTH, normalizeNickname } from "../../net/device-identity";
 import {
+  Avatar,
   Badge,
   Button,
   InsetDisplay,
@@ -413,11 +415,18 @@ function SessionNotFound({ sessionId }: { sessionId: string }) {
 
 /** Nickname display + edit (A13). Persisted on the phone, prefilled on
  * return visits, sent on hello, live-renameable while connected. A desk
- * rename lands here too (`deskLabel` mirrors the session's view of us). */
+ * rename lands here too (`deskLabel` mirrors the session's view of us).
+ * Signed-in and unnamed (A16): the account email is the working default —
+ * exactly what the hello sends — and the account pfp fronts the panel so
+ * the performer sees the face their lane will wear. */
 function PerformerPanel({ deskLabel }: { deskLabel: string | null }) {
+  const me = useAuthUser();
   const [name, setName] = useState(() => getNickname() ?? "");
   const [draft, setDraft] = useState<string | null>(null); // null = not editing
   const editing = draft !== null;
+  // The name the desk actually sees: explicit nickname, else the signed-in
+  // email (the hello's A16 default), else unnamed.
+  const effectiveName = name || me?.email || "";
 
   // Adopt desk-initiated renames unless the user is mid-edit.
   useEffect(() => {
@@ -455,7 +464,7 @@ function PerformerPanel({ deskLabel }: { deskLabel: string | null }) {
             autoFocus
             value={draft}
             maxLength={NICKNAME_MAX_LENGTH}
-            placeholder="Your name"
+            placeholder={me?.email ?? "Your name"}
             onChange={(e) => setDraft(e.target.value)}
             onKeyDown={(e) => {
               if (e.key === "Enter") commit();
@@ -469,22 +478,29 @@ function PerformerPanel({ deskLabel }: { deskLabel: string | null }) {
         </div>
       ) : (
         <button type="button" onClick={() => setDraft(name)} className="mt-2.5 block w-full">
-          <InsetDisplay className="flex items-baseline justify-between px-3 py-1.5">
-            <span
-              className={`truncate font-mono text-[15px] font-semibold tracking-[0.5px] ${
-                name ? "text-text-hi" : "text-text-faint"
-              }`}
-            >
-              {name || "unnamed performer"}
-            </span>
-            <span className="ml-3 flex-none font-mono text-[9px] text-text-faint">
-              {name ? "tap to edit" : "tap to set"}
-            </span>
-          </InsetDisplay>
+          <div className="flex items-center gap-2">
+            {me?.imageUrl && (
+              <Avatar initials="" color="var(--color-card-hi)" imageUrl={me.imageUrl} />
+            )}
+            <InsetDisplay className="flex min-w-0 flex-1 items-baseline justify-between px-3 py-1.5">
+              <span
+                className={`truncate font-mono text-[15px] font-semibold tracking-[0.5px] ${
+                  effectiveName ? "text-text-hi" : "text-text-faint"
+                }`}
+              >
+                {effectiveName || "unnamed performer"}
+              </span>
+              <span className="ml-3 flex-none font-mono text-[9px] text-text-faint">
+                {name ? "tap to edit" : "tap to set"}
+              </span>
+            </InsetDisplay>
+          </div>
         </button>
       )}
       <p className="mt-2 text-[10px] leading-relaxed text-text-faint">
-        Names this phone's track on the desk. Saved for next time.
+        {!name && me?.email
+          ? "Your account email names this phone's track on the desk — tap to use a stage name instead."
+          : "Names this phone's track on the desk. Saved for next time."}
       </p>
     </Panel>
   );

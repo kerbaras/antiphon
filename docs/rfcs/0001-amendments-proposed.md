@@ -208,3 +208,31 @@ room claims a rolling take forever (blocking session expiry), and a
 stale un-stopped row from an earlier crash would resurrect as active on
 every boot. The desk re-asserting only what it knows is rolling is
 simpler and strictly safer under never-lose-audio.
+
+## A15. Desk authentication rides the hello (`hello.authToken`) — extends §12
+
+Browsers cannot set WebSocket headers, so the desk's Clerk session JWT
+is carried IN the hello message (`authToken`, ≤ 8192 chars). A server
+running with auth enabled MUST judge a desk hello by it BEFORE any
+session state attaches (no room, no ingest init, no peer entry, no
+doc); refusal is the fatal `unauthorized` error. Recorder hellos never
+carry it — mic join stays a public bearer capability (§12). Absent in
+keyless mode; old servers strip the unknown field (zod object schemas
+are non-strict), old desks never send it. The collab socket, which has
+no message-level handshake (binary Yjs frames from byte 0), carries the
+same token as an `auth_token` query parameter judged at the upgrade.
+
+## A16. Account profile picture (`deviceInfo.avatarUrl`) — extends A12/A13
+
+Signed-in endpoints MAY self-report their account's profile picture URL
+in `hello.deviceInfo.avatarUrl` (https only, ≤ 512 chars — schema-
+enforced; the desk renders it in an `<img>` under COEP `require-corp`,
+so hosts without CORP headers degrade to the initials disc). Display-
+only denorm with `label`'s exact semantics: a non-empty hello value
+wins, a silent reconnect keeps the stored one, and the server persists
+it on the peer row so archived lanes keep their face after the peer
+disconnects. Deliberately NOT verified against the account system —
+like `label` it is self-description, never authority; anything
+security-relevant must key off the A15 token, not this. The desk's
+embedded room-mic recorder (W2-D) deliberately never sends one: that
+lane is hardware, not a person. Old peers/servers strip the field.

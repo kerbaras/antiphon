@@ -29,6 +29,7 @@
 import { Awareness, applyAwarenessUpdate, encodeAwarenessUpdate } from "y-protocols/awareness";
 import * as Y from "yjs";
 import { authToken } from "./auth-token";
+import { createArrangementUndo } from "./collab-doc";
 
 const MSG_SYNC_STEP1 = 0;
 const MSG_UPDATE = 1;
@@ -36,6 +37,8 @@ const MSG_AWARENESS = 2;
 
 const RECONNECT_BASE_MS = 1_000;
 const RECONNECT_MAX_MS = 8_000;
+/** Upgrade answered within this or the attempt is aborted (see open()). */
+const HANDSHAKE_TIMEOUT_MS = 10_000;
 /** Outgoing doc updates coalesce into ≤ ~30 frames/s. */
 const UPDATE_FLUSH_MS = 33;
 /** Outgoing presence coalesces into ≤ ~5 frames/s. */
@@ -51,6 +54,8 @@ export interface PresenceState {
   name: string;
   /** Track-palette hex, derived from the clientID. */
   color: string;
+  /** Account profile picture (A16) — the top-bar face of a remote desk. */
+  avatarUrl: string | null;
   /** Ghost-cursor position on the shared arrangement timeline. */
   playheadSec: number | null;
   activeTakeId: string | null;
@@ -76,6 +81,13 @@ export class CollabClient {
   /** Transaction origin for every local write — the loop guard: updates
    * applied FROM the wire use REMOTE and are never relayed back. */
   readonly origin: object = {};
+  /** Origin for SYSTEM writes (server-confirmed deletion cleanup): synced
+   * to the wire like `origin`, but excluded from the undo ledger — Ctrl+Z
+   * must never resurrect doc keys for durably deleted streams. */
+  readonly systemOrigin: object = {};
+  /** Arrangement undo ledger (W9-F): this desk's own regions/arrange
+   * edits, undoable in gesture-sized steps. */
+  private readonly undoManager: Y.UndoManager;
   private static readonly REMOTE = "collab-remote";
 
   private ws: WebSocket | null = null;
@@ -97,6 +109,7 @@ export class CollabClient {
     this.sessionId = sessionId;
     this.awareness = new Awareness(this.doc);
     this.awareness.setLocalState(null); // published once the desk names itself
+    this.undoManager = createArrangementUndo(this.doc, this.origin);
     // Every local (non-wire) doc change goes out, coalesced.
     this.doc.on("update", (update: Uint8Array, origin: unknown) => {
       if (origin === CollabClient.REMOTE) return;
@@ -141,7 +154,16 @@ export class CollabClient {
     const ws = new WebSocket(url);
     ws.binaryType = "arraybuffer";
     this.ws = ws;
+    // Handshake deadline: a proxy that never answers the upgrade leaves
+    // the socket in CONNECTING forever, and the browser serializes ws
+    // handshakes per host (RFC 6455 §4.1) — one hung handshake would dam
+    // every later WebSocket to this origin (signaling, the desk-input
+    // recorder…). Abort into the ordinary close/backoff path instead.
+    const deadline = window.setTimeout(() => {
+      if (ws.readyState === WebSocket.CONNECTING) ws.close();
+    }, HANDSHAKE_TIMEOUT_MS);
     ws.addEventListener("open", () => {
+      window.clearTimeout(deadline);
       this.attempts = 0;
       this.setStatus("connected");
       // Full sync handshake: anything queued while offline is covered by
@@ -178,6 +200,7 @@ export class CollabClient {
       }
     });
     ws.addEventListener("close", () => {
+      window.clearTimeout(deadline);
       if (this.ws !== ws) return; // an old socket superseded by reconnect
       this.ws = null;
       this.setStatus("offline");
@@ -189,6 +212,26 @@ export class CollabClient {
     ws.addEventListener("error", () => ws.close());
   }
 
+  // ---- arrangement undo (W9-F) ------------------------------------------------
+
+  /** Undo the last local arrangement edit (split/drag/trim/delete/align
+   * reset). Returns whether anything was reverted. */
+  undoArrangement(): boolean {
+    return this.undoManager.undo() !== null;
+  }
+
+  /** Re-apply the last undone edit. */
+  redoArrangement(): boolean {
+    return this.undoManager.redo() !== null;
+  }
+
+  /** Seal the current undo step: called at the START of every gesture so a
+   * new edit never merges into the previous one (UNDO_CAPTURE_MS covers
+   * the writes WITHIN a gesture). */
+  sealUndo(): void {
+    this.undoManager.stopCapturing();
+  }
+
   // ---- presence -------------------------------------------------------------
 
   /** Merge fields into this desk's presence (missing fields default). */
@@ -196,6 +239,7 @@ export class CollabClient {
     const current = (this.awareness.getLocalState() as PresenceState | null) ?? {
       name: "Desk",
       color: "#c8c9cb",
+      avatarUrl: null,
       playheadSec: null,
       activeTakeId: null,
       editing: null,
@@ -235,6 +279,11 @@ export class CollabClient {
           clientId,
           name: typeof p.name === "string" && p.name ? p.name : "Desk",
           color: typeof p.color === "string" ? p.color : "#c8c9cb",
+          // https only — the same bound the A16 wire schema enforces.
+          avatarUrl:
+            typeof p.avatarUrl === "string" && p.avatarUrl.startsWith("https://")
+              ? p.avatarUrl
+              : null,
           playheadSec: typeof p.playheadSec === "number" ? p.playheadSec : null,
           activeTakeId: typeof p.activeTakeId === "string" ? p.activeTakeId : null,
           editing: typeof p.editing === "string" ? p.editing : null,

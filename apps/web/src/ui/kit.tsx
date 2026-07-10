@@ -4,7 +4,7 @@
 // circles with status dots, VU meters, hard-divider panels.
 
 import QRCode from "qrcode";
-import { type ReactNode, useMemo } from "react";
+import { type ReactNode, useMemo, useState } from "react";
 
 function cx(...parts: Array<string | false | null | undefined>): string {
   return parts.filter(Boolean).join(" ");
@@ -139,17 +139,39 @@ export function Button({
   );
 }
 
-/** Avatar circle with the reference's status dot. */
+/** Account profile picture covering an initials disc (A16). Renders OVER
+ * the initials, so a slow/failed load degrades to the disc that was
+ * always there. COEP note: img.clerk.com serves CORP (see
+ * auth/clerk-shell.tsx); any host that doesn't is refused by require-corp
+ * and lands in the same onError fallback. Parent must be `relative`. */
+export function AvatarImg({ src }: { src: string }) {
+  const [failed, setFailed] = useState(false);
+  if (failed) return null;
+  return (
+    <img
+      src={src}
+      alt=""
+      draggable={false}
+      onError={() => setFailed(true)}
+      className="absolute inset-0 size-full rounded-full object-cover"
+    />
+  );
+}
+
+/** Avatar circle with the reference's status dot. `imageUrl` (the account
+ * pfp, A16) covers the initials when present and loadable. */
 export function Avatar({
   initials,
   color,
   dot,
   size = 28,
+  imageUrl,
 }: {
   initials: string;
   color: string;
   dot?: string;
   size?: number;
+  imageUrl?: string | null;
 }) {
   return (
     <div
@@ -157,6 +179,7 @@ export function Avatar({
       style={{ width: size, height: size, background: color, fontSize: size * 0.36 }}
     >
       {initials}
+      {imageUrl && <AvatarImg src={imageUrl} />}
       {dot && (
         <div
           className="absolute -right-px -bottom-px rounded-full border-2 border-card-hi"

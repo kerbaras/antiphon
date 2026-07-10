@@ -71,6 +71,8 @@ export const peers = pgTable("peers", {
   label: text("label"),
   /** Stable browser identity (A12): (session, role, device) resumes this peer id. */
   deviceId: uuid("device_id"),
+  /** Account profile picture (A16) — display-only denorm, label's twin. */
+  avatarUrl: text("avatar_url"),
   joinedAt: timestamp("joined_at", { withTimezone: true }).notNull().defaultNow(),
 });
 

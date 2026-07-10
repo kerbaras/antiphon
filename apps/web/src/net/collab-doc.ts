@@ -186,6 +186,10 @@ export function deleteArrangeKeys(doc: Y.Doc, keys: string[], origin: unknown): 
 //     current `arrange` value baked into region startSecs). From then on the
 //     regions list is authoritative for new desks; the stream's `arrange`
 //     key is left as-is, frozen at its split-time value.
+//   · An EMPTY list is valid (W9-F): every clip of the stream was deleted
+//     from the ARRANGEMENT — a projection edit; the raw audio stays
+//     archived, the lane stays, undo restores the pieces. Distinct from an
+//     ABSENT entry (never-split → the implicit whole clip).
 //   · Old desks ignore this map entirely and keep reading `arrange`: they
 //     see the pre-split view (the whole clip at its last pre-split position)
 //     and can still play/export it — degraded to yesterday's truth, never a
@@ -218,14 +222,16 @@ export interface ClipRegion {
  * writable by any desk build, so a foreign/buggy value must never reach a
  * consumer — a non-array crashed .map()s, a garbage region defeated
  * planRegionSource's guards via NaN comparisons (source.start(NaN)
- * throws), an empty list scheduled zero sources (silent stream). The rule
- * is whole-list-or-nothing: any invalid piece invalidates the LIST, and an
- * invalid/empty list reads as ABSENT — the stream degrades to its
- * never-split view (all audio at the legacy arrange position, the same
- * yesterday's-truth degradation old desks live on). Never a partial subset:
- * dropping one garbage piece would silently lose its audio window. */
+ * throws). The rule is whole-list-or-nothing: any invalid piece
+ * invalidates the LIST, and an invalid list reads as ABSENT — the stream
+ * degrades to its never-split view (all audio at the legacy arrange
+ * position, the same yesterday's-truth degradation old desks live on).
+ * Never a partial subset: dropping one garbage piece would silently lose
+ * its audio window. An EMPTY array is VALID since W9-F — the deliberate
+ * "every clip deleted from the arrangement" state (zero sources by
+ * design, no longer a hostile shape). */
 function validRegionList(value: unknown): ClipRegion[] | null {
-  if (!Array.isArray(value) || value.length === 0) return null;
+  if (!Array.isArray(value)) return null;
   for (const region of value) {
     if (typeof region !== "object" || region === null) return null;
     const { id, startSec, sourceOffsetSec, durationSec } = region as Record<string, unknown>;
@@ -281,6 +287,28 @@ export function deleteRegionKeys(doc: Y.Doc, keys: string[], origin: unknown): v
   doc.transact(() => {
     for (const key of present) map.delete(key);
   }, origin);
+}
+
+// ---- arrangement undo ledger (W9-F) ---------------------------------------------
+
+/** How long consecutive tracked writes merge into ONE undo step: covers a
+ * drag/trim gesture's per-pointermove writes; distinct gestures also seal
+ * explicitly (CollabClient.sealUndo at gesture start). */
+export const UNDO_CAPTURE_MS = 500;
+
+/** The clip-arrangement undo ledger: an append-only stack over the
+ * `regions` + `arrange` maps (splits, drags, trims, clip deletes, align
+ * resets), tracking ONLY transactions carrying `origin` — this desk's own
+ * edits. Remote desks' edits (REMOTE origin) and system writes (the
+ * streams-deleted cleanup's own origin) never enter the stack, so undo can
+ * never revert someone else's work or resurrect doc keys for durably
+ * deleted streams. Raw audio is never in the doc, so every entry is
+ * trivially reversible — undo is a pure projection rollback. */
+export function createArrangementUndo(doc: Y.Doc, origin: unknown): Y.UndoManager {
+  return new Y.UndoManager([doc.getMap("regions"), doc.getMap("arrange")], {
+    trackedOrigins: new Set([origin]),
+    captureTimeout: UNDO_CAPTURE_MS,
+  });
 }
 
 // ---- markers / comments lists ---------------------------------------------------

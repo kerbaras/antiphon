@@ -5,6 +5,7 @@
 import type { PeerInfo } from "@antiphon/protocol";
 import { lazy, Suspense, useRef, useState } from "react";
 import { useAuthMode } from "../../auth/auth-root";
+import { useAuthUser } from "../../auth/use-auth-user";
 import type { DeskSessionState } from "../../net/desk-session";
 import { Wordmark } from "../../ui/kit";
 import { AvatarStack, InfoChip, Timecode, TransportButton, TransportGroup } from "./daw";
@@ -48,7 +49,7 @@ export function DeskTopBar({
   joinUrl: string;
   phones: PeerInfo[];
   /** Other desks in the room (W3-A presence) — real people, real avatars. */
-  remoteDesks: Array<{ clientId: number; name: string; color: string }>;
+  remoteDesks: Array<{ clientId: number; name: string; color: string; avatarUrl: string | null }>;
   deskInputLive: boolean;
   serverSync: DeskSessionState["serverSync"];
   rebuiltChunks: number;
@@ -71,6 +72,8 @@ export function DeskTopBar({
   // and the operator's account render as their own cluster beside it,
   // auth mode only — keyless top bars are unchanged.
   const authMode = useAuthMode();
+  // The operator's own face (A16): signed-in pfp over the DK disc.
+  const me = useAuthUser();
 
   return (
     // Left and right groups are equal flex shares (flex-1 basis-0), so at
@@ -186,19 +189,27 @@ export function DeskTopBar({
         <div className="relative">
           <AvatarStack
             people={[
-              { id: "you", initials: "DK", color: "#c8c9cb", title: "You (Desk)" },
+              {
+                id: "you",
+                initials: "DK",
+                color: "#c8c9cb",
+                title: "You (Desk)",
+                avatarUrl: me?.imageUrl ?? null,
+              },
               // Other desks co-editing this session (W3-A presence).
               ...remoteDesks.slice(0, 3).map((d) => ({
                 id: `desk-${d.clientId}`,
                 initials: initialsOf(d.name) ?? "D",
                 color: d.color,
                 title: `${d.name} (Desk)`,
+                avatarUrl: d.avatarUrl,
               })),
               ...phones.slice(0, 3).map((p, i) => ({
                 id: `phone-${p.peerId}`,
                 initials: initialsOf(p.deviceInfo.label) ?? p.peerId.slice(0, 2).toUpperCase(),
                 color: TRACK_COLORS[i % TRACK_COLORS.length] as string,
                 title: p.deviceInfo.label?.trim() || deviceName(p.deviceInfo.userAgent),
+                avatarUrl: p.deviceInfo.avatarUrl ?? null,
               })),
             ]}
             onAdd={() => setInviteOpen(!inviteOpen)}
@@ -207,6 +218,7 @@ export function DeskTopBar({
           />
           {inviteOpen && (
             <InvitePopover
+              sessionId={sessionId}
               joinUrl={joinUrl}
               onClose={(restoreFocus) => {
                 setInviteOpen(false);
@@ -217,7 +229,7 @@ export function DeskTopBar({
         </div>
         {authMode === "clerk" && (
           <Suspense fallback={null}>
-            <AccountCluster sessionId={sessionId} />
+            <AccountCluster />
           </Suspense>
         )}
         <ExportMenu {...exportMenu} />

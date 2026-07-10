@@ -100,6 +100,7 @@ export class Archive {
     userAgent: string;
     label: string | null;
     deviceId: string | null;
+    avatarUrl: string | null;
     joinedAt: Date;
   }): Promise<void> {
     await this.db
@@ -111,11 +112,17 @@ export class Archive {
         userAgent: peer.userAgent,
         label: peer.label,
         deviceId: peer.deviceId,
+        avatarUrl: peer.avatarUrl,
         joinedAt: peer.joinedAt,
       })
       .onConflictDoUpdate({
         target: schema.peers.id,
-        set: { userAgent: peer.userAgent, label: peer.label, deviceId: peer.deviceId },
+        set: {
+          userAgent: peer.userAgent,
+          label: peer.label,
+          deviceId: peer.deviceId,
+          avatarUrl: peer.avatarUrl,
+        },
       });
   }
 
@@ -416,6 +423,7 @@ export class Archive {
         userAgent: p.userAgent,
         label: p.label,
         deviceId: p.deviceId,
+        avatarUrl: p.avatarUrl,
         joinedAt: p.joinedAt,
       })),
     };

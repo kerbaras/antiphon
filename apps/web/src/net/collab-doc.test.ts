@@ -5,6 +5,7 @@
 import { describe, expect, it } from "vitest";
 import * as Y from "yjs";
 import {
+  createArrangementUndo,
   dedupeById,
   defaultMixStripState,
   deleteArrangeKeys,
@@ -166,8 +167,6 @@ describe("regions map (W7-B)", () => {
       map.set("stream-zero-dur", [{ id: "a", startSec: 0, sourceOffsetSec: 0, durationSec: 0 }]);
       map.set("stream-neg", [{ id: "a", startSec: -1, sourceOffsetSec: 0, durationSec: 1 }]);
       map.set("stream-bad-id", [{ id: 7, startSec: 0, sourceOffsetSec: 0, durationSec: 1 }]);
-      // (c) an empty list — zero source planners, a silently muted stream.
-      map.set("stream-empty", []);
       // Whole-list-or-nothing: one garbage piece invalidates the LIST
       // (a partial subset would silently lose that piece's audio window).
       map.set("stream-mixed", [region("stream-mixed", 1, 0, 4), {}]);
@@ -175,6 +174,14 @@ describe("regions map (W7-B)", () => {
     // Only the well-formed list survives; every probe reads as ABSENT —
     // those streams degrade to their never-split (whole-clip) view.
     expect(readRegions(doc)).toEqual({ "stream-ok": good });
+  });
+
+  it("an EMPTY list is a real state (W9-F): every clip deleted, audio archived", () => {
+    const doc = new Y.Doc();
+    writeStreamRegions(doc, "stream-1", [], LOCAL);
+    // Reads as PRESENT-and-empty — zero clips — never as absent (which
+    // would resurrect the never-split whole-clip view).
+    expect(readRegions(doc)).toEqual({ "stream-1": [] });
   });
 
   it("LWW per stream: concurrent splits converge on one whole list", () => {
@@ -197,6 +204,62 @@ describe("regions map (W7-B)", () => {
     expect([JSON.stringify(["stream-1", "rA"]), JSON.stringify(["stream-1", "rB"])]).toContain(
       JSON.stringify(winner?.map((r) => r.id)),
     );
+  });
+});
+
+describe("arrangement undo ledger (W9-F)", () => {
+  const region = (id: string, startSec: number, sourceOffsetSec: number, durationSec: number) => ({
+    id,
+    startSec,
+    sourceOffsetSec,
+    durationSec,
+  });
+
+  it("undo walks back regions+arrange edits; redo replays them", () => {
+    const doc = new Y.Doc();
+    const undo = createArrangementUndo(doc, LOCAL);
+    const seed = [region("s1", 1, 0, 10)];
+    const cut = [region("s1", 1, 0, 4), region("r2", 5, 4, 6)];
+
+    writeStreamRegions(doc, "s1", seed, LOCAL);
+    undo.stopCapturing(); // new gesture
+    writeStreamRegions(doc, "s1", cut, LOCAL);
+    undo.stopCapturing();
+    writeStreamRegions(doc, "s1", [], LOCAL); // delete every clip
+
+    expect(undo.undo()).not.toBeNull();
+    expect(readRegions(doc)).toEqual({ s1: cut });
+    expect(undo.undo()).not.toBeNull();
+    expect(readRegions(doc)).toEqual({ s1: seed });
+    expect(undo.redo()).not.toBeNull();
+    expect(readRegions(doc)).toEqual({ s1: cut });
+
+    undo.stopCapturing();
+    writeArrange(doc, { s2: 7.5 }, LOCAL);
+    expect(undo.undo()).not.toBeNull();
+    expect(readArrange(doc)).toEqual({});
+  });
+
+  it("consecutive writes within a gesture merge into ONE step (drag)", () => {
+    const doc = new Y.Doc();
+    const undo = createArrangementUndo(doc, LOCAL);
+    writeStreamRegions(doc, "s1", [region("s1", 1, 0, 10)], LOCAL);
+    undo.stopCapturing();
+    // A drag: many whole-list writes, no seal between them.
+    for (const x of [1.2, 1.5, 1.9, 2.4]) {
+      writeStreamRegions(doc, "s1", [region("s1", x, 0, 10)], LOCAL);
+    }
+    expect(undo.undo()).not.toBeNull();
+    expect(readRegions(doc).s1?.[0]?.startSec).toBe(1); // the pre-drag spot
+  });
+
+  it("remote and system edits never enter the ledger", () => {
+    const doc = new Y.Doc();
+    const undo = createArrangementUndo(doc, LOCAL);
+    writeStreamRegions(doc, "s1", [region("s1", 1, 0, 10)], REMOTE); // remote desk
+    deleteArrangeKeys(doc, ["s1"], "system"); // durable-delete cleanup
+    expect(undo.undo()).toBeNull();
+    expect(readRegions(doc)).toEqual({ s1: [region("s1", 1, 0, 10)] });
   });
 });
 

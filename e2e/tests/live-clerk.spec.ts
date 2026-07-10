@@ -227,6 +227,12 @@ test.describe
         })
         .toBe(true);
       expect(await ownerPage.evaluate(() => globalThis.crossOriginIsolated)).toBe(true);
+      // A16: the operator's own top-bar avatar wears the account pfp
+      // (img.clerk.com under COEP require-corp — a broken CORP story
+      // would fail this img and fall back to initials).
+      await expect(ownerPage.locator('div[title="You (Desk)"] img')).toBeVisible({
+        timeout: 15_000,
+      });
     });
 
     test("second user without a share is refused: gate screen, REST 403, WS unauthorized", async () => {
@@ -286,11 +292,20 @@ test.describe
       expect(verdict?.code).toBe("unauthorized");
     });
 
-    test("owner shares by email; the sharee's landing and desk both open", async () => {
+    test("owner shares by email from the merged '+' popover; the sharee's landing and desk both open", async () => {
       test.setTimeout(120_000);
-      await ownerPage.getByRole("button", { name: "Share", exact: true }).click();
-      const popover = ownerPage.getByRole("dialog", { name: "Desk access" });
+      // The old top-bar Share button is gone: desk access lives in the
+      // avatar-stack "+" popover, below the mic invite (one affordance,
+      // both capability classes).
+      await expect(ownerPage.getByRole("button", { name: "Share", exact: true })).toHaveCount(0);
+      await ownerPage.getByRole("button", { name: "Invite performer", exact: true }).click();
+      const popover = ownerPage.getByRole("dialog", { name: "Invite & access" });
       await expect(popover).toBeVisible();
+      // Both capability sections in the one card: the mic QR + link, and
+      // the desk-access management below it.
+      await expect(popover.locator('svg[aria-label="Join QR code"]')).toBeVisible();
+      await expect(popover.getByRole("button", { name: "Copy link" })).toBeVisible();
+      await expect(popover.getByText("Desk access")).toBeVisible();
       // Hostile-typist input on purpose: server normalizes to lowercase.
       await popover.getByLabel("Share desk access by email").fill(mate.email.toUpperCase());
       await popover.getByRole("button", { name: "Share" }).click();
@@ -313,11 +328,13 @@ test.describe
           timeout: 45_000,
         })
         .toBe(true);
-      // …but share management stays owner-only.
-      await matePage.getByRole("button", { name: "Share", exact: true }).click();
+      // …but share management stays owner-only (the sharee's "+" popover
+      // says so instead of showing the form).
+      await matePage.getByRole("button", { name: "Invite performer", exact: true }).click();
       await expect(
         matePage.getByText("Only the session owner can manage desk access", { exact: false }),
       ).toBeVisible({ timeout: 10_000 });
+      await expect(matePage.getByLabel("Share desk access by email")).toHaveCount(0);
       await matePage.keyboard.press("Escape");
     });
 
@@ -328,6 +345,25 @@ test.describe
       await expect(listPage.getByText("Your sessions")).toBeVisible({ timeout: 20_000 });
       await expect(listPage.getByTitle(`Open desk ${sessionId}`)).toBeVisible({ timeout: 20_000 });
       await listPage.close();
+    });
+
+    test("a SIGNED-IN mic join defaults its lane to the account email and wears the pfp (A16)", async () => {
+      test.setTimeout(120_000);
+      // Same context as the owner: the join page sees the signed-in user.
+      const joinPage = await ownerCtx.newPage();
+      await joinPage.goto(`${origin}/join/${sessionId}`);
+      // No nickname configured → the working name is the account email…
+      await expect(joinPage.getByText(owner.email)).toBeVisible({ timeout: 20_000 });
+      await enableMicAndWait(joinPage);
+      // …and the desk lane adopts it, wearing the account pfp on its chip
+      // and in the top-bar stack.
+      const laneHeader = ownerPage.locator("[data-lane-header]").first();
+      await expect(laneHeader).toContainText(owner.email.slice(0, 12), { timeout: 20_000 });
+      await expect(laneHeader.locator("img").first()).toBeVisible({ timeout: 15_000 });
+      await expect(ownerPage.locator(`div[title="${owner.email}"] img`)).toBeVisible({
+        timeout: 15_000,
+      });
+      await joinPage.close();
     });
 
     test("mic join needs no account and stays cross-origin isolated", async ({ browser }) => {
@@ -352,8 +388,8 @@ test.describe
 
     test("revoke bites on the sharee's next request", async () => {
       test.setTimeout(120_000);
-      await ownerPage.getByRole("button", { name: "Share", exact: true }).click();
-      const popover = ownerPage.getByRole("dialog", { name: "Desk access" });
+      await ownerPage.getByRole("button", { name: "Invite performer", exact: true }).click();
+      const popover = ownerPage.getByRole("dialog", { name: "Invite & access" });
       await popover.getByRole("button", { name: `Revoke desk access for ${mate.email}` }).click();
       await expect(popover.getByText(mate.email)).toHaveCount(0, { timeout: 10_000 });
       await ownerPage.keyboard.press("Escape");

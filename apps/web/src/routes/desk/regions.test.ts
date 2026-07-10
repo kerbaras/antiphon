@@ -9,6 +9,7 @@ import {
   seedRegion,
   selectionStreamIds,
   splitRegion,
+  trimRegion,
 } from "./regions";
 
 describe("seedRegion", () => {
@@ -82,6 +83,82 @@ describe("selectionStreamIds", () => {
   });
 });
 
+describe("trimRegion (W9-F)", () => {
+  // Windows: [1..4), gap (4..5), [5..8) of a 10 s stream — the gap is the
+  // deleted material an edge drag can re-open.
+  const list = [
+    { id: "a", startSec: 2, sourceOffsetSec: 1, durationSec: 3 },
+    { id: "b", startSec: 7, sourceOffsetSec: 5, durationSec: 3 },
+  ];
+
+  it("tail trim shortens; the untrimmed head holds its spot", () => {
+    const out = trimRegion(list, "a", "tail", -1, 10);
+    expect(out?.find((r) => r.id === "a")).toEqual({
+      id: "a",
+      startSec: 2,
+      sourceOffsetSec: 1,
+      durationSec: 2,
+    });
+    expect(out?.find((r) => r.id === "b")).toEqual(list[1]); // sibling untouched
+  });
+
+  it("tail extend re-opens hidden audio, clamped at the next window", () => {
+    // +5 wants source end 9, but b starts at 5 → clamps to +1.
+    const out = trimRegion(list, "a", "tail", 5, 10);
+    expect(out?.find((r) => r.id === "a")?.durationSec).toBeCloseTo(4, 9);
+    // The LAST region's tail is clamped by the stream end instead.
+    const tail = trimRegion(list, "b", "tail", 99, 10);
+    expect(tail?.find((r) => r.id === "b")?.durationSec).toBeCloseTo(5, 9); // 5..10
+  });
+
+  it("head trim moves start with source offset (material holds position)", () => {
+    const out = trimRegion(list, "a", "head", 1, 10);
+    expect(out?.find((r) => r.id === "a")).toEqual({
+      id: "a",
+      startSec: 3,
+      sourceOffsetSec: 2,
+      durationSec: 2,
+    });
+  });
+
+  it("head extend clamps at the previous window's end and at source 0", () => {
+    // b's head can only reach a's end (source 4): -3 wants source 2 → -1.
+    const out = trimRegion(list, "b", "head", -3, 10);
+    expect(out?.find((r) => r.id === "b")).toEqual({
+      id: "b",
+      startSec: 6,
+      sourceOffsetSec: 4,
+      durationSec: 4,
+    });
+    // a's head clamps at source 0.
+    const first = trimRegion(list, "a", "head", -99, 10);
+    expect(first?.find((r) => r.id === "a")?.sourceOffsetSec).toBe(0);
+    // …and never past its own startSec 0 (arrangement floor).
+    const nearZero = [{ id: "z", startSec: 0.5, sourceOffsetSec: 5, durationSec: 2 }];
+    expect(trimRegion(nearZero, "z", "head", -3, 10)?.[0]?.startSec).toBeCloseTo(0, 9);
+  });
+
+  it("keeps the 100 ms floor and rejects unknown ids", () => {
+    const out = trimRegion(list, "a", "tail", -99, 10);
+    expect(out?.find((r) => r.id === "a")?.durationSec).toBeCloseTo(MIN_REGION_SEC, 9);
+    const head = trimRegion(list, "a", "head", 99, 10);
+    expect(head?.find((r) => r.id === "a")?.durationSec).toBeCloseTo(MIN_REGION_SEC, 9);
+    expect(trimRegion(list, "nope", "tail", 1, 10)).toBeNull();
+  });
+
+  it("every clamped result satisfies the stored-list invariants", () => {
+    for (const edge of ["head", "tail"] as const) {
+      for (const d of [-99, -1, -0.05, 0.05, 1, 99]) {
+        for (const id of ["a", "b"]) {
+          const out = trimRegion(list, id, edge, d, 10);
+          expect(out, `${edge} ${id} ${d}`).not.toBeNull();
+          expect(regionsValid(out as [], 10), `${edge} ${id} ${d} valid`).toBe(true);
+        }
+      }
+    }
+  });
+});
+
 describe("regionsValid", () => {
   it("accepts a fresh split of a valid seed", () => {
     const out = splitRegion([seedRegion("s1", 1, 10)], "s1", 4) as [];
@@ -107,7 +184,8 @@ describe("regionsValid", () => {
     expect(regionsValid([{ id: "a", startSec: -1, sourceOffsetSec: 0, durationSec: 5 }], 10)).toBe(
       false,
     );
-    expect(regionsValid([], 10)).toBe(false);
+    // Empty is VALID (W9-F): every clip deleted from the arrangement.
+    expect(regionsValid([], 10)).toBe(true);
   });
 
   it("allows arrangement-domain overlap — stacked pieces BOTH sound, like overlapped whole clips (source stays disjoint)", () => {

@@ -5,6 +5,7 @@
 
 import { type ReactNode, type Ref, useEffect, useRef, useState } from "react";
 import { NICKNAME_MAX_LENGTH } from "../../net/device-identity";
+import { AvatarImg } from "../../ui/kit";
 import {
   EQ_DB_RANGE,
   EQ_MID_HZ_DEFAULT,
@@ -112,8 +113,14 @@ export function AvatarStack({
   addExpanded,
 }: {
   /** `id` is the stable identity (titles may repeat: two desks both named
-   * "Desk"). */
-  people: Array<{ id: string; initials: string; color: string; title: string }>;
+   * "Desk"). `avatarUrl` (account pfp, A16) covers the initials disc. */
+  people: Array<{
+    id: string;
+    initials: string;
+    color: string;
+    title: string;
+    avatarUrl?: string | null;
+  }>;
   onAdd?: () => void;
   /** The "+" anchors the invite popover (W4-D): the opener owns the
    * aria-expanded state and gets the element so Esc can hand focus back. */
@@ -129,13 +136,14 @@ export function AvatarStack({
           key={p.id}
           title={p.title}
           className={cx(
-            "hidden size-[26px] place-items-center rounded-full border-2 border-panel min-[640px]:grid",
+            "relative hidden size-[26px] place-items-center rounded-full border-2 border-panel min-[640px]:grid",
             "text-[9.5px] font-bold text-void",
             i > 0 && "-ml-[7px]",
           )}
           style={{ background: p.color }}
         >
           {p.initials}
+          {p.avatarUrl && <AvatarImg src={p.avatarUrl} />}
         </div>
       ))}
       <button
@@ -165,16 +173,16 @@ function SoonChip() {
 }
 
 const INERT_TOOLS: Array<{ name: string; key: string }> = [
-  { name: "Trim", key: "T" },
   { name: "Stretch", key: "R" },
   { name: "Fade", key: "F" },
   { name: "Align", key: "A" },
 ];
 
-/** The desk's active editing tool (W7-B): Select is the pointer contract
+/** The desk's active editing tool: Select is the pointer contract
  * everything was built on (clip click / marquee / drag / seek); Split
- * turns the pointer into the blade. */
-export type DeskTool = "select" | "split";
+ * turns the pointer into the blade (W7-B); Trim grabs a clip's nearest
+ * edge to shorten or re-extend its window (W9-F). */
+export type DeskTool = "select" | "split" | "trim";
 
 /** Editing tool group. Select and Split are LIVE now (W7-B) — real tool
  * state, prototype styling verbatim: the active tool wears the accent with
@@ -199,7 +207,10 @@ export type DeskTool = "select" | "split";
  * AND ~11px short right at the view-tabs return (860-871), and the hints
  * are the pair's lowest-information pixels. 900 clears the second squeeze
  * with margin (the sweep caught BOTH — third and fourth time the
- * arithmetic lied). */
+ * arithmetic lied). W9-F's third live tool (Trim) cost the chip ~40px at
+ * every tier through 1023 (the sweep caught 700, 860, then 900 — fifth
+ * through seventh time the arithmetic lied): the marker/comment button
+ * LABELS shed below 1024 (toolbar.tsx) — icons + titles + aria stay. */
 export function ToolGroup({
   tool,
   onTool,
@@ -207,8 +218,9 @@ export function ToolGroup({
 }: {
   tool: DeskTool;
   onTool: (tool: DeskTool) => void;
-  /** Recording: the blade is meaningless over a rolling take — honest
-   * disable (the C shortcut is inert too, and take-start auto-reverts). */
+  /** Recording: the blade/edges are meaningless over a rolling take —
+   * honest disable (the C/T shortcuts are inert too, and take-start
+   * auto-reverts). */
   splitDisabled?: boolean;
 }) {
   const LIVE_TOOLS: Array<{ id: DeskTool; name: string; key: string; title: string }> = [
@@ -220,6 +232,14 @@ export function ToolGroup({
       title: splitDisabled
         ? "Split is unavailable while recording"
         : "Split tool (C) — click a clip to cut it there; click the ruler or bare timeline to cut every lane. V or Escape returns to Select.",
+    },
+    {
+      id: "trim",
+      name: "Trim",
+      key: "T",
+      title: splitDisabled
+        ? "Trim is unavailable while recording"
+        : "Trim tool (T) — drag a clip's nearest edge to shorten it or re-extend hidden audio. V or Escape returns to Select.",
     },
   ];
   return (
@@ -233,7 +253,7 @@ export function ToolGroup({
             data-tool={t.id}
             aria-pressed={active}
             title={t.title}
-            disabled={t.id === "split" && (splitDisabled ?? false)}
+            disabled={t.id !== "select" && (splitDisabled ?? false)}
             onClick={() => onTool(t.id)}
             className={cx(
               "flex items-center gap-1.5 rounded px-2.5 py-1 text-[11px] font-semibold transition-colors",
@@ -399,6 +419,9 @@ export interface ClipModel {
   /** Split tool active (W7-B): the box wears the blade cursor (grab
    * suppressed) and a press means "cut here", not select/drag. */
   splitting?: boolean;
+  /** Trim tool active (W9-F): the box wears the resize cursor and a press
+   * grabs the nearest edge instead of selecting/dragging. */
+  trimming?: boolean;
   /** "incomplete" (F9) is TERMINAL: an A6-truncated stream that will never
    * finish syncing — distinct from the transient "syncing". */
   badge: "rec" | "converged" | "syncing" | "aligned" | "incomplete" | null;
@@ -475,12 +498,13 @@ export function ClipCard({ clip }: { clip: ClipModel }) {
   // Split mode (W7-B): the blade cursor replaces grab on splittable boxes —
   // an F9 orphan is honestly not-allowed (unsplittable, like the tool's
   // click guard); the style attr wins over any cursor class, exactly the
-  // precedence the surface's own blade cursor relies on.
+  // precedence the surface's own blade cursor relies on. Trim mode (W9-F)
+  // wears the resize cursor under the same rules.
   const splitCursor =
-    clip.splitting === true
+    clip.splitting === true || clip.trimming === true
       ? clip.badge === "incomplete"
         ? { cursor: "not-allowed" }
-        : { cursor: SPLIT_CURSOR }
+        : { cursor: clip.trimming === true ? "ew-resize" : SPLIT_CURSOR }
       : {};
   return (
     <button
@@ -503,8 +527,8 @@ export function ClipCard({ clip }: { clip: ClipModel }) {
         // under all timeline overlays (marker guides/ghosts z-[3],
         // playhead z-[4], marquee/headers z-[5]).
         clip.badge === "incomplete" ? "z-0" : "z-[1]",
-        // Split mode (W7-B) suppresses grab — the blade style below rules.
-        clip.onPointerDown && clip.splitting !== true
+        // Split/Trim modes suppress grab — the style attr below rules.
+        clip.onPointerDown && clip.splitting !== true && clip.trimming !== true
           ? "cursor-grab active:cursor-grabbing"
           : "cursor-default",
         clip.selected && "shadow-[0_0_0_1px_var(--color-accent)]",

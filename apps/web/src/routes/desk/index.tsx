@@ -14,6 +14,7 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useParams } from "react-router";
 import type { DeskStreamStatus } from "../../audio/sink-worker-protocol";
+import { useAuthUser } from "../../auth/use-auth-user";
 import { type ClipRegion, deleteArrangeKeys } from "../../net/collab-doc";
 import { downloadStreamFlac } from "../../net/stream-download";
 import { recordRecentSession } from "../home/recent-sessions";
@@ -32,7 +33,14 @@ import type { MidiLaneModel } from "./midi-lane";
 import { MixerDock } from "./mixer-dock";
 import { PerformersPanel } from "./performers-panel";
 import type { DriftResult } from "./player";
-import { regionsValid, seedRegion, selectionStreamIds, splitRegion } from "./regions";
+import {
+  regionsValid,
+  seedRegion,
+  selectionStreamIds,
+  splitRegion,
+  type TrimEdge,
+  trimRegion,
+} from "./regions";
 import { type RailTab, RailTabs } from "./right-rail";
 import { SinksPanel } from "./sinks-panel";
 import { SongsPanel } from "./songs-panel";
@@ -142,7 +150,7 @@ function Desk({ sessionId }: { sessionId: string }) {
   // take (the toolbar button and the C shortcut are disabled alongside).
   const [tool, setTool] = useState<DeskTool>("select");
   useEffect(() => {
-    if (recording && tool === "split") setTool("select");
+    if (recording && tool !== "select") setTool("select");
   }, [recording, tool]);
   const recorders = (state.session?.peers ?? []).filter((p) => p.role === "recorder");
   // The desk's own input joins as a recorder peer (W2-D); it gets a lane
@@ -269,6 +277,9 @@ function Desk({ sessionId }: { sessionId: string }) {
         peerInitials:
           initialsOf(nickname) ??
           (attributed ? key : (streams[0]?.streamId ?? key)).slice(0, 2).toUpperCase(),
+        // Account pfp (A16): live roster first, archive fallback (F1) — so
+        // a lane keeps its face after the phone disconnects.
+        avatarUrl: peer?.deviceInfo.avatarUrl ?? archived?.avatarUrl ?? null,
         // The chip keeps the device provenance even when a nickname rules
         // the lane title ("Maria" · chip "iPhone"; the desk input · "Desk").
         peerLabel:
@@ -504,11 +515,17 @@ function Desk({ sessionId }: { sessionId: string }) {
 
   /** A stream's arrangement start: leftmost region for split streams, the
    * legacy override ?? take slot otherwise. The one "where does this
-   * stream's audio begin" rule every consumer below shares. */
+   * stream's audio begin" rule every consumer below shares. A stream whose
+   * every clip was deleted (empty doc list, W9-F) has NO start — +Infinity,
+   * so it can never win a leftmost-of-take reduction (callers filter). */
   const streamStartSec = useCallback(
     (streamId: string, takeId: string): number => {
       const regions = docRegions[streamId];
-      if (regions && regions.length > 0) return Math.min(...regions.map((r) => r.startSec));
+      if (regions) {
+        return regions.length > 0
+          ? Math.min(...regions.map((r) => r.startSec))
+          : Number.POSITIVE_INFINITY;
+      }
       return clipStartOverrides[streamId] ?? takes.get(takeId)?.offsetSec ?? 0;
     },
     [docRegions, clipStartOverrides, takes],
@@ -522,7 +539,8 @@ function Desk({ sessionId }: { sessionId: string }) {
     if (!selectedTakeId) return 0;
     const starts = state.deskStatus
       .filter((s) => s.takeId === selectedTakeId)
-      .map((s) => streamStartSec(s.streamId, selectedTakeId));
+      .map((s) => streamStartSec(s.streamId, selectedTakeId))
+      .filter((s) => Number.isFinite(s));
     return starts.length > 0 ? Math.min(...starts) : 0;
   }, [selectedTakeId, state.deskStatus, streamStartSec]);
   // ---- THE W6-B × W6-C composition invariant (W7-A: every take) --------------
@@ -721,9 +739,11 @@ function Desk({ sessionId }: { sessionId: string }) {
 
   // ---- timeline editing: selection, marquee, clip drag ---------------------
   const [selection, setSelection] = useState<string[]>([]);
-  // Deletion staged behind the confirm dialog (F2): Delete/Backspace only
-  // STAGES refs here; the durable streams-delete fires from the dialog's
-  // explicit confirm. Escape/cancel drops the stage, selection preserved.
+  // DURABLE deletion staged behind the confirm dialog (F2): only the
+  // destructive paths stage here — Shift+Delete and the lane menu, both
+  // destroying whole recordings (rows + blobs; undo can't reach those).
+  // Plain Delete became a projection edit (W9-F) and never stages.
+  // Escape/cancel drops the stage, selection preserved.
   const [pendingDelete, setPendingDelete] = useState<Array<{
     takeId: string;
     streamId: string;
@@ -769,7 +789,9 @@ function Desk({ sessionId }: { sessionId: string }) {
   const streamRegionsOf = (stream: DeskStreamStatus): StreamRegions => {
     const streamDurationSec = Math.max(stream.totalSamples / SAMPLE_RATE, 1);
     const doc = docRegions[stream.streamId];
-    if (doc && doc.length > 0) return { regions: doc, split: true, streamDurationSec };
+    // An EMPTY doc list is a real state (W9-F): every clip deleted from
+    // the arrangement — zero boxes, zero sources, audio archived.
+    if (doc) return { regions: doc, split: true, streamDurationSec };
     return {
       regions: [
         seedRegion(
@@ -873,6 +895,7 @@ function Desk({ sessionId }: { sessionId: string }) {
           durationSec: region.durationSec,
           live: false,
           splitting: tool === "split",
+          trimming: tool === "trim",
           badge,
           // Split pieces draw their SLICE of the stream waveform; the
           // unsplit seed keeps the verbatim array (zero-change parity).
@@ -882,9 +905,10 @@ function Desk({ sessionId }: { sessionId: string }) {
           onPointerDown: (e: React.PointerEvent) => onClipPointerDown(e, region.id),
           // Loading a take is an EXPLICIT action (QA E3): selection
           // (click/marquee) must not switch what the player has loaded —
-          // double-click does. The blade suspends it: a split's two
-          // clicks must never double up into a take switch.
-          ...(tool === "split" ? {} : { onDoubleClick: () => setPickedTakeId(stream.takeId) }),
+          // double-click does. The blade suspends it (a split's two
+          // clicks must never double up into a take switch), and so do
+          // trim edge-grabs (W9-F).
+          ...(tool === "select" ? { onDoubleClick: () => setPickedTakeId(stream.takeId) } : {}),
         }),
       );
     }),
@@ -986,6 +1010,7 @@ function Desk({ sessionId }: { sessionId: string }) {
    * the align-shift visual composition exactly like click-to-seek — the
    * cut lands where the operator sees the hairline over each waveform. */
   function splitAllAt(contentSec: number): void {
+    collab.sealUndo(); // an all-lanes cut is its own undo step (W9-F)
     const byStream = new Map<
       string,
       { takeId: string; cuts: Array<{ regionId: string; atSourceSec: number }> }
@@ -1022,7 +1047,45 @@ function Desk({ sessionId }: { sessionId: string }) {
     if (tool === "split") {
       const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
       const atSourceSec = entry.region.sourceOffsetSec + (e.clientX - rect.left) / pxPerSec;
+      collab.sealUndo(); // a cut is its own undo step (W9-F)
       cutStream(entry.streamId, entry.takeId, [{ regionId, atSourceSec }]);
+      return;
+    }
+    if (tool === "trim") {
+      // TRIM (W9-F): grab the NEAREST edge of the pressed clip and drag it.
+      // Clips are projections — the edge re-opens audio a cut/trim hid, or
+      // hides more; trimRegion clamps to the source window, the 100 ms
+      // floor, and sibling windows. Same eligibility as the blade.
+      if (!entry.splittable) return;
+      const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+      const edge: TrimEdge = e.clientX - rect.left < rect.width / 2 ? "head" : "tail";
+      // Never-split streams seed their implicit region on first trim (the
+      // split tool's exact seeding rule).
+      const base = entry.split
+        ? (docRegions[entry.streamId] ?? [])
+        : [
+            seedRegion(
+              entry.streamId,
+              clipStartSec(entry.streamId, entry.takeId),
+              entry.streamDurationSec,
+            ),
+          ];
+      collab.sealUndo(); // one trim gesture = one undo step
+      const originX = e.clientX;
+      const move = (ev: PointerEvent) => {
+        if (Math.abs(ev.clientX - originX) < 2) return;
+        const deltaSec = (ev.clientX - originX) / pxPerSec;
+        const next = trimRegion(base, regionId, edge, deltaSec, entry.streamDurationSec);
+        if (next && regionsValid(next, entry.streamDurationSec)) {
+          writeStreamRegionsMap(entry.streamId, next);
+        }
+      };
+      const up = () => {
+        window.removeEventListener("pointermove", move);
+        window.removeEventListener("pointerup", up);
+      };
+      window.addEventListener("pointermove", move);
+      window.addEventListener("pointerup", up);
       return;
     }
     if (e.shiftKey || e.metaKey || e.ctrlKey) {
@@ -1033,6 +1096,7 @@ function Desk({ sessionId }: { sessionId: string }) {
     }
     const dragIds = selection.includes(regionId) ? selection : [regionId];
     if (!selection.includes(regionId)) setSelection([regionId]);
+    collab.sealUndo(); // one clip-drag gesture = one undo step (W9-F)
     const originX = e.clientX;
     // Snapshot the down-state: legacy starts for never-split streams (the
     // arrange write path, wire-compat), whole region lists for split ones
@@ -1197,13 +1261,25 @@ function Desk({ sessionId }: { sessionId: string }) {
           ? selectedLaneKey
           : null;
       if (e.key === "Escape") {
-        // Escape exits the Split tool first (W7-B) — the blade is the
+        // Escape exits Split/Trim first (W7-B/W9-F) — a live tool is the
         // most-modal thing on screen; a second Escape clears the lane.
-        if (tool === "split") {
+        if (tool !== "select") {
           setTool("select");
           return;
         }
         setSelectedLaneKey(null);
+        return;
+      }
+      // Ctrl/Cmd+Z: undo the last arrangement edit; +Shift redoes (W9-F).
+      // Clips are projections of the raw audio, so the ledger walk is a
+      // pure doc rollback — nothing durable is ever at stake. Inert while
+      // a take rolls (arrangement edits are, too).
+      if (e.code === "KeyZ" && (e.metaKey || e.ctrlKey) && !e.altKey) {
+        e.preventDefault();
+        if (recording) return;
+        const collabClient = getDeskCollab(sessionId);
+        if (e.shiftKey) collabClient.redoArrangement();
+        else collabClient.undoArrangement();
         return;
       }
       if (e.code === "Space") {
@@ -1238,6 +1314,12 @@ function Desk({ sessionId }: { sessionId: string }) {
         if (!recording) setTool("split");
         return;
       }
+      // T: activate the TRIM tool (W9-F) — edge drags trim/extend clips.
+      // Inert while recording, like the blade.
+      if (e.code === "KeyT" && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        if (!recording) setTool("trim");
+        return;
+      }
       // V: back to the Select tool (W7-B).
       if (e.code === "KeyV" && !e.metaKey && !e.ctrlKey && !e.altKey) {
         setTool("select");
@@ -1255,16 +1337,47 @@ function Desk({ sessionId }: { sessionId: string }) {
       }
       if ((e.code === "Delete" || e.code === "Backspace") && selection.length > 0) {
         e.preventDefault();
-        // Selection holds REGION ids (W7-B); deletion stays STREAM-level —
-        // any selected piece stages its whole stream (the confirm dialog
-        // says so when a split stream is among them). The same resolver
-        // scopes selection-aware auto-align (W7-A × W7-B).
-        const streamIds = new Set(selectionStreamIds(selection, docRegions));
-        const refs = state.deskStatus
-          .filter((s) => streamIds.has(s.streamId) && s.takeId !== state.activeTakeId)
-          .map((s) => ({ takeId: s.takeId, streamId: s.streamId }));
-        if (refs.length === 0) return;
-        setPendingDelete(refs);
+        // Selection holds REGION ids (W7-B). Plain Delete is a PROJECTION
+        // edit (W9-F): the selected clips leave the arrangement by doc
+        // write — raw audio untouched, no confirm dialog, Ctrl+Z brings
+        // them back. A never-split clip's delete writes the EMPTY list
+        // (zero clips, lane + archive stay). Shift+Delete is the durable
+        // path: it stages the selected clips' WHOLE recordings for the
+        // confirmed server delete (rows + blobs — undo can't reach those,
+        // so the F2 dialog stays). The rolling take is untouchable.
+        if (e.shiftKey) {
+          const refs: Array<{ takeId: string; streamId: string }> = [];
+          for (const id of selection) {
+            const streamId = selectionStreamIds([id], docRegions)[0] ?? id;
+            const stream = state.deskStatus.find((s) => s.streamId === streamId);
+            if (!stream || stream.takeId === state.activeTakeId) continue;
+            if (!refs.some((r) => r.streamId === streamId)) {
+              refs.push({ takeId: stream.takeId, streamId });
+            }
+          }
+          if (refs.length === 0) return;
+          setPendingDelete(refs);
+          return;
+        }
+        const byStream = new Map<string, Set<string>>();
+        for (const id of selection) {
+          const streamId = selectionStreamIds([id], docRegions)[0] ?? id;
+          const stream = state.deskStatus.find((s) => s.streamId === streamId);
+          if (!stream || stream.takeId === state.activeTakeId) continue;
+          const bucket = byStream.get(streamId) ?? new Set();
+          bucket.add(id);
+          byStream.set(streamId, bucket);
+        }
+        if (byStream.size === 0) return;
+        const collabClient = getDeskCollab(sessionId);
+        collabClient.sealUndo(); // one Delete press = one undo step
+        for (const [streamId, ids] of byStream) {
+          const doc = docRegions[streamId];
+          // Never-split: its one implicit clip IS the stream → empty list.
+          const next = doc ? doc.filter((r) => !ids.has(r.id)) : [];
+          writeStreamRegionsMap(streamId, next);
+        }
+        setSelection([]);
       }
     };
     window.addEventListener("keydown", onKey);
@@ -1281,15 +1394,16 @@ function Desk({ sessionId }: { sessionId: string }) {
     menuRow,
     tool,
     docRegions,
+    writeStreamRegionsMap,
     state.deskStatus,
     state.activeTakeId,
     takeMarkers.addAt,
     takeLocalPlayhead,
   ]);
 
-  /** Confirmed deletion (F2): the existing server-authoritative protocol
-   * path, unchanged — local copies drop only on the streams-deleted
-   * confirm fanout. */
+  /** Confirmed DURABLE deletion (F2): the existing server-authoritative
+   * protocol path, unchanged — local copies drop only on the
+   * streams-deleted confirm fanout. */
   function confirmDelete() {
     if (!pendingDelete) return;
     getDeskSession(sessionId).deleteStreams(pendingDelete);
@@ -1302,22 +1416,23 @@ function Desk({ sessionId }: { sessionId: string }) {
     setPendingDelete(null);
   }
 
-  /** Any staged stream is split into regions (W7-B): the dialog carries
-   * the whole-lane honesty line — deletion is stream-level, a piece can't
-   * be destroyed without its siblings. */
+  /** Any staged recording that is SPLIT into pieces: the durable delete
+   * destroys every piece's audio, and the dialog says so. */
   const deleteSplitWhole = useMemo(
     () => (pendingDelete ?? []).some((ref) => (docRegions[ref.streamId]?.length ?? 0) > 1),
     [pendingDelete, docRegions],
   );
 
   /** What the staged deletion would destroy, spelled out for the dialog:
-   * clip counts per take, in timeline take order. */
+   * clip counts per take (a split recording destroys every piece — count
+   * them, lanes show pieces), in timeline take order. */
   const deleteSummary = useMemo((): DeleteSummaryTake[] => {
     if (!pendingDelete) return [];
     const order = [...takes.keys()];
     const counts = new Map<string, number>();
     for (const ref of pendingDelete) {
-      counts.set(ref.takeId, (counts.get(ref.takeId) ?? 0) + 1);
+      const pieces = docRegions[ref.streamId]?.length ?? 1;
+      counts.set(ref.takeId, (counts.get(ref.takeId) ?? 0) + Math.max(pieces, 1));
     }
     return [...counts.entries()]
       .sort(([a], [b]) => order.indexOf(a) - order.indexOf(b))
@@ -1325,7 +1440,7 @@ function Desk({ sessionId }: { sessionId: string }) {
         name: `Take ${order.indexOf(takeId) + 1}`,
         clipCount,
       }));
-  }, [pendingDelete, takes]);
+  }, [pendingDelete, takes, docRegions]);
 
   // ---- selection-aware auto-align (W7-A) -------------------------------------
   // The toolbar button forks on selection: none → force re-align the
@@ -1404,20 +1519,38 @@ function Desk({ sessionId }: { sessionId: string }) {
     // remeasured, and that is SAFE: the persisted verdict still draws AND
     // plays those clips aligned (align-flow.ts header).
     //
-    // SPLIT streams are exempt from the reset — PM decision (W7-A × W7-B):
-    // a split is deliberate arrangement work, and its region layout is the
-    // operator's edit, not a "manual move" re-align exists to undo. Their
-    // region structure (source windows AND positions) is preserved; their
-    // frozen legacy `arrange` key is preserved too (it is the OLD desks'
-    // pre-split view — deleting it would move the clip on old desks only).
-    // Realignment still fully applies to them: head-trims are schedule/
-    // drawing compositions OVER the regions, never region mutations. Only
-    // never-split streams get the override reset, and only those count in
-    // the chip note.
+    // SPLIT streams reset by REGION rewrite (W9-E, reversing the W7-A ×
+    // W7-B position parking after the operator hit it as a bug): their
+    // CUTS (source windows, piece identity) are the deliberate edit and
+    // stay untouched, but piece POSITIONS are manual moves like any drag
+    // — each piece returns to its source-true spot (take slot + source
+    // offset), the same zero a never-split clip returns to, so the fresh
+    // verdict lines every waveform up by construction. Their frozen
+    // legacy `arrange` key is still preserved (it is the OLD desks'
+    // pre-split view — deleting it would move the clip on old desks
+    // only). The chip note counts every clip that actually moved:
+    // never-split overrides and repositioned pieces alike.
     const scopedIds = scopes.flatMap((s) => s.streamIds);
     const resetIds = scopedIds.filter((id) => docRegions[id] === undefined);
-    const resetCount = resetIds.filter((id) => clipStartOverrides[id] !== undefined).length;
+    let resetCount = resetIds.filter((id) => clipStartOverrides[id] !== undefined).length;
+    collab.sealUndo(); // the whole align reset = one undo step (W9-F)
     deleteArrangeKeys(collab.doc, resetIds, collab.origin);
+    const EPS = 1e-9;
+    for (const scope of scopes) {
+      const base = takes.get(scope.takeId)?.offsetSec ?? 0;
+      for (const id of scope.streamIds) {
+        const regions = docRegions[id];
+        if (!regions) continue;
+        const next = regions.map((r) => ({ ...r, startSec: base + r.sourceOffsetSec }));
+        const moved = next.filter(
+          (r, i) => Math.abs(r.startSec - (regions[i] as ClipRegion).startSec) > EPS,
+        ).length;
+        if (moved > 0) {
+          writeStreamRegionsMap(id, next);
+          resetCount += moved;
+        }
+      }
+    }
     noteAlign(
       resetCount > 0
         ? `manual offsets reset · ${resetCount} clip${resetCount === 1 ? "" : "s"}`
@@ -1596,14 +1729,16 @@ function Desk({ sessionId }: { sessionId: string }) {
       // Split streams (W7-B) span their region layout — leftmost piece to
       // the last piece's end — through the same rule every other consumer
       // uses (streamStartSec); never-split streams keep the legacy
-      // override/slot + declared-length yardstick.
-      const starts = streams.map((s) => streamStartSec(s.streamId, takeId));
-      const ends = streams.map((s, i) => {
+      // override/slot + declared-length yardstick. Zero-clip streams
+      // (W9-F: streamStartSec = +Infinity) span nothing and drop out.
+      const starts = streams
+        .map((s) => streamStartSec(s.streamId, takeId))
+        .filter((s) => Number.isFinite(s));
+      if (starts.length === 0) continue;
+      const ends = streams.flatMap((s) => {
         const regions = docRegions[s.streamId];
-        if (regions && regions.length > 0) {
-          return Math.max(...regions.map((r) => r.startSec + r.durationSec));
-        }
-        return (starts[i] as number) + s.totalSamples / SAMPLE_RATE;
+        if (regions) return regions.map((r) => r.startSec + r.durationSec);
+        return [streamStartSec(s.streamId, takeId) + s.totalSamples / SAMPLE_RATE];
       });
       spans.push({
         startSec: Math.min(...starts),
@@ -1629,13 +1764,16 @@ function Desk({ sessionId }: { sessionId: string }) {
   // ---- presence (W3-A) -------------------------------------------------------
   // Publish who we are and where our playhead sits; read the other desks.
   // Name = the operator's comment-author pref (already user-editable in the
-  // comments panel); color keyed off the doc clientID into the track palette.
+  // comments panel); color keyed off the doc clientID into the track palette;
+  // face = the signed-in account's pfp (A16; null keyless/signed out).
+  const authUserIdentity = useAuthUser();
   useEffect(() => {
     collab.setPresence({
       name: commentAuthor,
       color: TRACK_COLORS[collab.doc.clientID % TRACK_COLORS.length] as string,
+      avatarUrl: authUserIdentity?.imageUrl ?? null,
     });
-  }, [collab, commentAuthor]);
+  }, [collab, commentAuthor, authUserIdentity]);
   // Ghost cursor position, coarse on purpose (0.25 s — a cursor, not a
   // clock): setPresence no-ops on equal state, the client throttles the wire.
   useEffect(() => {
@@ -2037,12 +2175,18 @@ function Desk({ sessionId }: { sessionId: string }) {
           canMoveDown={rows.indexOf(menuRow) < rows.length - 1}
           soloed={playerSnap.channels.find((c) => c.key === menuRow.key)?.soloed ?? false}
           muted={playerSnap.channels.find((c) => c.key === menuRow.key)?.muted ?? false}
-          deletableClipCount={menuRow.streams.filter((s) => s.takeId !== state.activeTakeId).length}
+          deletableClipCount={menuRow.streams
+            .filter((s) => s.takeId !== state.activeTakeId)
+            // A recording stays durably deletable even with zero visible
+            // clips (projection-deleted, W9-F): count at least 1 each.
+            .reduce((n, s) => n + Math.max(docRegions[s.streamId]?.length ?? 1, 1), 0)}
           onMoveUp={() => moveLane(menuRow.key, -1)}
           onMoveDown={() => moveLane(menuRow.key, 1)}
           onSolo={() => getPlayer().toggleChannelSolo(menuRow.key)}
           onMute={() => getPlayer().toggleChannelMute(menuRow.key)}
           onDelete={() => {
+            // Whole-lane durable destroy: every recording of the lane
+            // (rows + blobs) — stages behind the F2 confirm as always.
             const refs = menuRow.streams
               .filter((s) => s.takeId !== state.activeTakeId)
               .map((s) => ({ takeId: s.takeId, streamId: s.streamId }));
@@ -2055,7 +2199,7 @@ function Desk({ sessionId }: { sessionId: string }) {
       {pendingDelete && (
         <DeleteConfirm
           takes={deleteSummary}
-          clipCount={pendingDelete.length}
+          clipCount={deleteSummary.reduce((n, t) => n + t.clipCount, 0)}
           splitWhole={deleteSplitWhole}
           onConfirm={confirmDelete}
           onCancel={() => setPendingDelete(null)}

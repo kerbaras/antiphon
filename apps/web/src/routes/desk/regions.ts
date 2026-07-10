@@ -80,6 +80,76 @@ export function selectionStreamIds(
   return out;
 }
 
+/** Which end of a clip a trim gesture grabs (W9-F). */
+export type TrimEdge = "head" | "tail";
+
+/** Trim or extend one region's edge by `deltaSec` SOURCE seconds (W9-F —
+ * clips are projections of the raw audio, so an edge drag can re-open
+ * material a cut or an earlier trim hid). The delta is CLAMPED, never
+ * rejected:
+ *   · the region keeps ≥ MIN_REGION_SEC;
+ *   · the source window stays inside [0, streamDurationSec] and never
+ *     overlaps a sibling's window (source disjointness is the stored-list
+ *     invariant — regionsValid);
+ *   · a head trim moves startSec WITH sourceOffsetSec, so the untrimmed
+ *     material holds its arrangement position (DAW-standard edge feel);
+ *   · startSec stays ≥ 0.
+ * Returns the new list, or null for an unknown region id. */
+export function trimRegion(
+  regions: readonly ClipRegion[],
+  regionId: string,
+  edge: TrimEdge,
+  deltaSec: number,
+  streamDurationSec: number,
+): ClipRegion[] | null {
+  const target = regions.find((r) => r.id === regionId);
+  if (!target) return null;
+  const sourceEnd = target.sourceOffsetSec + target.durationSec;
+  if (edge === "head") {
+    // Nearest sibling window END at or before our start caps extension.
+    const prevEnd = regions.reduce(
+      (acc, r) =>
+        r.id !== regionId && r.sourceOffsetSec + r.durationSec <= target.sourceOffsetSec + 1e-9
+          ? Math.max(acc, r.sourceOffsetSec + r.durationSec)
+          : acc,
+      0,
+    );
+    const d = Math.min(
+      Math.max(deltaSec, prevEnd - target.sourceOffsetSec, -target.startSec),
+      target.durationSec - MIN_REGION_SEC,
+    );
+    if (Math.abs(d) < 1e-9) return [...regions];
+    return sortRegions(
+      regions.map((r) =>
+        r.id === regionId
+          ? {
+              ...r,
+              startSec: r.startSec + d,
+              sourceOffsetSec: r.sourceOffsetSec + d,
+              durationSec: r.durationSec - d,
+            }
+          : r,
+      ),
+    );
+  }
+  // Tail: the nearest sibling window START at or after our end caps it.
+  const nextStart = regions.reduce(
+    (acc, r) =>
+      r.id !== regionId && r.sourceOffsetSec >= sourceEnd - 1e-9
+        ? Math.min(acc, r.sourceOffsetSec)
+        : acc,
+    streamDurationSec,
+  );
+  const d = Math.min(
+    Math.max(deltaSec, MIN_REGION_SEC - target.durationSec),
+    nextStart - sourceEnd,
+  );
+  if (Math.abs(d) < 1e-9) return [...regions];
+  return sortRegions(
+    regions.map((r) => (r.id === regionId ? { ...r, durationSec: r.durationSec + d } : r)),
+  );
+}
+
 /** The stored-list invariants (collab-doc.ts ClipRegion doc): source-ordered,
  * non-overlapping in the source domain, within [0, streamDurationSec], every
  * region ≥ MIN_REGION_SEC (a hair of float slack so a boundary computed
@@ -92,7 +162,8 @@ export function selectionStreamIds(
  * onto each other have always done. Source disjointness is the only
  * overlap rule; where the operator stacks the pieces is arrangement. */
 export function regionsValid(regions: readonly ClipRegion[], streamDurationSec: number): boolean {
-  if (regions.length === 0) return false;
+  // Empty is valid (W9-F): every clip deleted from the arrangement — a
+  // projection state, the raw audio stays archived.
   const EPS = 1e-6;
   let cursor = 0;
   for (const r of sortRegions(regions)) {

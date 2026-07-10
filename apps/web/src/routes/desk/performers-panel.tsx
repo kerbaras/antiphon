@@ -65,6 +65,7 @@ export function PerformersPanel({
                 }
                 color={color}
                 dot={isRecording ? "var(--color-rec)" : "var(--color-ok)"}
+                imageUrl={peer.deviceInfo.avatarUrl ?? null}
               />
               <div className="min-w-0 flex-1">
                 <div className="truncate text-[11.5px] font-semibold text-text-strong">{title}</div>

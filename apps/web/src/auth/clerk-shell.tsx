@@ -22,9 +22,10 @@
 // TokenBridge hands Clerk's getToken to the non-React net layer; on
 // unmount the registry clears back to keyless behavior.
 
-import { ClerkProvider, useAuth } from "@clerk/react";
+import { ClerkProvider, useAuth, useUser } from "@clerk/react";
 import { type ReactNode, useEffect } from "react";
 import { registerAuthTokenGetter } from "../net/auth-token";
+import { setAuthUser } from "../net/auth-user";
 
 /** House tokens → Clerk appearance variables (the CURRENT @clerk/ui
  * names: colorForeground/colorInput/… — the legacy colorText/
@@ -64,6 +65,21 @@ function TokenBridge() {
   return null;
 }
 
+/** Mirrors the signed-in user's DISPLAY identity (email + pfp) into the
+ * net-layer registry: join-page email defaults, hello avatarUrl (A16), and
+ * the desk's own top-bar face all read from there — no Clerk outside this
+ * chunk. */
+function IdentityBridge() {
+  const { user } = useUser();
+  const email = user?.primaryEmailAddress?.emailAddress ?? null;
+  const imageUrl = user?.imageUrl ?? null;
+  useEffect(() => {
+    setAuthUser(user ? { email, imageUrl } : null);
+    return () => setAuthUser(null);
+  }, [user, email, imageUrl]);
+  return null;
+}
+
 export default function ClerkShell({
   publishableKey,
   children,
@@ -73,9 +89,11 @@ export default function ClerkShell({
 }) {
   return (
     <ClerkProvider publishableKey={publishableKey} appearance={APPEARANCE}>
-      {/* First child on purpose: its effect (token registration) flushes
-          before any route effect can fire an authed fetch. */}
+      {/* First children on purpose: their effects (token + identity
+          registration) flush before any route effect can fire an authed
+          fetch or read the user. */}
       <TokenBridge />
+      <IdentityBridge />
       {children}
     </ClerkProvider>
   );

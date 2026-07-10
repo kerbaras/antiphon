@@ -118,7 +118,9 @@ test.describe("timeline polish (F17 + zoom anchor + min-width badges)", () => {
     expect(await loadedTakeId(desk)).toBe(take2); // selection never loads
 
     // --- F2 dialog itemizes the mixed multi-take selection -------------------
-    await desk.keyboard.press("Delete");
+    // Shift+Delete: the DURABLE path keeps the confirm (plain Delete is a
+    // projection-only edit since W9-F and asks nothing).
+    await desk.keyboard.press("Shift+Delete");
     const dialog = desk.getByRole("alertdialog");
     await expect(dialog).toBeVisible();
     await expect(dialog.getByText("Delete 2 clips?")).toBeVisible();

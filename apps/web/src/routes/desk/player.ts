@@ -501,15 +501,24 @@ export class SessionPlayer {
    * derived as exactly that by the desk; regions rule if they disagree). */
   private takeBaseSec(takeId: string | null): number {
     if (takeId === null) return 0;
+    // A stream whose EVERY clip was deleted (regions: [], W9-F) has no
+    // arrangement presence: +Infinity here so it never wins the leftmost
+    // reduction; an all-empty take collapses to base 0.
     const startOf = (clipStartSec: number, regions: ClipRegion[] | null | undefined): number =>
-      regions && regions.length > 0 ? Math.min(...regions.map((r) => r.startSec)) : clipStartSec;
+      regions
+        ? regions.length > 0
+          ? Math.min(...regions.map((r) => r.startSec))
+          : Number.POSITIVE_INFINITY
+        : clipStartSec;
     const mounted = this.takeTracks(takeId);
     if (mounted.length > 0) {
-      return Math.min(...mounted.map((t) => startOf(t.clipStartSec, t.regions)));
+      const base = Math.min(...mounted.map((t) => startOf(t.clipStartSec, t.regions)));
+      return Number.isFinite(base) ? base : 0;
     }
     const planned = this.plan.find((p) => p.takeId === takeId);
     if (planned && planned.streams.length > 0) {
-      return Math.min(...planned.streams.map((s) => startOf(s.clipStartSec, s.regions)));
+      const base = Math.min(...planned.streams.map((s) => startOf(s.clipStartSec, s.regions)));
+      return Number.isFinite(base) ? base : 0;
     }
     return 0;
   }
@@ -531,8 +540,11 @@ export class SessionPlayer {
     if (planned && planned.streams.length > 0) {
       return Math.max(
         ...planned.streams.map((s) =>
-          s.regions && s.regions.length > 0
-            ? Math.max(...s.regions.map((r) => r.startSec + r.durationSec))
+          // Empty regions (every clip deleted, W9-F) span nothing.
+          s.regions
+            ? s.regions.length > 0
+              ? Math.max(...s.regions.map((r) => r.startSec + r.durationSec))
+              : 0
             : s.clipStartSec + s.declaredDurationSec,
         ),
       );

@@ -9,6 +9,7 @@ import {
   type SignalingMessage,
 } from "@antiphon/protocol";
 import { authToken } from "./auth-token";
+import { authUser } from "./auth-user";
 import { getDeviceId } from "./device-identity";
 
 type MessageListener = (msg: SignalingMessage) => void;
@@ -31,6 +32,11 @@ export interface SignalingClientState {
 
 const RECONNECT_BASE_MS = 1_000;
 const RECONNECT_MAX_MS = 8_000;
+/** Upgrade answered within this or the attempt is aborted: a handshake a
+ * broken proxy never answers would otherwise sit in CONNECTING forever —
+ * and the browser serializes ws handshakes per host (RFC 6455 §4.1), so
+ * one hung socket dams every later WebSocket to the origin. */
+const HANDSHAKE_TIMEOUT_MS = 10_000;
 
 export class SignalingClient {
   readonly role: PeerRole;
@@ -41,6 +47,11 @@ export class SignalingClient {
   /** A12 identity override (the desk's embedded recorder derives its own);
    * null = this browser's persisted deviceId. */
   private readonly deviceId: string | null;
+  /** This endpoint speaks for the signed-in ACCOUNT (A16): hellos carry the
+   * profile picture, and an unnamed recorder defaults its label to the
+   * account email. False for the desk's embedded room-mic recorder — that
+   * lane is hardware, not a person. No-op keyless (authUser() is null). */
+  private readonly accountIdentity: boolean;
   private ws: WebSocket | null = null;
   private closed = false;
   private attempts = 0;
@@ -53,11 +64,13 @@ export class SignalingClient {
     sessionId: string,
     label: string | null = null,
     deviceId: string | null = null,
+    accountIdentity = true,
   ) {
     this.role = role;
     this.sessionId = sessionId;
     this.label = label;
     this.deviceId = deviceId;
+    this.accountIdentity = accountIdentity;
   }
 
   connect(): void {
@@ -69,9 +82,21 @@ export class SignalingClient {
     const proto = location.protocol === "https:" ? "wss" : "ws";
     const ws = new WebSocket(`${proto}://${location.host}/${path}/${this.sessionId}/ws`);
     this.ws = ws;
+    const deadline = setTimeout(() => {
+      if (ws.readyState === WebSocket.CONNECTING) ws.close();
+    }, HANDSHAKE_TIMEOUT_MS);
     ws.addEventListener("open", () => {
+      clearTimeout(deadline);
       this.attempts = 0;
-      const label = this.label?.trim();
+      // Account display identity (A16), read at hello time so a sign-in
+      // that landed after construction still counts: signed-in endpoints
+      // carry their pfp, and an unnamed RECORDER introduces itself by its
+      // account email (a default, never persisted — an explicit nickname
+      // always wins). Keyless/signed-out: account is null, wire unchanged.
+      const account = this.accountIdentity ? authUser() : null;
+      const label =
+        this.label?.trim() ||
+        (this.role === "recorder" ? (account?.email ?? undefined) : undefined);
       // Desk hellos carry the Clerk session token (A15) — the browser
       // cannot set WS headers, so auth rides the handshake message. The
       // await is a no-op keyless (null, nothing attached) and recorders
@@ -89,6 +114,7 @@ export class SignalingClient {
             // Stable per-browser id (A12): the server resumes our peerId.
             deviceId: this.deviceId ?? getDeviceId(),
             ...(label ? { label } : {}),
+            ...(account?.imageUrl ? { avatarUrl: account.imageUrl } : {}),
           },
           protocolVersions: [1],
           ...(token ? { authToken: token } : {}),
@@ -138,6 +164,7 @@ export class SignalingClient {
       for (const l of this.messageListeners) l(msg);
     });
     ws.addEventListener("close", () => {
+      clearTimeout(deadline);
       this.setState({ ...this.state, connected: false, peerId: null });
       if (!this.closed && !this.state.fatal) {
         const delay = Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * 2 ** this.attempts++);

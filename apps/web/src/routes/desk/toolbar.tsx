@@ -201,7 +201,11 @@ export function DeskToolbar({
           className="flex items-center gap-1.5 whitespace-nowrap rounded-full border border-edge-strong px-2.5 py-1 text-[10.5px] font-semibold text-text-mute transition-colors hover:text-text-hi disabled:cursor-not-allowed disabled:opacity-50"
         >
           <span className="text-[8px] text-accent/80">◆</span>
-          marker
+          {/* Label text sheds below 1024 (W9-F: the third live tool costs
+              the chip budget ~40px, and at 900 — labels + key hints both
+              returning — the sweep measured the chip 28px short; icon +
+              title + aria carry the meaning below the boundary). */}
+          <span className="hidden min-[1024px]:inline">marker</span>
         </button>
         {/* N (was C — the Split tool owns C now, W7-B). */}
         <button
@@ -213,7 +217,8 @@ export function DeskToolbar({
           className="flex items-center gap-1.5 whitespace-nowrap rounded-full border border-edge-strong px-2.5 py-1 text-[10.5px] font-semibold text-text-mute transition-colors hover:text-text-hi disabled:cursor-not-allowed disabled:opacity-50"
         >
           <span className="text-[8px] text-pin/80">●</span>
-          comment
+          {/* Sheds with the marker label (W9-F) — same tier, same reason. */}
+          <span className="hidden min-[1024px]:inline">comment</span>
         </button>
         {lastChirpAt && (
           <span className="font-mono text-[9px] text-text-faint">

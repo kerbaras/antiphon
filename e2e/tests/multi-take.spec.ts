@@ -4,11 +4,12 @@
 // converge at both sinks (complete sets, digest-equal, valid FLAC per
 // stream). Then the desk deletes take 2's streams THROUGH THE UI (F2):
 // marquee-select take 2's clips (which must NOT switch the loaded take —
-// QA E3), press Delete, and drive the confirm dialog — Escape preserves
-// everything, Enter confirms. The server must refuse while a take is
-// active (A9 ordering), and once idle must remove rows AND blobs durably
-// before fanning out the confirm — after which the desk's state drops the
-// streams while takes 1 and 3 stay byte-identical.
+// QA E3), press Shift+Delete (the durable destroy — plain Delete is a
+// projection-only edit since W9-F), and drive the confirm dialog — Escape
+// preserves everything, Enter confirms. The server must refuse while a
+// take is active (A9 ordering), and once idle must remove rows AND blobs
+// durably before fanning out the confirm — after which the desk's state
+// drops the streams while takes 1 and 3 stay byte-identical.
 
 import { expect, type Page, test } from "@playwright/test";
 import { countBlobFiles, findTakeBlobDir } from "./helpers/blobs";
@@ -230,8 +231,10 @@ test.describe("multi-take session", () => {
       );
     expect((await editingState(desk)).loadedTakeId).toBe(take3);
 
-    // Delete opens the confirm dialog — nothing has been deleted yet.
-    await desk.keyboard.press("Delete");
+    // Shift+Delete — the DURABLE destroy (W9-F moved plain Delete to a
+    // projection-only edit) — opens the confirm dialog; nothing has been
+    // deleted yet.
+    await desk.keyboard.press("Shift+Delete");
     const dialog = desk.getByRole("alertdialog");
     await expect(dialog).toBeVisible();
     await expect(dialog.getByText("Delete 2 clips?")).toBeVisible();
@@ -246,8 +249,8 @@ test.describe("multi-take session", () => {
       200,
     );
 
-    // Delete again, Enter confirms (focus starts on the confirm button).
-    await desk.keyboard.press("Delete");
+    // Shift+Delete again, Enter confirms (focus starts on the confirm button).
+    await desk.keyboard.press("Shift+Delete");
     await expect(dialog).toBeVisible();
     await desk.keyboard.press("Enter");
     await expect(dialog).toBeHidden();

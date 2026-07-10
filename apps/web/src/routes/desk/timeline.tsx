@@ -5,7 +5,7 @@
 
 import type { RefObject } from "react";
 import { useLayoutEffect, useRef, useState } from "react";
-import { Badge, SectionLabel } from "../../ui/kit";
+import { AvatarImg, Badge, SectionLabel } from "../../ui/kit";
 import type { TakeComment } from "./comments";
 import {
   ClipCard,
@@ -572,6 +572,8 @@ function TimelineRow({
                   style={{ background: row.color }}
                 >
                   {row.peerInitials}
+                  {/* Account pfp (A16) covers the initials disc. */}
+                  {row.avatarUrl && <AvatarImg src={row.avatarUrl} />}
                   <span
                     className="absolute -right-px -bottom-px size-[5px] rounded-full border border-[#17181a]"
                     style={{

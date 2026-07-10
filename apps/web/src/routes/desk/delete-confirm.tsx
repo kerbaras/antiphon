@@ -1,10 +1,12 @@
-// F2 — destructive-action confirm. Stream deletion is durable and fans out
-// to every sink (rows AND blobs gone), so the Delete key must never fire
-// it straight from keydown. This kit-styled alertdialog spells out exactly
-// what is about to be destroyed (clip count per take, mono readouts),
-// traps focus, and maps Enter=confirm / Escape=cancel. It only ADDS a
-// confirmation ahead of the existing server-authoritative delete protocol
-// — the never-lose-audio path itself is untouched.
+// F2 — destructive-action confirm for DURABLE deletion (Shift+Delete, the
+// lane menu): recordings fan out of every sink (rows AND blobs gone), so
+// these paths must never fire straight from keydown. This kit-styled
+// alertdialog spells out exactly what is about to be destroyed (clip count
+// per take, mono readouts), traps focus, and maps Enter=confirm /
+// Escape=cancel. It only ADDS a confirmation ahead of the existing
+// server-authoritative delete protocol — the never-lose-audio path itself
+// is untouched. Plain Delete needs none of this since W9-F: it removes
+// clips from the ARRANGEMENT only (doc write, Ctrl+Z restores).
 
 import { useEffect, useRef } from "react";
 import { Button, MonoReadout, Panel, SectionLabel } from "../../ui/kit";
@@ -25,8 +27,8 @@ export function DeleteConfirm({
 }: {
   takes: DeleteSummaryTake[];
   clipCount: number;
-  /** Any staged stream is SPLIT into regions (W7-B): deletion stays
-   * stream-level, so the dialog must say the whole lane goes. */
+  /** A staged recording is SPLIT into pieces: durable deletion destroys
+   * every piece's audio, so the dialog must say the whole lane goes. */
   splitWhole?: boolean;
   onConfirm: () => void;
   onCancel: () => void;
@@ -101,20 +103,21 @@ export function DeleteConfirm({
                 value={`${take.clipCount} clip${take.clipCount === 1 ? "" : "s"}`}
               />
             ))}
-            {/* Honesty over a split selection (W7-B): deletion is stream-
-                level — a piece can't be destroyed without its siblings. */}
+            {/* Honesty over a split selection: durable deletion is
+                recording-level — every piece of a staged stream goes. */}
             {splitWhole && (
               <p
                 data-split-whole
                 className="pt-1.5 font-mono text-[9.5px] leading-relaxed text-warn"
               >
-                A selected clip is a piece of a split recording: this deletes the whole lane's audio
-                for that take, not just the selected part.
+                A staged recording is split into pieces: this destroys the whole recording — every
+                piece of it, not just what is selected.
               </p>
             )}
             <p className="pt-1.5 font-mono text-[9.5px] leading-relaxed text-warn">
               Removes the recordings from every sink — server rows and blobs are deleted durably.
-              There is no undo.
+              There is no undo. (Removing clips from the arrangement only is plain Delete — that one
+              undoes.)
             </p>
           </div>
           <div className="mt-4 flex items-center justify-between gap-2">

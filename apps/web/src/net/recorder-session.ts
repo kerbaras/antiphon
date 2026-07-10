@@ -82,6 +82,9 @@ export class RecorderSession {
       sessionId,
       identity ? identity.label : getNickname(),
       identity?.deviceId ?? null,
+      // Embedded recorders (the desk's room mic) are hardware, not a
+      // person: no account pfp, no email-default label (A16).
+      identity === undefined,
     );
   }
 

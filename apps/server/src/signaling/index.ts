@@ -34,6 +34,7 @@ interface RoomPeer {
 interface DeviceRecord {
   peerId: string;
   label: string | undefined;
+  avatarUrl: string | undefined;
   joinedAt: string;
 }
 
@@ -141,6 +142,7 @@ export class Signaling {
           room.devices.set(`${row.role}:${row.deviceId}`, {
             peerId: row.id,
             label: row.label ?? undefined,
+            avatarUrl: row.avatarUrl ?? undefined,
             joinedAt: row.joinedAt.toISOString(),
           });
         }
@@ -481,8 +483,11 @@ export class Signaling {
       room.peers.delete(peerId);
     }
     // A non-empty hello label wins (the device speaks for itself); a silent
-    // reconnect keeps the stored nickname (possibly desk-given).
+    // reconnect keeps the stored nickname (possibly desk-given). The A16
+    // avatar follows the same rule — a signed-out reconnect keeps the face
+    // it introduced itself with, exactly like the nickname.
     const label = msg.deviceInfo.label?.trim() || known?.label;
+    const avatarUrl = msg.deviceInfo.avatarUrl?.trim() || known?.avatarUrl;
     const joinedAt = known?.joinedAt ?? new Date().toISOString();
     const epoch = ++this.epochs;
     conn.peerId = peerId;
@@ -491,9 +496,12 @@ export class Signaling {
       userAgent: msg.deviceInfo.userAgent,
       ...(label ? { label } : {}),
       ...(deviceId ? { deviceId } : {}),
+      ...(avatarUrl ? { avatarUrl } : {}),
     };
     room.peers.set(peerId, { peerId, role: msg.role, deviceInfo, joinedAt, epoch, ws });
-    if (deviceId) room.devices.set(`${msg.role}:${deviceId}`, { peerId, label, joinedAt });
+    if (deviceId) {
+      room.devices.set(`${msg.role}:${deviceId}`, { peerId, label, avatarUrl, joinedAt });
+    }
     await this.archive.upsertPeer({
       peerId,
       sessionId: conn.sessionId,
@@ -501,6 +509,7 @@ export class Signaling {
       userAgent: msg.deviceInfo.userAgent,
       label: label ?? null,
       deviceId,
+      avatarUrl: avatarUrl ?? null,
       joinedAt: new Date(joinedAt),
     });
     await this.archive.touchSession(room.sessionId);

@@ -1,6 +1,7 @@
 import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
+import { serverProxy } from "./src/net/server-proxy";
 
 // COOP/COEP from day one: SharedArrayBuffer requires cross-origin isolation,
 // and retrofitting it breaks lazily-loaded third-party scripts.
@@ -14,17 +15,10 @@ const crossOriginIsolation = {
 // browser (and for a single cloudflared tunnel) via proxy in dev/preview.
 // The e2e suite runs one preview+server pair per git worktree on derived
 // ports (e2e/ports.ts) and threads the server origin in here; dev and CI
-// keep the fixed :8787 default.
+// keep the fixed :8787 default. Proxy map + the unit-pinned WS pattern
+// live in src/net/server-proxy.ts (the room-mic postmortem is there).
 const serverOrigin = process.env.ANTIPHON_SERVER_ORIGIN ?? "http://localhost:8787";
-const serverProxy = {
-  "/api": { target: serverOrigin, changeOrigin: true },
-  // Signaling (ws) + the W3-A shared-project-doc sync (collab).
-  "^/(session|join)/[^/]+/(ws|collab)$": {
-    target: serverOrigin,
-    ws: true,
-    changeOrigin: true,
-  },
-};
+const proxy = serverProxy(serverOrigin);
 
 export default defineConfig({
   plugins: [
@@ -35,7 +29,7 @@ export default defineConfig({
     }),
     tailwindcss(),
   ],
-  server: { headers: crossOriginIsolation, proxy: serverProxy },
-  preview: { headers: crossOriginIsolation, proxy: serverProxy },
+  server: { headers: crossOriginIsolation, proxy },
+  preview: { headers: crossOriginIsolation, proxy },
   worker: { format: "es" },
 });
