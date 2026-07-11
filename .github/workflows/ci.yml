@@ -132,6 +132,17 @@ jobs:
           key: turbo-${{ runner.os }}-${{ github.sha }}
           restore-keys: turbo-${{ runner.os }}-
       - run: pnpm install --frozen-lockfile
+      # The signal suites assume 48 kHz capture (the RFC's RECOMMENDED rate,
+      # and what every dev machine delivers). Runners have no audio server,
+      # and Chromium's fallback rate without one is 44.1 kHz — every sample
+      # count then drifts by exactly 48/44.1. PulseAudio's own default is
+      # ALSO 44.1 kHz, so pin 48 kHz explicitly.
+      - name: 48 kHz audio server
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq pulseaudio
+          mkdir -p ~/.config/pulse
+          printf 'default-sample-rate = 48000\n' > ~/.config/pulse/daemon.conf
+          pulseaudio -D --exit-idle-time=-1
       # chromium: desktop suite (fake mic). webkit: the mobile-safari project
       # (devices["iPhone 15"] runs on the webkit build — nothing extra needed).
       - run: pnpm exec playwright install --with-deps chromium webkit

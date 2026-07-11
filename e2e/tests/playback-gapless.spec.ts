@@ -138,14 +138,28 @@ test.describe("playback gapless (W4-A)", () => {
 
     // The phone's capture pipeline reported no faults: what the mic gave
     // is what the archive holds.
-    const ringFaults = await phone.evaluate(() => {
+    const { ringFaults, captureRate } = await phone.evaluate(() => {
       const hook = (
         globalThis as unknown as {
-          __antiphon?: { snapshot(): { ring: { droppedSamples: number } | null } | null };
+          __antiphon?: {
+            snapshot(): {
+              ring: { droppedSamples: number } | null;
+              contextSampleRate: number | null;
+            } | null;
+          };
         }
       ).__antiphon;
-      return hook?.snapshot()?.ring?.droppedSamples ?? -1;
+      const snap = hook?.snapshot();
+      return {
+        ringFaults: snap?.ring?.droppedSamples ?? -1,
+        captureRate: snap?.contextSampleRate ?? -1,
+      };
     });
+    // Canary for the whole signal suite: every sample-count/onset assertion
+    // assumes 48 kHz capture (RFC RECOMMENDED; what dev machines deliver).
+    // Chromium without a 48 kHz audio server falls back to 44.1 kHz and every
+    // count drifts by exactly 48/44.1 — see the CI workflow's PulseAudio step.
+    expect(captureRate, "phone capture context must run at 48 kHz").toBe(48_000);
     expect(ringFaults).toBe(0);
 
     // --- layer 1: the archive itself is gapless --------------------------
