@@ -181,7 +181,10 @@ test("top bar: below the 520px floor the bar keeps its shape and the page scroll
 // then 1200-1345 in the "fix" — 4px at 1200, 84px at 1280). So the guard
 // is a SWEEP with a live declined verdict, not spot widths: every guarded
 // width ≥ 700 including both sides of every tier boundary and QA's
-// measured five, asserting ≥170px AND visually untruncated.
+// measured five, asserting the chip's own natural width AND visually
+// untruncated. The floor is MEASURED at 1440px (nothing squeezes there),
+// not a constant: 9px mono rasterizes ~178px on macOS but ~160px on CI's
+// Linux, so a hardcoded pin is platform-calibrated and lies on the other.
 //
 // WHY declined, and why the sine file (W5-D QA F5): "declined ·
 // confidence 0.xx < 0.5" (~178px) is the longest string that must render
@@ -191,7 +194,7 @@ test("top bar: below the 520px floor the bar keeps its shape and the page scroll
 // chip below the declined string's natural width. The default fake-mic
 // beep grid made that verdict nondeterministic (see helpers/align.ts sineWav); the
 // flat sine declines by construction, so the assertion stays strict.
-test("toolbar: the live declined verdict chip keeps ≥170px across the width sweep", async ({
+test("toolbar: the live declined verdict chip keeps its natural width across the width sweep", async ({
   browser,
 }) => {
   test.setTimeout(180_000);
@@ -219,12 +222,18 @@ test("toolbar: the live declined verdict chip keeps ≥170px across the width sw
   await expect(chip).toBeVisible({ timeout: 60_000 });
   await expect(chip).toContainText("declined");
 
+  // Natural width: at 1440px the flex row has slack everywhere, so the
+  // chip sits at the declined string's own rendered width on THIS
+  // platform's font rasterizer. The sweep pins that exact width.
+  const natural = (await box(chip, "verdict chip at rest (1440px)")).width;
+  expect(natural, "declined chip renders a real string").toBeGreaterThanOrEqual(120);
+
   for (const width of [
     700, 760, 800, 859, 860, 900, 1024, 1100, 1199, 1200, 1280, 1345, 1379, 1380, 1440,
   ]) {
     await desk.setViewportSize({ width, height: 800 });
     const b = await box(chip, `verdict chip at ${width}px`);
-    expect(b.width, `chip width at ${width}px`).toBeGreaterThanOrEqual(170);
+    expect(b.width, `chip width at ${width}px`).toBeGreaterThanOrEqual(natural - 0.5);
     expect(b.x + b.width, `chip on-screen at ${width}px`).toBeLessThanOrEqual(width + 0.5);
     const truncated = await chip.evaluate((el) => el.scrollWidth > el.clientWidth + 1);
     expect(truncated, `chip visually whole at ${width}px`).toBe(false);

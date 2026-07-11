@@ -9,12 +9,12 @@ export default defineConfig({
   // CI: inline github annotations plus an HTML report (self-contained, traces
   // embedded) that the workflow uploads as an artifact when the job fails.
   reporter: process.env.CI ? [["github"], ["html", { open: "never" }]] : "list",
-  // Local cap: at the default worker count the suite flakes under machine
+  // Worker caps: at the default worker count the suite flakes under machine
   // load — concurrent WebRTC DTLS handshakes starve and 1-5 rotating
-  // "serverLink down" failures appear. 2 workers is reliably green. CI keeps
-  // the playwright default (workers omitted; exactOptionalPropertyTypes
-  // forbids an explicit undefined).
-  ...(process.env.CI ? {} : { workers: 2 }),
+  // "serverLink down" failures appear. 2 workers is reliably green locally.
+  // CI pins 1: on shared 4-vCPU runners two concurrent signal suites starve
+  // each other (archive/declared drift, missed onsets in live playback taps).
+  workers: process.env.CI ? 1 : 2,
   use: {
     baseURL: `http://localhost:${WEB_PORT}`,
     trace: "on-first-retry",
