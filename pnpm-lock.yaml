@@ -160,6 +160,12 @@ importers:
 
   e2e:
     devDependencies:
+      '@antiphon/server':
+        specifier: workspace:*
+        version: link:../apps/server
+      '@antiphon/web':
+        specifier: workspace:*
+        version: link:../apps/web
       '@clerk/testing':
         specifier: ^2.2.2
         version: 2.2.2(@playwright/test@1.61.1)(react-dom@19.2.7(react@19.2.7))(react@19.2.7)

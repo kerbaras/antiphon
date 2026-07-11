@@ -8,6 +8,8 @@
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
+    "@antiphon/server": "workspace:*",
+    "@antiphon/web": "workspace:*",
     "@clerk/testing": "^2.2.2",
     "@playwright/test": "^1.61.1",
     "@types/node": "catalog:",
